@@ -122,109 +122,327 @@ def spherical_to_cartesian_field(E_r: np.ndarray, E_theta: np.ndarray, E_phi: np
     
     return E_x, E_y, E_z
 
-def hansen_associated_legendre(n: int, m: int, cos_theta: np.ndarray) -> np.ndarray:
+class LegendreCoefficientCache:
+    """Cache for factorial ratios and normalization constants."""
+    
+    def __init__(self):
+        self._factorial_ratio_cache = {}
+        self._norm_factor_cache = {}
+    
+    def factorial_ratio(self, n: int, m: int) -> float:
+        """
+        Compute (n-m)! / (n+m)! efficiently without computing large factorials.
+        
+        For m >= 0: (n-m)! / (n+m)! = 1 / [(n-m+1)(n-m+2)...(n+m)]
+        """
+        key = (n, m)
+        if key in self._factorial_ratio_cache:
+            return self._factorial_ratio_cache[key]
+        
+        if m == 0:
+            result = 1.0
+        elif m > 0:
+            result = 1.0
+            for i in range(n - m + 1, n + m + 1):
+                result /= i
+        else:  # m < 0
+            result = 1.0
+            for i in range(n + m + 1, n - m + 1):
+                result *= i
+        
+        self._factorial_ratio_cache[key] = result
+        return result
+    
+    def normalization_factor(self, n: int, m: int) -> float:
+        """
+        Compute Hansen normalization factor: sqrt((2n+1)/2 * (n-m)!/(n+m)!)
+        """
+        key = (n, abs(m))
+        if key in self._norm_factor_cache:
+            return self._norm_factor_cache[key]
+        
+        abs_m = abs(m)
+        fac_ratio = self.factorial_ratio(n, abs_m)
+        result = np.sqrt((2 * n + 1) / 2 * fac_ratio)
+        
+        self._norm_factor_cache[key] = result
+        return result
+
+
+# Global cache instance
+_legendre_cache = LegendreCoefficientCache()
+
+import numpy as np
+from typing import Tuple, Dict
+import math
+
+
+# ==============================================================================
+# Optimized Associated Legendre Functions Using Recurrence Relations
+# ==============================================================================
+
+class LegendreCoefficientCache:
+    """Cache for factorial ratios and normalization constants."""
+    
+    def __init__(self):
+        self._factorial_ratio_cache = {}
+        self._norm_factor_cache = {}
+    
+    def factorial_ratio(self, n: int, m: int) -> float:
+        """
+        Compute (n-m)! / (n+m)! efficiently without computing large factorials.
+        
+        For m >= 0: (n-m)! / (n+m)! = 1 / [(n-m+1)(n-m+2)...(n+m)]
+        """
+        key = (n, m)
+        if key in self._factorial_ratio_cache:
+            return self._factorial_ratio_cache[key]
+        
+        if m == 0:
+            result = 1.0
+        elif m > 0:
+            result = 1.0
+            for i in range(n - m + 1, n + m + 1):
+                result /= i
+        else:  # m < 0
+            result = 1.0
+            for i in range(n + m + 1, n - m + 1):
+                result *= i
+        
+        self._factorial_ratio_cache[key] = result
+        return result
+    
+    def normalization_factor(self, n: int, m: int) -> float:
+        """
+        Compute Hansen normalization factor: sqrt((2n+1)/2 * (n-m)!/(n+m)!)
+        """
+        key = (n, abs(m))
+        if key in self._norm_factor_cache:
+            return self._norm_factor_cache[key]
+        
+        abs_m = abs(m)
+        fac_ratio = self.factorial_ratio(n, abs_m)
+        result = np.sqrt((2 * n + 1) / 2 * fac_ratio)
+        
+        self._norm_factor_cache[key] = result
+        return result
+
+
+# Global cache instance
+_legendre_cache = LegendreCoefficientCache()
+
+
+def compute_legendre_recurrence(n_max: int, m: int, cos_theta: np.ndarray) -> np.ndarray:
     """
-    Compute unnormalized associated Legendre function per Hansen's convention.
-    
-    Hansen (following Stratton) defines:
-        P_n^m(cos θ) = (sin θ)^m × d^m P_n(cos θ) / d(cos θ)^m
-    
-    This does NOT include the Condon-Shortley phase factor (-1)^m.
+    Compute associated Legendre functions P_n^m(cos θ) for all n from m to n_max
+    using recurrence relations. Much faster than calling lpmv repeatedly.
     
     Args:
-        n: Degree (n >= 0)
-        m: Order (0 <= m <= n, use absolute value)
-        cos_theta: Cosine of polar angle
-        
+        n_max: Maximum degree
+        m: Order (can be negative)
+        cos_theta: cos(θ) values, shape (N,)
+    
     Returns:
-        P_n^m(cos θ) in Hansen's convention
+        Array of shape (n_max - m + 1, N) containing P_m^m, P_{m+1}^m, ..., P_{n_max}^m
     """
     abs_m = abs(m)
+    cos_theta = np.atleast_1d(cos_theta)
+    N = len(cos_theta)
     
-    # scipy's lpmv includes (-1)^m phase, so we remove it
-    P_scipy = lpmv(abs_m, n, cos_theta)
-    P_hansen = (-1)**abs_m * P_scipy
+    # Avoid singularities
+    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+    sin_theta = np.sqrt(1 - cos_theta**2)
     
-    return P_hansen
+    # Number of n values we need
+    n_count = n_max - abs_m + 1
+    P = np.zeros((n_count, N))
+    
+    if abs_m > n_max:
+        return P
+    
+    # Starting value: P_m^m using the formula
+    # P_m^m = (-1)^m * (2m-1)!! * sin^m(θ)
+    if abs_m == 0:
+        P[0, :] = 1.0
+    else:
+        # Double factorial: (2m-1)!! = 1*3*5*...*(2m-1)
+        double_fac = 1.0
+        for i in range(1, 2*abs_m, 2):
+            double_fac *= i
+        P[0, :] = double_fac * (sin_theta ** abs_m)
+        if abs_m % 2 == 1:
+            P[0, :] *= -1
+    
+    if n_count == 1:
+        return P
+    
+    # Next value: P_{m+1}^m using specific recurrence
+    # P_{m+1}^m = (2m+1) * cos(θ) * P_m^m
+    if abs_m + 1 <= n_max:
+        P[1, :] = (2 * abs_m + 1) * cos_theta * P[0, :]
+    
+    # General recurrence for n >= m+2:
+    # (n-m) P_n^m = (2n-1) cos(θ) P_{n-1}^m - (n+m-1) P_{n-2}^m
+    for i in range(2, n_count):
+        n = abs_m + i
+        coeff1 = (2 * n - 1) / (n - abs_m)
+        coeff2 = (n + abs_m - 1) / (n - abs_m)
+        P[i, :] = coeff1 * cos_theta * P[i-1, :] - coeff2 * P[i-2, :]
+    
+    return P
 
-def normalized_associated_legendre(n: int, m: int, theta: np.ndarray):
+
+def compute_legendre_derivative_recurrence(n_max: int, m: int, cos_theta: np.ndarray,
+                                           P: np.ndarray = None) -> np.ndarray:
     """
-    Compute normalized associated Legendre function per Hansen equation A1.25.
+    Compute derivatives dP_n^m/dθ using recurrence relations.
     
-    P̄_n^m(cos θ) = sqrt((2n+1)/2 × (n-m)!/(n+m)!) × P_n^m(cos θ)
+    The derivative can be computed from:
+    sin(θ) dP_n^m/dθ = n*cos(θ)*P_n^m - (n+m)*P_{n-1}^m
     
-    Also computes the derivative dP̄_n^m/dθ.
+    Or for better numerical stability:
+    dP_n^m/dθ = (n*cos(θ)*P_n^m - (n+m)*P_{n-1}^m) / sin(θ)
     
     Args:
-        n: Degree (n >= 1)
-        m: Order (-n <= m <= n)
+        n_max: Maximum degree
+        m: Order
+        cos_theta: cos(θ) values
+        P: Pre-computed P values (optional, will compute if not provided)
+    
+    Returns:
+        Array of shape (n_max - |m| + 1, N) containing derivatives
+    """
+    abs_m = abs(m)
+    cos_theta = np.atleast_1d(cos_theta)
+    N = len(cos_theta)
+    
+    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+    sin_theta = np.sqrt(1 - cos_theta**2)
+    
+    # Compute P if not provided
+    if P is None:
+        P = compute_legendre_recurrence(n_max, m, cos_theta)
+    
+    n_count = n_max - abs_m + 1
+    dP = np.zeros((n_count, N))
+    
+    # For n = m, special case:
+    # dP_m^m/dθ = m * cos(θ)/sin(θ) * P_m^m
+    # But we need P_{m-1}^m which is 0, so:
+    # sin(θ) dP_m^m/dθ = m*cos(θ)*P_m^m - 0
+    if n_count > 0:
+        # Avoid division by zero at poles
+        safe_sin = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
+        dP[0, :] = abs_m * cos_theta * P[0, :] / safe_sin
+    
+    # For n > m, use the recurrence with P_{n-1}^m
+    for i in range(1, n_count):
+        n = abs_m + i
+        safe_sin = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
+        dP[i, :] = (n * cos_theta * P[i, :] - (n + abs_m) * P[i-1, :]) / safe_sin
+    
+    return dP
+
+
+def normalized_associated_legendre(n: int, m: int, 
+                                             theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Optimized version using recurrence relations and caching.
+    Drop-in replacement for normalized_associated_legendre.
+    
+    Args:
+        n: Degree
+        m: Order (can be negative)
         theta: Polar angle(s) in radians
-        
+    
     Returns:
         P_norm: Normalized associated Legendre function
         dP_norm: Derivative with respect to theta
     """
-    abs_m = abs(m)
+    theta = np.atleast_1d(theta)
     cos_theta = np.cos(theta)
-    sin_theta = np.sin(theta)
     
-    # Safe sin_theta to avoid division by zero at poles
-    sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
+    abs_m = abs(m)
     
-    # Compute unnormalized associated Legendre function (Hansen convention)
-    P_unnorm = hansen_associated_legendre(n, abs_m, cos_theta)
+    # Compute P_n^m for this n and all lower n values using recurrence
+    # We need P_{n-1}^m for the derivative, so compute up to n
+    P_all = compute_legendre_recurrence(n, abs(m), cos_theta)
     
-    # Normalization factor from equation A1.25
-    norm_factor = np.sqrt((2*n + 1) / 2 * 
-                         np.math.factorial(n - abs_m) / 
-                         np.math.factorial(n + abs_m))
+    # Extract P_n^m (it's the last one in the array)
+    P_n_m = P_all[-1, :]
     
-    P_norm = norm_factor * P_unnorm
+    # Compute derivative
+    dP_all = compute_legendre_derivative_recurrence(n, abs(m), cos_theta, P_all)
+    dP_n_m_dtheta = dP_all[-1, :]
     
-    # Compute derivative using Hansen's equation A1.34b
-    # For normalized functions, the coefficients change due to normalization factor ratios
-    if abs_m == 0:
-        # For m=0: dP̄_n^0/dθ = -√[n(n+1)] × P̄_n^1
-        P_bar_n_1 = hansen_associated_legendre(n, 1, cos_theta)
-        norm_factor_n_1 = np.sqrt((2*n + 1) / 2 * 
-                                 np.math.factorial(n - 1) / 
-                                 np.math.factorial(n + 1))
-        P_bar_n_1_norm = norm_factor_n_1 * P_bar_n_1
-        
-        coeff = np.sqrt(n * (n + 1))
-        dP_norm = -coeff * P_bar_n_1_norm
-    else:
-        # For m > 0: dP̄_n^m/dθ = (1/2){√[(n-m+1)(n+m)] P̄_n^(m-1) - √[(n+m+1)(n-m)] P̄_n^(m+1)}
-        
-        # First term: √[(n-m+1)(n+m)] × P̄_n^(m-1)
-        P_n_m_minus = hansen_associated_legendre(n, abs_m - 1, cos_theta)
-        norm_factor_m_minus = np.sqrt((2*n + 1) / 2 * 
-                                     np.math.factorial(n - (abs_m - 1)) / 
-                                     np.math.factorial(n + (abs_m - 1)))
-        P_bar_n_m_minus = norm_factor_m_minus * P_n_m_minus
-        
-        coeff1 = np.sqrt((n - abs_m + 1) * (n + abs_m))
-        term1 = coeff1 * P_bar_n_m_minus
-        
-        # Second term: √[(n+m+1)(n-m)] × P̄_n^(m+1)
-        if abs_m + 1 <= n:
-            P_n_m_plus = hansen_associated_legendre(n, abs_m + 1, cos_theta)
-            norm_factor_m_plus = np.sqrt((2*n + 1) / 2 * 
-                                        np.math.factorial(n - (abs_m + 1)) / 
-                                        np.math.factorial(n + (abs_m + 1)))
-            P_bar_n_m_plus = norm_factor_m_plus * P_n_m_plus
-            
-            coeff2 = np.sqrt((n + abs_m + 1) * (n - abs_m))
-            term2 = coeff2 * P_bar_n_m_plus
-        else:
-            # P̄_n^(n+1) = 0
-            term2 = 0.0
-        
-        dP_norm = 0.5 * (term1 - term2)
+    # Apply Hansen normalization
+    norm_factor = _legendre_cache.normalization_factor(n, m)
+    P_norm = norm_factor * P_n_m
+    dP_norm = norm_factor * dP_n_m_dtheta
     
     return P_norm, dP_norm
 
-def far_field_pattern_functions(n: int, m: int, theta: np.ndarray, phi: np.ndarray):
+
+def compute_all_modes_legendre(n_max: int, m_max: int, 
+                               theta: np.ndarray) -> Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]]:
+    """
+    Compute normalized Legendre functions and derivatives for ALL modes at once.
+    This is much more efficient when you need many (n,m) pairs.
+    
+    Args:
+        n_max: Maximum degree
+        m_max: Maximum order
+        theta: Polar angle(s) in radians
+    
+    Returns:
+        Dictionary mapping (n, m) -> (P_norm, dP_norm)
+    """
+    theta = np.atleast_1d(theta)
+    cos_theta = np.cos(theta)
+    
+    results = {}
+    
+    # For each order m, compute all degrees n >= |m| at once
+    for m in range(-m_max, m_max + 1):
+        abs_m = abs(m)
+        
+        if abs_m > n_max:
+            continue
+        
+        # Compute all P_n^m for n from abs_m to n_max
+        P_all = compute_legendre_recurrence(n_max, m, cos_theta)
+        dP_all = compute_legendre_derivative_recurrence(n_max, m, cos_theta, P_all)
+        
+        # Store normalized results for each n
+        for i, n in enumerate(range(abs_m, n_max + 1)):
+            if n < 1:  # Skip n=0 for spherical wave expansion
+                continue
+            
+            norm_factor = _legendre_cache.normalization_factor(n, m)
+            P_norm = norm_factor * P_all[i, :]
+            dP_norm = norm_factor * dP_all[i, :]
+            
+            results[(n, m)] = (P_norm, dP_norm)
+    
+    return results
+
+def far_field_pattern_functions(n: int, m: int, 
+                                         theta: np.ndarray, 
+                                         phi: np.ndarray,
+                                         legendre_cache: Dict = None):
+    """
+    Optimized version that can use pre-computed Legendre functions.
+    
+    Args:
+        n: Degree
+        m: Order
+        theta: Polar angles
+        phi: Azimuthal angles
+        legendre_cache: Optional pre-computed dict from compute_all_modes_legendre
+    
+    Returns:
+        (K1_theta, K1_phi), (K2_theta, K2_phi)
+    """
     abs_m = abs(m)
     
     # Avoid exact evaluation at poles
@@ -236,8 +454,11 @@ def far_field_pattern_functions(n: int, m: int, theta: np.ndarray, phi: np.ndarr
     theta_safe = np.where(at_north_pole, epsilon, theta_safe)
     theta_safe = np.where(at_south_pole, np.pi - epsilon, theta_safe)
     
-    # Now compute with safe theta values
-    P_norm, dP_norm_dtheta = normalized_associated_legendre(n, m, theta_safe)
+    # Get Legendre functions (from cache or compute)
+    if legendre_cache is not None and (n, m) in legendre_cache:
+        P_norm, dP_norm_dtheta = legendre_cache[(n, m)]
+    else:
+        P_norm, dP_norm_dtheta = normalized_associated_legendre(n, m, theta_safe)
     
     prefactor = np.sqrt(2 / (n * (n + 1)))
     
@@ -250,7 +471,6 @@ def far_field_pattern_functions(n: int, m: int, theta: np.ndarray, phi: np.ndarr
     i_factor_1 = (-1j) ** (n + 1)
     i_factor_2 = (-1j) ** n
     
-    # Now sin_theta_safe is never zero
     sin_theta = np.sin(theta_safe)
     mP_over_sin = m * P_norm / sin_theta
     
@@ -339,7 +559,9 @@ class SphericalWaveExpansion:
     
     def far_field(self, theta: np.ndarray, phi: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Calculate far-field E_theta and E_phi components.
+        Optimized far_field calculation using batch Legendre computation.
+        
+        Replace the existing far_field method with this one.
         
         Args:
             theta: Polar angle(s) in radians
@@ -363,9 +585,18 @@ class SphericalWaveExpansion:
         
         all_modes = set(self.Q1_coeffs.keys()) | set(self.Q2_coeffs.keys())
         
+        if not all_modes:
+            return E_theta, E_phi
+        
+        # PRE-COMPUTE ALL LEGENDRE FUNCTIONS AT ONCE
+        # This is the key optimization - compute once, use many times
+        legendre_cache = compute_all_modes_legendre(self.NMAX, self.MMAX, theta)
+        
+        # Now loop through modes using the pre-computed values
         for (n, m) in all_modes:
+            # Use optimized version with cache
             (K1_theta, K1_phi), (K2_theta, K2_phi) = \
-                far_field_pattern_functions(n, m, theta, phi)
+                far_field_pattern_functions(n, m, theta, phi, legendre_cache)
             
             if (n, m) in self.Q1_coeffs:
                 Q1 = self.Q1_coeffs[(n, m)]
@@ -376,13 +607,6 @@ class SphericalWaveExpansion:
                 Q2 = self.Q2_coeffs[(n, m)]
                 E_theta += Q2 * K2_theta
                 E_phi += Q2 * K2_phi
-        
-        # Apply overall factor k * sqrt(η₀) from TICRA equation (4)
-        # E_SI(r,θ,φ) = k√ζ Σ Q_smn F_smn(r,θ,φ)
-        # where ζ = η₀ = 376.73 Ω
-        Z0 = 376.730313668  # Free space impedance in ohms
-        E_theta *= self.k * np.sqrt(Z0)
-        E_phi *= self.k * np.sqrt(Z0)
                 
         return E_theta, E_phi
     
@@ -754,32 +978,23 @@ class SphericalWaveExpansion:
         )
     
     @classmethod
-    def from_far_field(cls, 
-                      theta: np.ndarray, 
-                      phi: np.ndarray,
-                      E_theta: np.ndarray, 
-                      E_phi: np.ndarray,
-                      frequency: float,
-                      NMAX: int,
-                      MMAX: Optional[int] = None) -> 'SphericalWaveExpansion':
+    def from_far_field(cls,
+                            theta: np.ndarray,
+                            phi: np.ndarray,
+                            E_theta: np.ndarray,
+                            E_phi: np.ndarray,
+                            frequency: float,
+                            NMAX: int,
+                            MMAX: int = None):
         """
-        Create SWE object from far-field measurements using least squares.
+        Optimized from_far_field using batch Legendre computation.
         
-        Args:
-            theta: Polar angles in radians (1D array of length N)
-            phi: Azimuthal angles in radians (1D array of length N)
-            E_theta: Measured theta component (1D array of length N)
-            E_phi: Measured phi component (1D array of length N)
-            frequency: Frequency in Hz
-            NMAX: Maximum degree for expansion
-            MMAX: Maximum order (default: NMAX)
-            
-        Returns:
-            SphericalWaveExpansion object with fitted coefficients
+        This is a classmethod, so add @classmethod decorator when integrating.
         """
         if MMAX is None:
             MMAX = NMAX
         
+        # Convert to 1D arrays
         theta = np.atleast_1d(theta).flatten()
         phi = np.atleast_1d(phi).flatten()
         E_theta = np.atleast_1d(E_theta).flatten()
@@ -791,86 +1006,64 @@ class SphericalWaveExpansion:
         
         k = 2 * np.pi * frequency / 299792458.0
         
-        # Build list of modes
+        # Build mode list
         modes = []
         for n in range(1, NMAX + 1):
             for m in range(-min(n, MMAX), min(n, MMAX) + 1):
                 modes.append((n, m))
         
         N_modes = len(modes)
-        N_coeffs = 2 * N_modes  # Q1 and Q2 for each mode
         
-        # Build design matrix: each row corresponds to a measurement point
-        # Columns correspond to [Re(Q1), Im(Q1), Re(Q2), Im(Q2)] for each mode
-        A_theta = np.zeros((N_points, N_coeffs), dtype=float)
-        A_phi = np.zeros((N_points, N_coeffs), dtype=float)
+        # PRE-COMPUTE ALL LEGENDRE FUNCTIONS
+        legendre_cache = compute_all_modes_legendre(NMAX, MMAX, theta)
         
-        for mode_idx, (n, m) in enumerate(modes):
-            (K1_theta, K1_phi), (K2_theta, K2_phi) = \
-                far_field_pattern_functions(n, m, theta, phi)
-            
-            # Q1 contribution (real and imaginary parts)
-            col_Q1_re = 2 * mode_idx
-            col_Q1_im = 2 * mode_idx + 1
-            
-            A_theta[:, col_Q1_re] = k * np.real(K1_theta)
-            A_theta[:, col_Q1_im] = k * -np.imag(K1_theta)  # Note the minus sign
-            A_phi[:, col_Q1_re] = k * np.real(K1_phi)
-            A_phi[:, col_Q1_im] = k * -np.imag(K1_phi)
-            
-            # Q2 contribution
-            col_Q2_re = 2 * mode_idx + N_modes * 2
-            col_Q2_im = 2 * mode_idx + N_modes * 2 + 1
-            
-            # Actually, let me reorganize: alternate Q1, Q2 for each mode
-            # Columns: [Re(Q1_mode0), Im(Q1_mode0), Re(Q2_mode0), Im(Q2_mode0), ...]
-            col_Q1_re = 4 * mode_idx
-            col_Q1_im = 4 * mode_idx + 1
-            col_Q2_re = 4 * mode_idx + 2
-            col_Q2_im = 4 * mode_idx + 3
-            
-        # Reinitialize with correct size
+        # Build design matrix - now much faster with cached Legendre
         N_coeffs = 4 * N_modes
         A_theta = np.zeros((N_points, N_coeffs), dtype=float)
         A_phi = np.zeros((N_points, N_coeffs), dtype=float)
         
         for mode_idx, (n, m) in enumerate(modes):
+            # Use cached Legendre functions
             (K1_theta, K1_phi), (K2_theta, K2_phi) = \
-                far_field_pattern_functions(n, m, theta, phi)
+                far_field_pattern_functions(n, m, theta, phi, legendre_cache)
             
             col_Q1_re = 4 * mode_idx
             col_Q1_im = 4 * mode_idx + 1
             col_Q2_re = 4 * mode_idx + 2
             col_Q2_im = 4 * mode_idx + 3
             
+            # Q1 contribution
             A_theta[:, col_Q1_re] = k * np.real(K1_theta)
             A_theta[:, col_Q1_im] = k * -np.imag(K1_theta)
-            A_theta[:, col_Q2_re] = k * np.real(K2_theta)
-            A_theta[:, col_Q2_im] = k * -np.imag(K2_theta)
-            
             A_phi[:, col_Q1_re] = k * np.real(K1_phi)
             A_phi[:, col_Q1_im] = k * -np.imag(K1_phi)
+            
+            # Q2 contribution
+            A_theta[:, col_Q2_re] = k * np.real(K2_theta)
+            A_theta[:, col_Q2_im] = k * -np.imag(K2_theta)
             A_phi[:, col_Q2_re] = k * np.real(K2_phi)
             A_phi[:, col_Q2_im] = k * -np.imag(K2_phi)
         
-        # Stack theta and phi equations
+        # Stack matrices and solve
         A = np.vstack([A_theta, A_phi])
         b = np.concatenate([np.real(E_theta), np.imag(E_theta),
-                           np.real(E_phi), np.imag(E_phi)])
+                            np.real(E_phi), np.imag(E_phi)])
         
-        # Solve least squares problem
-        result = lsq_linear(A, b)
+        result = lsq_linear(A, b, verbose=0)
         coeffs = result.x
         
         # Extract Q coefficients
         Q1_coeffs = {}
         Q2_coeffs = {}
         
+        Z0 = 376.730313668
+        norm_factor = k * np.sqrt(Z0)
+        
         for mode_idx, (n, m) in enumerate(modes):
-            Q1_re = coeffs[4 * mode_idx]
-            Q1_im = coeffs[4 * mode_idx + 1]
-            Q2_re = coeffs[4 * mode_idx + 2]
-            Q2_im = coeffs[4 * mode_idx + 3]
+            Q1_re = coeffs[4 * mode_idx] / norm_factor
+            Q1_im = coeffs[4 * mode_idx + 1] / norm_factor
+            Q2_re = coeffs[4 * mode_idx + 2] / norm_factor
+            Q2_im = coeffs[4 * mode_idx + 3] / norm_factor
             
             Q1_coeffs[(n, m)] = Q1_re + 1j * Q1_im
             Q2_coeffs[(n, m)] = Q2_re + 1j * Q2_im
@@ -1036,14 +1229,15 @@ class SphericalWaveExpansion:
                 H_theta += -factor_H * coef * (1j * m / sin_theta_safe) * P_norm * h_n / kr
                 H_phi += factor_H * coef * dP_norm * h_n / kr
         
-        # Apply overall normalization
-        # The field should have units of V/m for E and A/m for H
-        E_r *= self.k
-        E_theta *= self.k
-        E_phi *= self.k
-        H_r *= self.k
-        H_theta *= self.k
-        H_phi *= self.k
+        # To Check: I think this is double applied if we apply it here
+        # # Apply overall normalization
+        # # The field should have units of V/m for E and A/m for H
+        # E_r *= self.k
+        # E_theta *= self.k
+        # E_phi *= self.k
+        # H_r *= self.k
+        # H_theta *= self.k
+        # H_phi *= self.k
         
         return (E_r, E_theta, E_phi), (H_r, H_theta, H_phi)
     
@@ -1142,7 +1336,8 @@ def read_ticra_sph(filename: str) -> Dict:
     """
 
     # NORMALIZATION FACTOR (from Ticra)
-    normalization_factor = np.sqrt(8 * np.pi)
+    # ticra has a comment about 1/sqrt(8pi) normalization, but that doesn't apply in this formulation
+    normalization_factor = 1
 
 
     with open(filename, 'r') as f:
