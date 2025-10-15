@@ -203,10 +203,7 @@ def far_field_pattern_functions(n: int, m: int, theta: np.ndarray, phi: np.ndarr
     prefactor = np.sqrt(2 / (n * (n + 1)))
     
     # Sign factor: (-m/|m|)^m
-    if m == 0:
-        sign_factor = 1.0
-    else:
-        sign_factor = (-m / abs_m) ** abs_m
+    sign_factor = (-m / abs_m) ** m
     
     # Azimuthal phase
     phase = np.exp(1j * m * phi)
@@ -461,7 +458,7 @@ class SphericalWaveExpansion:
             exp_imphi = np.exp(1j * m * phi)
             
             prefactor = np.sqrt(2 / (n * (n + 1)))
-            sign_factor = 1.0 if m == 0 else (-m / abs(m)) ** abs(m)
+            sign_factor = (-m / abs(m)) ** m
             
             sin_theta = np.sin(theta)
             sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
@@ -955,10 +952,7 @@ class SphericalWaveExpansion:
             
             # Common factors
             prefactor = np.sqrt(2 / (n * (n + 1)))
-            if m == 0:
-                sign_factor = 1.0
-            else:
-                sign_factor = (-m / abs(m)) ** abs(m)
+            sign_factor = (-m / abs(m)) ** m
             
             # Safe sin(theta)
             sin_theta = np.sin(theta)
