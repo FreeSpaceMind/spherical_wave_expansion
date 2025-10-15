@@ -122,13 +122,38 @@ def spherical_to_cartesian_field(E_r: np.ndarray, E_theta: np.ndarray, E_phi: np
     
     return E_x, E_y, E_z
 
-
-def normalized_associated_legendre(n: int, m: int, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def hansen_associated_legendre(n: int, m: int, cos_theta: np.ndarray) -> np.ndarray:
     """
-    Compute normalized associated Legendre function and its derivative.
+    Compute unnormalized associated Legendre function per Hansen's convention.
     
-    Based on equation A1.25 from Hansen's documentation:
-    P̄ₙᵐ(cos θ) = sqrt((2n+1)/2 * (n-m)!/(n+m)!) * Pₙᵐ(cos θ)
+    Hansen (following Stratton) defines:
+        P_n^m(cos θ) = (sin θ)^m × d^m P_n(cos θ) / d(cos θ)^m
+    
+    This does NOT include the Condon-Shortley phase factor (-1)^m.
+    
+    Args:
+        n: Degree (n >= 0)
+        m: Order (0 <= m <= n, use absolute value)
+        cos_theta: Cosine of polar angle
+        
+    Returns:
+        P_n^m(cos θ) in Hansen's convention
+    """
+    abs_m = abs(m)
+    
+    # scipy's lpmv includes (-1)^m phase, so we remove it
+    P_scipy = lpmv(abs_m, n, cos_theta)
+    P_hansen = (-1)**abs_m * P_scipy
+    
+    return P_hansen
+
+def normalized_associated_legendre(n: int, m: int, theta: np.ndarray):
+    """
+    Compute normalized associated Legendre function per Hansen equation A1.25.
+    
+    P̄_n^m(cos θ) = sqrt((2n+1)/2 × (n-m)!/(n+m)!) × P_n^m(cos θ)
+    
+    Also computes the derivative dP̄_n^m/dθ.
     
     Args:
         n: Degree (n >= 1)
@@ -136,7 +161,7 @@ def normalized_associated_legendre(n: int, m: int, theta: np.ndarray) -> Tuple[n
         theta: Polar angle(s) in radians
         
     Returns:
-        P_norm: Normalized associated Legendre function values
+        P_norm: Normalized associated Legendre function
         dP_norm: Derivative with respect to theta
     """
     abs_m = abs(m)
@@ -146,36 +171,58 @@ def normalized_associated_legendre(n: int, m: int, theta: np.ndarray) -> Tuple[n
     # Safe sin_theta to avoid division by zero at poles
     sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
     
-    # Compute unnormalized associated Legendre function
-    P_unnorm = lpmv(abs_m, n, cos_theta)
+    # Compute unnormalized associated Legendre function (Hansen convention)
+    P_unnorm = hansen_associated_legendre(n, abs_m, cos_theta)
     
-    # Normalization factor
+    # Normalization factor from equation A1.25
     norm_factor = np.sqrt((2*n + 1) / 2 * 
                          np.math.factorial(n - abs_m) / 
                          np.math.factorial(n + abs_m))
     
     P_norm = norm_factor * P_unnorm
     
-    # Compute derivative using recurrence relations with SAFE division
+    # Compute derivative using Hansen's equation A1.34b
+    # For normalized functions, the coefficients change due to normalization factor ratios
     if abs_m == 0:
-        if n == 1:
-            dP_norm = -norm_factor * np.sqrt((n*(n+1))/2) * sin_theta
-        else:
-            P_n_minus_1 = lpmv(0, n-1, cos_theta) * np.sqrt((2*(n-1) + 1) / 2)
-            dP_norm = -(1/(2*n + 1)) * ((n-abs_m+1)*(n+abs_m) * P_n_minus_1 - 
-                                         (n+1) * cos_theta * P_norm) / sin_theta_safe
+        # For m=0: dP̄_n^0/dθ = -√[n(n+1)] × P̄_n^1
+        P_bar_n_1 = hansen_associated_legendre(n, 1, cos_theta)
+        norm_factor_n_1 = np.sqrt((2*n + 1) / 2 * 
+                                 np.math.factorial(n - 1) / 
+                                 np.math.factorial(n + 1))
+        P_bar_n_1_norm = norm_factor_n_1 * P_bar_n_1
+        
+        coeff = np.sqrt(n * (n + 1))
+        dP_norm = -coeff * P_bar_n_1_norm
     else:
-        if n > abs_m:
-            P_n_minus_1 = lpmv(abs_m, n-1, cos_theta) * np.sqrt((2*(n-1) + 1) / 2 * 
-                              np.math.factorial(n-1-abs_m) / 
-                              np.math.factorial(n-1+abs_m))
-            dP_norm = 0.5 * ((n - abs_m + 1) * (n + abs_m) * P_n_minus_1 - 
-                            (n + 1) * cos_theta * P_norm) / sin_theta_safe
+        # For m > 0: dP̄_n^m/dθ = (1/2){√[(n-m+1)(n+m)] P̄_n^(m-1) - √[(n+m+1)(n-m)] P̄_n^(m+1)}
+        
+        # First term: √[(n-m+1)(n+m)] × P̄_n^(m-1)
+        P_n_m_minus = hansen_associated_legendre(n, abs_m - 1, cos_theta)
+        norm_factor_m_minus = np.sqrt((2*n + 1) / 2 * 
+                                     np.math.factorial(n - (abs_m - 1)) / 
+                                     np.math.factorial(n + (abs_m - 1)))
+        P_bar_n_m_minus = norm_factor_m_minus * P_n_m_minus
+        
+        coeff1 = np.sqrt((n - abs_m + 1) * (n + abs_m))
+        term1 = coeff1 * P_bar_n_m_minus
+        
+        # Second term: √[(n+m+1)(n-m)] × P̄_n^(m+1)
+        if abs_m + 1 <= n:
+            P_n_m_plus = hansen_associated_legendre(n, abs_m + 1, cos_theta)
+            norm_factor_m_plus = np.sqrt((2*n + 1) / 2 * 
+                                        np.math.factorial(n - (abs_m + 1)) / 
+                                        np.math.factorial(n + (abs_m + 1)))
+            P_bar_n_m_plus = norm_factor_m_plus * P_n_m_plus
+            
+            coeff2 = np.sqrt((n + abs_m + 1) * (n - abs_m))
+            term2 = coeff2 * P_bar_n_m_plus
         else:
-            dP_norm = -abs_m * cos_theta * P_norm / sin_theta_safe
+            # P̄_n^(n+1) = 0
+            term2 = 0.0
+        
+        dP_norm = 0.5 * (term1 - term2)
     
     return P_norm, dP_norm
-
 
 def far_field_pattern_functions(n: int, m: int, theta: np.ndarray, phi: np.ndarray) -> \
         Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]:
@@ -203,7 +250,10 @@ def far_field_pattern_functions(n: int, m: int, theta: np.ndarray, phi: np.ndarr
     prefactor = np.sqrt(2 / (n * (n + 1)))
     
     # Sign factor: (-m/|m|)^m
-    sign_factor = (-m / abs_m) ** m
+    if m == 0:
+        sign_factor = 1.0
+    else:
+        sign_factor = (-m / abs(m)) ** m
     
     # Azimuthal phase
     phase = np.exp(1j * m * phi)
@@ -458,7 +508,10 @@ class SphericalWaveExpansion:
             exp_imphi = np.exp(1j * m * phi)
             
             prefactor = np.sqrt(2 / (n * (n + 1)))
-            sign_factor = (-m / abs(m)) ** m
+            if m == 0:
+                sign_factor = 1.0
+            else:
+                sign_factor = (-m / abs(m)) ** m
             
             sin_theta = np.sin(theta)
             sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
@@ -952,8 +1005,11 @@ class SphericalWaveExpansion:
             
             # Common factors
             prefactor = np.sqrt(2 / (n * (n + 1)))
-            sign_factor = (-m / abs(m)) ** m
-            
+            if m == 0:
+                sign_factor = 1.0
+            else:
+                sign_factor = (-m / abs(m)) ** m
+                        
             # Safe sin(theta)
             sin_theta = np.sin(theta)
             sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
@@ -1330,170 +1386,45 @@ def write_ticra_sph(filename: str,
 # Example Usage
 # ==============================================================================
 
+def verify_against_hansen_table():
+    """
+    Verify implementation against values from Hansen's table (page 324).
+    """
+    import numpy as np
+    
+    theta = np.pi / 3  # 60 degrees for easy checking
+    cos_theta = np.cos(theta)
+    sin_theta = np.sin(theta)
+    
+    print("Verification against Hansen table (Appendix A1):")
+    print(f"θ = {np.degrees(theta):.1f}°, cos(θ) = {cos_theta:.4f}, sin(θ) = {sin_theta:.4f}\n")
+    
+    # Test cases from Hansen tables
+    # Page 322: Function values P̄^|m|_n(cos θ)  
+    # Page 324: Derivatives dP̄^|m|_n/dθ
+    test_cases = [
+        # (n, m, expected_P, expected_dP_dtheta, description)
+        (1, 0, np.sqrt(6)/2 * cos_theta, -np.sqrt(6)/2 * sin_theta, 
+         "P̄_1^0 = √6/2 cos θ, dP̄_1^0/dθ = -√6/2 sin θ"),
+        (1, 1, np.sqrt(3)/2 * sin_theta, np.sqrt(3)/2 * cos_theta,
+         "P̄_1^1 = √3/2 sin θ, dP̄_1^1/dθ = √3/2 cos θ"),
+        (2, 0, np.sqrt(10)/8 * (3*np.cos(2*theta) + 1), -3*np.sqrt(10)/4 * np.sin(2*theta),
+         "P̄_2^0 = √10/8 (3cos 2θ + 1), dP̄_2^0/dθ = -3√10/4 sin 2θ"),
+        (2, 1, np.sqrt(15)/4 * np.sin(2*theta), np.sqrt(15)/2 * np.cos(2*theta),
+         "P̄_2^1 = √15/4 sin 2θ, dP̄_2^1/dθ = √15/2 cos 2θ"),
+    ]
+    
+    print("Expected values at θ = 60° (from Hansen Appendix A1):")
+    print()
+    for n, m, exp_P, exp_dP, desc in test_cases:
+        P_norm, dP_norm = normalized_associated_legendre(n, m, theta)
+        
+        print(f"{desc}")
+        print(f"  P̄_{n}^{m}: computed={P_norm:.6f}, expected={exp_P:.6f}, " 
+              f"error={abs(P_norm - exp_P):.2e}")
+        print(f"  dP̄_{n}^{m}/dθ: computed={dP_norm:.6f}, expected={exp_dP:.6f}, "
+              f"error={abs(dP_norm - exp_dP):.2e}")
+        print()
+
 if __name__ == "__main__":
-    
-    print("=== Example 1: Create SWE from coefficients ===")
-    # Create simple dipole-like pattern
-    Q1_coeffs = {
-        (1, -1): 0.5 + 0.1j,
-        (1, 0): 1.0,
-        (1, 1): 0.5 - 0.1j,
-    }
-    Q2_coeffs = {
-        (1, -1): 0.1j,
-        (1, 0): 0.0,
-        (1, 1): -0.1j,
-    }
-    
-    swe = SphericalWaveExpansion(Q1_coeffs, Q2_coeffs, frequency=10e9)
-    print(swe)
-    
-    # Calculate far field
-    theta = np.linspace(0, np.pi, 91)
-    phi = np.zeros_like(theta)
-    E_theta, E_phi = swe.far_field(theta, phi)
-    print(f"Field calculated at {len(theta)} points")
-    print(f"Max |E_theta|: {np.max(np.abs(E_theta)):.3e}")
-    
-    print("\n=== Example 2: Read from .sph file ===")
-    # swe_from_file = SphericalWaveExpansion.from_sph_file("output_truncated.sph")
-    # print(swe_from_file)
-    
-    print("\n=== Example 3: Fit SWE from far-field data ===")
-    # Generate synthetic far-field data
-    theta_meas = np.random.uniform(0, np.pi, 100)
-    phi_meas = np.random.uniform(0, 2*np.pi, 100)
-    E_theta_meas, E_phi_meas = swe.far_field(theta_meas, phi_meas)
-    
-    # Fit new SWE
-    swe_fitted = SphericalWaveExpansion.from_far_field(
-        theta_meas, phi_meas, E_theta_meas, E_phi_meas,
-        frequency=10e9, NMAX=1
-    )
-    print(swe_fitted)
-    print("Original Q1(1,0):", Q1_coeffs[(1, 0)])
-    print("Fitted Q1(1,0):  ", swe_fitted.Q1_coeffs[(1, 0)])
-    
-    print("\n=== Example 4: Near-field calculation ===")
-    # Calculate E and H fields at near-field points
-    r_near = np.array([0.1, 0.2, 0.5])  # meters
-    theta_near = np.array([np.pi/4, np.pi/2, 3*np.pi/4])
-    phi_near = np.array([0.0, np.pi/2, np.pi])
-    
-    (E_r, E_theta_nf, E_phi_nf), (H_r, H_theta_nf, H_phi_nf) = swe.near_field(
-        r_near, theta_near, phi_near
-    )
-    print(f"Near-field calculated at {len(r_near)} points")
-    print(f"E_r at r={r_near[0]:.2f}m: {E_r[0]:.3e} V/m")
-    print(f"H_theta at r={r_near[1]:.2f}m: {H_theta_nf[1]:.3e} A/m")
-    
-    print("\n=== Example 5: Surface currents ===")
-    # Calculate equivalent surface currents on a sphere
-    r_surface = 0.3  # meters
-    theta_surf = np.linspace(0, np.pi, 37)
-    phi_surf = np.linspace(0, 2*np.pi, 73)
-    theta_grid, phi_grid = np.meshgrid(theta_surf, phi_surf, indexing='ij')
-    r_grid = np.full_like(theta_grid, r_surface)
-    
-    (J_r, J_theta, J_phi), (M_r, M_theta, M_phi) = swe.surface_currents(
-        r_grid, theta_grid, phi_grid, surface_normal='outward'
-    )
-    print(f"Surface currents calculated on {theta_grid.size} surface points")
-    print(f"Max |J_theta|: {np.max(np.abs(J_theta)):.3e} A/m")
-    print(f"Max |M_phi|: {np.max(np.abs(M_phi)):.3e} V/m")
-    print(f"J_r should be zero: max|J_r| = {np.max(np.abs(J_r)):.3e}")
-    
-    print("\n=== Example 6: Write to file ===")
-    # swe.to_sph_file("output_example.sph", description="Example SWE output")
-    
-    print("\n=== Example 7: Cartesian coordinates ===")
-    # Calculate fields at Cartesian grid points
-    x_pts = np.array([0.1, 0.0, 0.1])
-    y_pts = np.array([0.0, 0.1, 0.1])
-    z_pts = np.array([0.2, 0.2, 0.0])
-    
-    (E_x, E_y, E_z), (H_x, H_y, H_z) = swe.near_field_cartesian(x_pts, y_pts, z_pts)
-    print(f"Fields in Cartesian basis at {len(x_pts)} points")
-    print(f"E at (x,y,z) = ({x_pts[0]:.1f}, {y_pts[0]:.1f}, {z_pts[0]:.1f}):")
-    print(f"  E_x = {E_x[0]:.3e} V/m")
-    print(f"  E_y = {E_y[0]:.3e} V/m")
-    print(f"  E_z = {E_z[0]:.3e} V/m")
-    
-    print("\n=== Example 8: Create SWE from spherical near-field measurements ===")
-    # Generate synthetic near-field data on a sphere
-    r_meas = 0.5  # meters
-    theta_nf_meas = np.random.uniform(0, np.pi, 150)
-    phi_nf_meas = np.random.uniform(0, 2*np.pi, 150)
-    
-    # Get "measured" fields from original SWE
-    (_, E_theta_nf_meas, E_phi_nf_meas), (_, H_theta_nf_meas, H_phi_nf_meas) = swe.near_field(
-        np.full_like(theta_nf_meas, r_meas), theta_nf_meas, phi_nf_meas
-    )
-    
-    # Fit new SWE from near-field measurements
-    swe_from_nf = SphericalWaveExpansion.from_spherical_near_field(
-        r_meas, theta_nf_meas, phi_nf_meas,
-        E_theta_nf_meas, E_phi_nf_meas,
-        frequency=10e9, NMAX=1
-    )
-    print(f"SWE fitted from spherical near-field: {swe_from_nf}")
-    print(f"Comparison of Q1(1,0):")
-    print(f"  Original: {Q1_coeffs[(1, 0)]:.6f}")
-    print(f"  Fitted:   {swe_from_nf.Q1_coeffs[(1, 0)]:.6f}")
-    
-    print("\n=== Example 9: Create SWE from planar near-field measurements ===")
-    # Simulate planar scan at z = 0.3m
-    x_scan = np.linspace(-0.3, 0.3, 31)
-    y_scan = np.linspace(-0.3, 0.3, 31)
-    X_scan, Y_scan = np.meshgrid(x_scan, y_scan)
-    x_flat = X_scan.flatten()
-    y_flat = Y_scan.flatten()
-    z_scan_plane = 0.3
-    
-    # Get "measured" fields in Cartesian coordinates
-    (E_x_meas, E_y_meas, E_z_meas), _ = swe.near_field_cartesian(
-        x_flat, y_flat, np.full_like(x_flat, z_scan_plane)
-    )
-    
-    # Fit SWE from planar measurements (using tangential components)
-    swe_from_planar = SphericalWaveExpansion.from_planar_near_field(
-        x_flat, y_flat, z_scan_plane,
-        E_x_meas, E_y_meas,
-        frequency=10e9, NMAX=1,
-        origin_offset=(0., 0., 0.)
-    )
-    print(f"SWE fitted from planar near-field: {swe_from_planar}")
-    print(f"Comparison of Q1(1,0):")
-    print(f"  Original: {Q1_coeffs[(1, 0)]:.6f}")
-    print(f"  Fitted:   {swe_from_planar.Q1_coeffs[(1, 0)]:.6f}")
-    
-    print("\n=== Example 10: Create SWE from cylindrical near-field measurements ===")
-    # Simulate cylindrical scan at rho = 0.4m
-    phi_cyl_scan = np.linspace(0, 2*np.pi, 72)
-    z_cyl_scan = np.linspace(-0.3, 0.3, 31)
-    PHI_cyl, Z_cyl = np.meshgrid(phi_cyl_scan, z_cyl_scan)
-    phi_flat = PHI_cyl.flatten()
-    z_flat = Z_cyl.flatten()
-    rho_scan = 0.4
-    
-    # Convert to Cartesian to get fields
-    x_cyl = rho_scan * np.cos(phi_flat)
-    y_cyl = rho_scan * np.sin(phi_flat)
-    (E_x_cyl, E_y_cyl, E_z_cyl), _ = swe.near_field_cartesian(x_cyl, y_cyl, z_flat)
-    
-    # Convert to cylindrical components
-    E_rho_meas = E_x_cyl * np.cos(phi_flat) + E_y_cyl * np.sin(phi_flat)
-    # E_phi_meas = -E_x_cyl * np.sin(phi_flat) + E_y_cyl * np.cos(phi_flat)  # Not used
-    E_z_meas = E_z_cyl
-    
-    # Fit SWE from cylindrical measurements
-    swe_from_cyl = SphericalWaveExpansion.from_cylindrical_near_field(
-        np.full_like(phi_flat, rho_scan), phi_flat, z_flat,
-        E_rho_meas, E_z_meas,
-        frequency=10e9, NMAX=1,
-        origin_offset=(0., 0., 0.)
-    )
-    print(f"SWE fitted from cylindrical near-field: {swe_from_cyl}")
-    print(f"Comparison of Q1(1,0):")
-    print(f"  Original: {Q1_coeffs[(1, 0)]:.6f}")
-    print(f"  Fitted:   {swe_from_cyl.Q1_coeffs[(1, 0)]:.6f}")
+    verify_against_hansen_table()
