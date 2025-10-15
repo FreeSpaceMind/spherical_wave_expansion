@@ -1,38 +1,3 @@
 [build-system]
-requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+requires = ["setuptools>=45", "wheel"]
 build-backend = "setuptools.build_meta"
-
-[project]
-name = "spherical-wave-expansion"
-version = "0.1.0"
-description = "Spherical wave expansion for antenna pattern analysis and near-field measurements"
-readme = "README.md"
-requires-python = ">=3.8"
-license = {text = "MIT"}
-authors = [
-    {name = "Your Name", email = "your.email@example.com"}
-]
-keywords = ["antenna", "electromagnetics", "spherical-wave-expansion", "near-field"]
-classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Intended Audience :: Science/Research",
-    "Topic :: Scientific/Engineering :: Physics",
-    "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3",
-]
-
-dependencies = [
-    "numpy>=1.20.0",
-    "scipy>=1.7.0",
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=6.0",
-    "pytest-cov",
-    "black",
-    "flake8",
-]
-viz = [
-    "matplotlib>=3.3.0",
-]
