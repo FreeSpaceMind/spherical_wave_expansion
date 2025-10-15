@@ -41,7 +41,9 @@ References:
 - IEEE Std 1720-2012: Recommended Practice for Near-Field Antenna Measurements
 """
 
+import math
 import numpy as np
+np.math = math 
 from scipy.special import lpmv, spherical_jn, spherical_yn
 from scipy.optimize import lsq_linear
 from typing import Dict, Tuple, Optional, Union
@@ -141,6 +143,9 @@ def normalized_associated_legendre(n: int, m: int, theta: np.ndarray) -> Tuple[n
     cos_theta = np.cos(theta)
     sin_theta = np.sin(theta)
     
+    # Safe sin_theta to avoid division by zero at poles
+    sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
+    
     # Compute unnormalized associated Legendre function
     P_unnorm = lpmv(abs_m, n, cos_theta)
     
@@ -151,23 +156,23 @@ def normalized_associated_legendre(n: int, m: int, theta: np.ndarray) -> Tuple[n
     
     P_norm = norm_factor * P_unnorm
     
-    # Compute derivative using recurrence relations
+    # Compute derivative using recurrence relations with SAFE division
     if abs_m == 0:
         if n == 1:
             dP_norm = -norm_factor * np.sqrt((n*(n+1))/2) * sin_theta
         else:
             P_n_minus_1 = lpmv(0, n-1, cos_theta) * np.sqrt((2*(n-1) + 1) / 2)
             dP_norm = -(1/(2*n + 1)) * ((n-abs_m+1)*(n+abs_m) * P_n_minus_1 - 
-                                         (n+1) * cos_theta * P_norm) / sin_theta
+                                         (n+1) * cos_theta * P_norm) / sin_theta_safe
     else:
         if n > abs_m:
             P_n_minus_1 = lpmv(abs_m, n-1, cos_theta) * np.sqrt((2*(n-1) + 1) / 2 * 
                               np.math.factorial(n-1-abs_m) / 
                               np.math.factorial(n-1+abs_m))
             dP_norm = 0.5 * ((n - abs_m + 1) * (n + abs_m) * P_n_minus_1 - 
-                            (n + 1) * cos_theta * P_norm) / sin_theta
+                            (n + 1) * cos_theta * P_norm) / sin_theta_safe
         else:
-            dP_norm = -abs_m * cos_theta * P_norm / sin_theta
+            dP_norm = -abs_m * cos_theta * P_norm / sin_theta_safe
     
     return P_norm, dP_norm
 
