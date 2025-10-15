@@ -348,10 +348,13 @@ class SphericalWaveExpansion:
                 E_theta += Q2 * K2_theta
                 E_phi += Q2 * K2_phi
         
-        # Apply overall factor k (assuming η=1)
-        E_theta *= self.k
-        E_phi *= self.k
-        
+        # Apply overall factor k * sqrt(η₀) from TICRA equation (4)
+        # E_SI(r,θ,φ) = k√ζ Σ Q_smn F_smn(r,θ,φ)
+        # where ζ = η₀ = 376.73 Ω
+        Z0 = 376.730313668  # Free space impedance in ohms
+        E_theta *= self.k * np.sqrt(Z0)
+        E_phi *= self.k * np.sqrt(Z0)
+                
         return E_theta, E_phi
     
     @classmethod
@@ -1105,6 +1108,10 @@ def read_ticra_sph(filename: str) -> Dict:
     Returns:
         Dictionary containing all data from .sph file
     """
+
+    # Fixed normalization factor from Ticra documentation
+    NORMALIZATION_FACTOR = np.sqrt(8 * np.pi)
+
     with open(filename, 'r') as f:
         lines = f.readlines()
     
@@ -1174,8 +1181,10 @@ def read_ticra_sph(filename: str) -> Dict:
                         
                         coeff_parts = coeff_line.split()
                         if len(coeff_parts) >= 4:
-                            Q1_coeffs[(n, 0)] = float(coeff_parts[0]) + 1j * float(coeff_parts[1])
-                            Q2_coeffs[(n, 0)] = float(coeff_parts[2]) + 1j * float(coeff_parts[3])
+                            Q1_prime = float(coeff_parts[0]) + 1j * float(coeff_parts[1])
+                            Q2_prime = float(coeff_parts[2]) + 1j * float(coeff_parts[3])
+                            Q1_coeffs[(n, 0)] = NORMALIZATION_FACTOR * np.conj(Q1_prime)
+                            Q2_coeffs[(n, 0)] = NORMALIZATION_FACTOR * np.conj(Q2_prime)
                         else:
                             line_idx -= 1
                             break
@@ -1189,8 +1198,10 @@ def read_ticra_sph(filename: str) -> Dict:
                         
                         coeff_parts = coeff_line.split()
                         if len(coeff_parts) >= 4:
-                            Q1_coeffs[(n, -abs_m)] = float(coeff_parts[0]) + 1j * float(coeff_parts[1])
-                            Q2_coeffs[(n, -abs_m)] = float(coeff_parts[2]) + 1j * float(coeff_parts[3])
+                            Q1_prime = float(coeff_parts[0]) + 1j * float(coeff_parts[1])
+                            Q2_prime = float(coeff_parts[2]) + 1j * float(coeff_parts[3])
+                            Q1_coeffs[(n, -abs_m)] = NORMALIZATION_FACTOR * np.conj(Q1_prime)
+                            Q2_coeffs[(n, -abs_m)] = NORMALIZATION_FACTOR * np.conj(Q2_prime)
                         else:
                             line_idx -= 1
                             break
@@ -1203,8 +1214,10 @@ def read_ticra_sph(filename: str) -> Dict:
                         
                         coeff_parts = coeff_line.split()
                         if len(coeff_parts) >= 4:
-                            Q1_coeffs[(n, abs_m)] = float(coeff_parts[0]) + 1j * float(coeff_parts[1])
-                            Q2_coeffs[(n, abs_m)] = float(coeff_parts[2]) + 1j * float(coeff_parts[3])
+                            Q1_prime = float(coeff_parts[0]) + 1j * float(coeff_parts[1])
+                            Q2_prime = float(coeff_parts[2]) + 1j * float(coeff_parts[3])
+                            Q1_coeffs[(n, abs_m)] = NORMALIZATION_FACTOR * np.conj(Q1_prime)
+                            Q2_coeffs[(n, abs_m)] = NORMALIZATION_FACTOR * np.conj(Q2_prime)
                         else:
                             line_idx -= 1
                             break
@@ -1237,6 +1250,10 @@ def write_ticra_sph(filename: str,
     """
     Write spherical wave coefficients to TICRA .sph file format.
     
+    Applies inverse normalization to convert from Q_smn coefficients
+    to Q'_smn file format according to TICRA spec equation (6):
+    Q'_smn = (1/√8π) * Q*_smn
+    
     Args:
         filename: Output file path
         Q1_coeffs: Q₁ coefficients dictionary
@@ -1249,6 +1266,10 @@ def write_ticra_sph(filename: str,
         description: Description text
     """
     from datetime import datetime
+    
+    # Normalization factor from TICRA spec
+    # Q'_smn = (1/√8π) * Q*_smn
+    NORMALIZATION_FACTOR = np.sqrt(8 * np.pi)
     
     with open(filename, 'w') as f:
         # Record 1: PRGTAG
@@ -1275,14 +1296,18 @@ def write_ticra_sph(filename: str,
         
         # Write coefficients for each |m|
         for m_val in range(MMAX + 1):
-            # Calculate power for this mode (sum of |Q|^2 over all n)
+            # Calculate power for this mode (sum of |Q'|^2 over all n)
+            # Note: Power is calculated from Q' coefficients in the file
             power = 0.0
             for n in range(max(1, m_val), NMAX + 1):
                 for m_sign in ([-m_val, m_val] if m_val > 0 else [0]):
                     if (n, m_sign) in Q1_coeffs:
-                        power += abs(Q1_coeffs[(n, m_sign)])**2
+                        # Convert to Q' for power calculation
+                        Q1_prime = np.conj(Q1_coeffs[(n, m_sign)]) / NORMALIZATION_FACTOR
+                        power += abs(Q1_prime)**2
                     if (n, m_sign) in Q2_coeffs:
-                        power += abs(Q2_coeffs[(n, m_sign)])**2
+                        Q2_prime = np.conj(Q2_coeffs[(n, m_sign)]) / NORMALIZATION_FACTOR
+                        power += abs(Q2_prime)**2
             
             # Write mode header
             f.write(f"{m_val:6d}  {power:24.16E}\n")
@@ -1291,22 +1316,35 @@ def write_ticra_sph(filename: str,
             for n in range(max(1, m_val), NMAX + 1):
                 if m_val == 0:
                     # m=0 case: one line per n
+                    # Apply inverse normalization: Q' = conj(Q) / sqrt(8π)
                     Q1 = Q1_coeffs.get((n, 0), 0.0 + 0.0j)
                     Q2 = Q2_coeffs.get((n, 0), 0.0 + 0.0j)
-                    f.write(f"  {Q1.real:23.16E} {Q1.imag:23.16E} "
-                           f"{Q2.real:23.16E} {Q2.imag:23.16E}\n")
+                    
+                    Q1_prime = np.conj(Q1) / NORMALIZATION_FACTOR
+                    Q2_prime = np.conj(Q2) / NORMALIZATION_FACTOR
+                    
+                    f.write(f"  {Q1_prime.real:23.16E} {Q1_prime.imag:23.16E} "
+                           f"{Q2_prime.real:23.16E} {Q2_prime.imag:23.16E}\n")
                 else:
                     # -m line
                     Q1_neg = Q1_coeffs.get((n, -m_val), 0.0 + 0.0j)
                     Q2_neg = Q2_coeffs.get((n, -m_val), 0.0 + 0.0j)
-                    f.write(f"  {Q1_neg.real:23.16E} {Q1_neg.imag:23.16E} "
-                           f"{Q2_neg.real:23.16E} {Q2_neg.imag:23.16E}\n")
+                    
+                    Q1_neg_prime = np.conj(Q1_neg) / NORMALIZATION_FACTOR
+                    Q2_neg_prime = np.conj(Q2_neg) / NORMALIZATION_FACTOR
+                    
+                    f.write(f"  {Q1_neg_prime.real:23.16E} {Q1_neg_prime.imag:23.16E} "
+                           f"{Q2_neg_prime.real:23.16E} {Q2_neg_prime.imag:23.16E}\n")
                     
                     # +m line
                     Q1_pos = Q1_coeffs.get((n, m_val), 0.0 + 0.0j)
                     Q2_pos = Q2_coeffs.get((n, m_val), 0.0 + 0.0j)
-                    f.write(f"  {Q1_pos.real:23.16E} {Q1_pos.imag:23.16E} "
-                           f"{Q2_pos.real:23.16E} {Q2_pos.imag:23.16E}\n")
+                    
+                    Q1_pos_prime = np.conj(Q1_pos) / NORMALIZATION_FACTOR
+                    Q2_pos_prime = np.conj(Q2_pos) / NORMALIZATION_FACTOR
+                    
+                    f.write(f"  {Q1_pos_prime.real:23.16E} {Q1_pos_prime.imag:23.16E} "
+                           f"{Q2_pos_prime.real:23.16E} {Q2_pos_prime.imag:23.16E}\n")
 
 
 # ==============================================================================
