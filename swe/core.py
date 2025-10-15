@@ -381,8 +381,8 @@ class SphericalWaveExpansion:
         # E_SI(r,θ,φ) = k√ζ Σ Q_smn F_smn(r,θ,φ)
         # where ζ = η₀ = 376.73 Ω
         Z0 = 376.730313668  # Free space impedance in ohms
-        E_theta *= self.k / np.sqrt(Z0)
-        E_phi *= self.k / np.sqrt(Z0)
+        E_theta *= self.k * np.sqrt(Z0)
+        E_phi *= self.k * np.sqrt(Z0)
                 
         return E_theta, E_phi
     
@@ -1141,8 +1141,9 @@ def read_ticra_sph(filename: str) -> Dict:
         Dictionary containing all data from .sph file
     """
 
-    # Fixed normalization factor from Ticra documentation
-    NORMALIZATION_FACTOR = np.sqrt(8 * np.pi)
+    # NORMALIZATION FACTOR (from Ticra)
+    normalization_factor = np.sqrt(8 * np.pi)
+
 
     with open(filename, 'r') as f:
         lines = f.readlines()
@@ -1213,8 +1214,8 @@ def read_ticra_sph(filename: str) -> Dict:
                         
                         coeff_parts = coeff_line.split()
                         if len(coeff_parts) >= 4:
-                            Q1_coeffs[(n, 0)] = float(coeff_parts[0]) + 1j * float(coeff_parts[1])
-                            Q2_coeffs[(n, 0)] = float(coeff_parts[2]) + 1j * float(coeff_parts[3])
+                            Q1_coeffs[(n, 0)] = normalization_factor * (float(coeff_parts[0]) + 1j * float(coeff_parts[1]))
+                            Q2_coeffs[(n, 0)] = normalization_factor * (float(coeff_parts[2]) + 1j * float(coeff_parts[3]))
                         else:
                             line_idx -= 1
                             break
@@ -1228,8 +1229,8 @@ def read_ticra_sph(filename: str) -> Dict:
                         
                         coeff_parts = coeff_line.split()
                         if len(coeff_parts) >= 4:
-                            Q1_coeffs[(n, -abs_m)] = float(coeff_parts[0]) + 1j * float(coeff_parts[1])
-                            Q2_coeffs[(n, -abs_m)] = float(coeff_parts[2]) + 1j * float(coeff_parts[3])
+                            Q1_coeffs[(n, -abs_m)] = normalization_factor * (float(coeff_parts[0]) + 1j * float(coeff_parts[1]))
+                            Q2_coeffs[(n, -abs_m)] = normalization_factor * (float(coeff_parts[2]) + 1j * float(coeff_parts[3]))
                         else:
                             line_idx -= 1
                             break
@@ -1242,8 +1243,8 @@ def read_ticra_sph(filename: str) -> Dict:
                         
                         coeff_parts = coeff_line.split()
                         if len(coeff_parts) >= 4:
-                            Q1_coeffs[(n, abs_m)] = float(coeff_parts[0]) + 1j * float(coeff_parts[1])
-                            Q2_coeffs[(n, abs_m)] = float(coeff_parts[2]) + 1j * float(coeff_parts[3])
+                            Q1_coeffs[(n, abs_m)] = normalization_factor * (float(coeff_parts[0]) + 1j * float(coeff_parts[1]))
+                            Q2_coeffs[(n, abs_m)] = normalization_factor * (float(coeff_parts[2]) + 1j * float(coeff_parts[3]))
                         else:
                             line_idx -= 1
                             break
@@ -1293,10 +1294,6 @@ def write_ticra_sph(filename: str,
     """
     from datetime import datetime
     
-    # Normalization factor from TICRA spec
-    # Q'_smn = (1/√8π) * Q*_smn
-    NORMALIZATION_FACTOR = np.sqrt(8 * np.pi)
-    
     with open(filename, 'w') as f:
         # Record 1: PRGTAG
         timestamp = datetime.now().strftime("%Y/%m/%d at %H:%M:%S")
@@ -1329,10 +1326,10 @@ def write_ticra_sph(filename: str,
                 for m_sign in ([-m_val, m_val] if m_val > 0 else [0]):
                     if (n, m_sign) in Q1_coeffs:
                         # Convert to Q' for power calculation
-                        Q1_prime = np.conj(Q1_coeffs[(n, m_sign)]) / NORMALIZATION_FACTOR
+                        Q1_prime = Q1_coeffs[(n, m_sign)]
                         power += abs(Q1_prime)**2
                     if (n, m_sign) in Q2_coeffs:
-                        Q2_prime = np.conj(Q2_coeffs[(n, m_sign)]) / NORMALIZATION_FACTOR
+                        Q2_prime = Q2_coeffs[(n, m_sign)]
                         power += abs(Q2_prime)**2
             
             # Write mode header
