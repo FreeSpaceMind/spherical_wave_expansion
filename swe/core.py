@@ -224,59 +224,41 @@ def normalized_associated_legendre(n: int, m: int, theta: np.ndarray):
     
     return P_norm, dP_norm
 
-def far_field_pattern_functions(n: int, m: int, theta: np.ndarray, phi: np.ndarray) -> \
-        Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]:
-    """
-    Compute far-field pattern functions K̄₁ₘₙ and K̄₂ₘₙ.
-    
-    Based on equations A1.59 and A1.60 from Hansen.
-    
-    Args:
-        n: Degree (n >= 1)
-        m: Order (-n <= m <= n)
-        theta: Polar angle(s) in radians
-        phi: Azimuthal angle(s) in radians
-        
-    Returns:
-        K1: Tuple of (K1_theta, K1_phi) components
-        K2: Tuple of (K2_theta, K2_phi) components
-    """
+def far_field_pattern_functions(n: int, m: int, theta: np.ndarray, phi: np.ndarray):
     abs_m = abs(m)
     
-    # Get normalized Legendre function and derivative
-    P_norm, dP_norm_dtheta = normalized_associated_legendre(n, m, theta)
+    # Avoid exact evaluation at poles
+    theta_safe = np.copy(theta)
+    epsilon = 1e-3
+    at_north_pole = theta < epsilon
+    at_south_pole = theta > (np.pi - epsilon)
     
-    # Common factors
+    theta_safe = np.where(at_north_pole, epsilon, theta_safe)
+    theta_safe = np.where(at_south_pole, np.pi - epsilon, theta_safe)
+    
+    # Now compute with safe theta values
+    P_norm, dP_norm_dtheta = normalized_associated_legendre(n, m, theta_safe)
+    
     prefactor = np.sqrt(2 / (n * (n + 1)))
     
-    # Sign factor: (-m/|m|)^m
     if m == 0:
         sign_factor = 1.0
     else:
         sign_factor = (-m / abs(m)) ** m
     
-    # Azimuthal phase
     phase = np.exp(1j * m * phi)
-    
-    # Powers of -i
     i_factor_1 = (-1j) ** (n + 1)
     i_factor_2 = (-1j) ** n
     
-    # Handle division by sin(theta) carefully
-    sin_theta = np.sin(theta)
-    sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
+    # Now sin_theta_safe is never zero
+    sin_theta = np.sin(theta_safe)
+    mP_over_sin = m * P_norm / sin_theta
     
-    # K̄₁ₘₙ components
-    K1_theta = prefactor * sign_factor * phase * i_factor_1 * \
-               (1j * m * P_norm / sin_theta_safe)
-    K1_phi = prefactor * sign_factor * phase * i_factor_1 * \
-             (-dP_norm_dtheta)
+    K1_theta = prefactor * sign_factor * phase * i_factor_1 * (1j * mP_over_sin)
+    K1_phi = prefactor * sign_factor * phase * i_factor_1 * (-dP_norm_dtheta)
     
-    # K̄₂ₘₙ components
-    K2_theta = prefactor * sign_factor * phase * i_factor_2 * \
-               dP_norm_dtheta
-    K2_phi = prefactor * sign_factor * phase * i_factor_2 * \
-             (1j * m * P_norm / sin_theta_safe)
+    K2_theta = prefactor * sign_factor * phase * i_factor_2 * dP_norm_dtheta
+    K2_phi = prefactor * sign_factor * phase * i_factor_2 * (1j * mP_over_sin)
     
     return (K1_theta, K1_phi), (K2_theta, K2_phi)
 
