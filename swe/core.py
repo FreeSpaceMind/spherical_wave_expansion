@@ -1181,8 +1181,8 @@ def read_ticra_sph(filename: str) -> Dict:
                         
                         coeff_parts = coeff_line.split()
                         if len(coeff_parts) >= 4:
-                            Q1_coeffs = float(coeff_parts[0]) + 1j * float(coeff_parts[1])
-                            Q2_coeffs = float(coeff_parts[2]) + 1j * float(coeff_parts[3])
+                            Q1_coeffs[(n, 0)] = float(coeff_parts[0]) + 1j * float(coeff_parts[1])
+                            Q2_coeffs[(n, 0)] = float(coeff_parts[2]) + 1j * float(coeff_parts[3])
                         else:
                             line_idx -= 1
                             break
@@ -1196,8 +1196,8 @@ def read_ticra_sph(filename: str) -> Dict:
                         
                         coeff_parts = coeff_line.split()
                         if len(coeff_parts) >= 4:
-                            Q1_coeffs = float(coeff_parts[0]) + 1j * float(coeff_parts[1])
-                            Q2_coeffs = float(coeff_parts[2]) + 1j * float(coeff_parts[3])
+                            Q1_coeffs[(n, -abs_m)] = float(coeff_parts[0]) + 1j * float(coeff_parts[1])
+                            Q2_coeffs[(n, -abs_m)] = float(coeff_parts[2]) + 1j * float(coeff_parts[3])
                         else:
                             line_idx -= 1
                             break
@@ -1210,8 +1210,8 @@ def read_ticra_sph(filename: str) -> Dict:
                         
                         coeff_parts = coeff_line.split()
                         if len(coeff_parts) >= 4:
-                            Q1_coeffs = float(coeff_parts[0]) + 1j * float(coeff_parts[1])
-                            Q2_coeffs = float(coeff_parts[2]) + 1j * float(coeff_parts[3])
+                            Q1_coeffs[(n, abs_m)] = float(coeff_parts[0]) + 1j * float(coeff_parts[1])
+                            Q2_coeffs[(n, abs_m)] = float(coeff_parts[2]) + 1j * float(coeff_parts[3])
                         else:
                             line_idx -= 1
                             break
@@ -1314,8 +1314,8 @@ def write_ticra_sph(filename: str,
                     Q1 = Q1_coeffs.get((n, 0), 0.0 + 0.0j)
                     Q2 = Q2_coeffs.get((n, 0), 0.0 + 0.0j)
                     
-                    f.write(f"  {Q1_prime.real:23.16E} {Q1_prime.imag:23.16E} "
-                           f"{Q2_prime.real:23.16E} {Q2_prime.imag:23.16E}\n")
+                    f.write(f"  {Q1.real:23.16E} {Q1.imag:23.16E} "
+                           f"{Q2.real:23.16E} {Q2.imag:23.16E}\n")
                 else:
                     # -m line
                     Q1_neg = Q1_coeffs.get((n, -m_val), 0.0 + 0.0j)
