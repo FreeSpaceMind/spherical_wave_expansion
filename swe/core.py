@@ -540,26 +540,36 @@ def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
     
     exp_imphi = np.exp(1j * m * phi)
     
-    # Use original theta for sin_theta (matches what Legendre cache expects)
-    sin_theta = np.sin(theta)
+    # Apply pole avoidance to theta to match Legendre cache computation
+    theta_safe = np.copy(theta)
+    epsilon = 1e-3
+    theta_safe = np.where(theta < epsilon, epsilon, theta_safe)
+    theta_safe = np.where(theta > (np.pi - epsilon), np.pi - epsilon, theta_safe)
+
+    # Compute sin_theta from the pole-avoided values
+    sin_theta = np.sin(theta_safe)
     sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
     
     coef = prefactor * sign_factor * exp_imphi
     
+    # Use correct radial derivative: (1/kr)*d{krh_n}/d(kr) = h_{n-1} - n*h_n/kr
+    radial_deriv = h_n_minus - n * h_n / kr
+
     # Q1 (TE to r) field components - from Hansen
     F1_E_r = 0.0
     F1_E_theta = coef * (1j * m / sin_theta_safe) * P_norm * h_n / kr
     F1_E_phi = -coef * dP_norm * h_n / kr
     
+    # Q1 contributes to H - same radial derivative
     F1_H_r = coef * n * (n + 1) * P_norm * h_n / kr**2
-    F1_H_theta = coef * dP_norm * (k * dh_n - h_n / r) / k
-    F1_H_phi = coef * (1j * m / sin_theta_safe) * P_norm * (k * dh_n - h_n / r) / k
+    F1_H_theta = coef * dP_norm * radial_deriv
+    F1_H_phi = coef * (1j * m / sin_theta_safe) * P_norm * radial_deriv
     
-    # Q2 (TM to r) field components - from Hansen
+    # Q2 (TM to r) field components - from Hansen A1.46
     F2_E_r = coef * n * (n + 1) * P_norm * h_n / kr**2
-    F2_E_theta = coef * dP_norm * (k * dh_n - h_n / r) / k
-    F2_E_phi = coef * (1j * m / sin_theta_safe) * P_norm * (k * dh_n - h_n / r) / k
-    
+    F2_E_theta = coef * dP_norm * radial_deriv
+    F2_E_phi = coef * (1j * m / sin_theta_safe) * P_norm * radial_deriv
+
     F2_H_r = 0.0
     F2_H_theta = -coef * (1j * m / sin_theta_safe) * P_norm * h_n / kr
     F2_H_phi = coef * dP_norm * h_n / kr
