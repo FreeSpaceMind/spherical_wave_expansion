@@ -398,7 +398,17 @@ def compute_all_modes_legendre(n_max: int, m_max: int,
         Dictionary mapping (n, m) -> (P_norm, dP_norm)
     """
     theta = np.atleast_1d(theta)
-    cos_theta = np.cos(theta)
+    
+    # CRITICAL: Apply pole avoidance BEFORE computing Legendre functions
+    theta_safe = np.copy(theta)
+    epsilon = 1e-3
+    at_north_pole = theta < epsilon
+    at_south_pole = theta > (np.pi - epsilon)
+    
+    theta_safe = np.where(at_north_pole, epsilon, theta_safe)
+    theta_safe = np.where(at_south_pole, np.pi - epsilon, theta_safe)
+    
+    cos_theta = np.cos(theta_safe)
     
     results = {}
     
@@ -433,10 +443,13 @@ def far_field_pattern_functions(n: int, m: int,
     """
     Optimized version that can use pre-computed Legendre functions.
     
+    IMPORTANT: Always applies pole avoidance (epsilon=1e-3) consistently
+    with how the cache was computed.
+    
     Args:
         n: Degree
         m: Order
-        theta: Polar angles
+        theta: Polar angles  
         phi: Azimuthal angles
         legendre_cache: Optional pre-computed dict from compute_all_modes_legendre
     
@@ -445,7 +458,7 @@ def far_field_pattern_functions(n: int, m: int,
     """
     abs_m = abs(m)
     
-    # Avoid exact evaluation at poles
+    # Always apply pole avoidance for consistency
     theta_safe = np.copy(theta)
     epsilon = 1e-3
     at_north_pole = theta < epsilon
@@ -482,7 +495,82 @@ def far_field_pattern_functions(n: int, m: int,
     
     return (K1_theta, K1_phi), (K2_theta, K2_phi)
 
-
+def near_field_functions(n: int, m: int, r: np.ndarray, theta: np.ndarray, 
+                        phi: np.ndarray, k: float, legendre_cache: Dict = None):
+    """
+    Calculate near-field function components matching existing near_field implementation.
+    Returns components needed for both E and H fields.
+    """
+    # Use theta_safe for poles like far_field does
+    theta_safe = np.copy(theta)
+    epsilon = 1e-3
+    at_north_pole = theta < epsilon
+    at_south_pole = theta > (np.pi - epsilon)
+    theta_safe = np.where(at_north_pole, epsilon, theta_safe)
+    theta_safe = np.where(at_south_pole, np.pi - epsilon, theta_safe)
+    
+    # Get Legendre from cache
+    if legendre_cache is not None and (n, m) in legendre_cache:
+        P_norm, dP_norm = legendre_cache[(n, m)]
+    else:
+        P_norm, dP_norm = normalized_associated_legendre(n, m, theta_safe)
+    
+    # Radial functions
+    kr = k * r
+    j_n = spherical_jn(n, kr)
+    y_n = spherical_yn(n, kr)
+    h_n = j_n - 1j * y_n
+    
+    if n == 0:
+        dh_n = -j_n + 1j * y_n
+    else:
+        j_n_minus = spherical_jn(n-1, kr)
+        y_n_minus = spherical_yn(n-1, kr)
+        h_n_minus = j_n_minus - 1j * y_n_minus
+        dh_n = h_n_minus - (n + 1) / kr * h_n
+    
+    # Common factors
+    prefactor = np.sqrt(2 / (n * (n + 1)))
+    if m == 0:
+        sign_factor = 1.0
+    else:
+        sign_factor = (-m / abs(m)) ** m
+    
+    exp_imphi = np.exp(1j * m * phi)
+    
+    sin_theta = np.sin(theta_safe)
+    sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
+    
+    coef = prefactor * sign_factor * exp_imphi
+    
+    # Return dict with all field components needed
+    # Q1 contributes to E as M-type (TE to r)
+    E1_r = 0.0
+    E1_theta = coef * (1j * m / sin_theta_safe) * P_norm * h_n / kr
+    E1_phi = -coef * dP_norm * h_n / kr
+    
+    # Q2 contributes to E as N-type (TM to r)
+    E2_r = coef * n * (n + 1) * P_norm * h_n / kr**2
+    E2_theta = coef * dP_norm * (k * dh_n - h_n / r) / k
+    E2_phi = coef * (1j * m / sin_theta_safe) * P_norm * (k * dh_n - h_n / r) / k
+    
+    # For H field: factor_H = 1 / (i*k*Z0)
+    # Q1 contributes to H as curl(M) type
+    H1_r = coef * n * (n + 1) * P_norm * h_n / kr**2
+    H1_theta = coef * dP_norm * (k * dh_n - h_n / r) / k
+    H1_phi = coef * (1j * m / sin_theta_safe) * P_norm * (k * dh_n - h_n / r) / k
+    
+    # Q2 contributes to H as curl(N) type  
+    H2_r = 0.0
+    H2_theta = -coef * (1j * m / sin_theta_safe) * P_norm * h_n / kr
+    H2_phi = coef * dP_norm * h_n / kr
+    
+    return {
+        'E1': (E1_r, E1_theta, E1_phi),
+        'E2': (E2_r, E2_theta, E2_phi),
+        'H1': (H1_r, H1_theta, H1_phi),
+        'H2': (H2_r, H2_theta, H2_phi)
+    }
 # ==============================================================================
 # Main SWE Class
 # ==============================================================================
@@ -611,40 +699,22 @@ class SphericalWaveExpansion:
         return E_theta, E_phi
     
     @classmethod
-    def from_spherical_near_field(cls,
-                                  r: Union[float, np.ndarray],
-                                  theta: np.ndarray,
-                                  phi: np.ndarray,
-                                  E_theta: np.ndarray,
-                                  E_phi: np.ndarray,
-                                  frequency: float,
-                                  NMAX: int,
-                                  MMAX: Optional[int] = None,
-                                  use_H: bool = False,
-                                  H_theta: Optional[np.ndarray] = None,
-                                  H_phi: Optional[np.ndarray] = None) -> 'SphericalWaveExpansion':
+    def from_spherical_near_field_batch(cls,
+                                        r,
+                                        theta: np.ndarray,
+                                        phi: np.ndarray,
+                                        E_theta: np.ndarray,
+                                        E_phi: np.ndarray,
+                                        frequency: float,
+                                        NMAX: int,
+                                        MMAX: int = None,
+                                        use_H: bool = False,
+                                        H_theta: np.ndarray = None,
+                                        H_phi: np.ndarray = None):
         """
-        Create SWE object from near-field measurements on a spherical surface.
+        Optimized from_spherical_near_field using batch Legendre computation.
         
-        This is the most natural measurement geometry for SWE. Measurements should
-        be tangential field components (E_theta, E_phi or H_theta, H_phi) on a 
-        sphere of radius r.
-        
-        Args:
-            r: Radius of measurement sphere in meters (scalar or array)
-            theta: Polar angles in radians (1D array of length N)
-            phi: Azimuthal angles in radians (1D array of length N)
-            E_theta: Measured E_theta component (1D array of length N)
-            E_phi: Measured E_phi component (1D array of length N)
-            frequency: Frequency in Hz
-            NMAX: Maximum degree for expansion
-            MMAX: Maximum order (default: NMAX)
-            use_H: If True, also include H field measurements in fit
-            H_theta: Measured H_theta component (optional)
-            H_phi: Measured H_phi component (optional)
-            
-        Returns:
-            SphericalWaveExpansion object with fitted coefficients
+        This is a classmethod, so add @classmethod decorator when integrating.
         """
         if MMAX is None:
             MMAX = NMAX
@@ -673,31 +743,33 @@ class SphericalWaveExpansion:
         
         N_modes = len(modes)
         
-        # Build design matrix for near-field (includes radial functions)
-        # Similar to far_field but with full h_n functions
-        
-        # Determine number of equations
+        # Determine if using H field
+        use_H_field = False
         if use_H and H_theta is not None and H_phi is not None:
             H_theta = np.atleast_1d(H_theta).flatten()
             H_phi = np.atleast_1d(H_phi).flatten()
             use_H_field = True
-        else:
-            use_H_field = False
         
-        # Each mode contributes 4 unknowns: Re(Q1), Im(Q1), Re(Q2), Im(Q2)
+        # PRE-COMPUTE ALL LEGENDRE FUNCTIONS ONCE
+        legendre_cache = compute_all_modes_legendre(NMAX, MMAX, theta)
+        
+        # Build design matrix
         N_coeffs = 4 * N_modes
         
-        # Build lists to accumulate matrix rows
-        A_rows = []
-        b_list = []
+        if use_H_field:
+            A = np.zeros((8 * N_points, N_coeffs), dtype=float)
+        else:
+            A = np.zeros((4 * N_points, N_coeffs), dtype=float)
         
         kr = k * r
+        sin_theta = np.sin(theta)
+        sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
         
         for mode_idx, (n, m) in enumerate(modes):
-            # Get angular functions
-            P_norm, dP_norm = normalized_associated_legendre(n, m, theta)
+            # Get cached Legendre functions
+            P_norm, dP_norm = legendre_cache[(n, m)]
             
-            # Radial functions
+            # Radial functions (still need to compute these)
             j_n = spherical_jn(n, kr)
             y_n = spherical_yn(n, kr)
             h_n = j_n - 1j * y_n
@@ -719,17 +791,15 @@ class SphericalWaveExpansion:
             else:
                 sign_factor = (-m / abs(m)) ** m
             
-            sin_theta = np.sin(theta)
-            sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
+            coef = prefactor * sign_factor * exp_imphi * k
             
-            # Column indices for this mode's coefficients
+            # Column indices
             col_Q1_re = 4 * mode_idx
             col_Q1_im = 4 * mode_idx + 1
             col_Q2_re = 4 * mode_idx + 2
             col_Q2_im = 4 * mode_idx + 3
             
             # Q1 contribution to E field
-            coef = prefactor * sign_factor * exp_imphi * k
             E_theta_Q1 = coef * (1j * m / sin_theta_safe) * P_norm * h_n / kr
             E_phi_Q1 = -coef * dP_norm * h_n / kr
             
@@ -737,75 +807,61 @@ class SphericalWaveExpansion:
             E_theta_Q2 = coef * dP_norm * (k * dh_n - h_n / r) / k
             E_phi_Q2 = coef * (1j * m / sin_theta_safe) * P_norm * (k * dh_n - h_n / r) / k
             
-            if mode_idx == 0:
-                # Initialize A matrix on first iteration
-                if use_H_field:
-                    A = np.zeros((8 * N_points, N_coeffs), dtype=float)
-                else:
-                    A = np.zeros((4 * N_points, N_coeffs), dtype=float)
-            
-            # Fill A matrix for E_theta real part
+            # Fill A matrix for E_theta (real and imaginary parts)
             A[0*N_points:1*N_points, col_Q1_re] = np.real(E_theta_Q1)
             A[0*N_points:1*N_points, col_Q1_im] = -np.imag(E_theta_Q1)
             A[0*N_points:1*N_points, col_Q2_re] = np.real(E_theta_Q2)
             A[0*N_points:1*N_points, col_Q2_im] = -np.imag(E_theta_Q2)
             
-            # Fill A matrix for E_theta imaginary part
             A[1*N_points:2*N_points, col_Q1_re] = np.imag(E_theta_Q1)
             A[1*N_points:2*N_points, col_Q1_im] = np.real(E_theta_Q1)
             A[1*N_points:2*N_points, col_Q2_re] = np.imag(E_theta_Q2)
             A[1*N_points:2*N_points, col_Q2_im] = np.real(E_theta_Q2)
             
-            # Fill A matrix for E_phi real part
+            # Fill A matrix for E_phi (real and imaginary parts)
             A[2*N_points:3*N_points, col_Q1_re] = np.real(E_phi_Q1)
             A[2*N_points:3*N_points, col_Q1_im] = -np.imag(E_phi_Q1)
             A[2*N_points:3*N_points, col_Q2_re] = np.real(E_phi_Q2)
             A[2*N_points:3*N_points, col_Q2_im] = -np.imag(E_phi_Q2)
             
-            # Fill A matrix for E_phi imaginary part
             A[3*N_points:4*N_points, col_Q1_re] = np.imag(E_phi_Q1)
             A[3*N_points:4*N_points, col_Q1_im] = np.real(E_phi_Q1)
             A[3*N_points:4*N_points, col_Q2_re] = np.imag(E_phi_Q2)
             A[3*N_points:4*N_points, col_Q2_im] = np.real(E_phi_Q2)
             
-            # If using H field as well
+            # H field contributions if requested
             if use_H_field:
                 Z0 = 376.730313668
                 factor_H = k / (1j * k * Z0)
                 
-                # Q1 contribution to H field
                 H_theta_Q1 = factor_H * coef * dP_norm * (k * dh_n - h_n / r) / k / k
                 H_phi_Q1 = factor_H * coef * (1j * m / sin_theta_safe) * P_norm * (k * dh_n - h_n / r) / k / k
                 
-                # Q2 contribution to H field
                 H_theta_Q2 = -factor_H * coef * (1j * m / sin_theta_safe) * P_norm * h_n / kr / k
                 H_phi_Q2 = factor_H * coef * dP_norm * h_n / kr / k
                 
-                # Fill A matrix for H_theta real part
+                # Fill H field rows
                 A[4*N_points:5*N_points, col_Q1_re] = np.real(H_theta_Q1)
                 A[4*N_points:5*N_points, col_Q1_im] = -np.imag(H_theta_Q1)
                 A[4*N_points:5*N_points, col_Q2_re] = np.real(H_theta_Q2)
                 A[4*N_points:5*N_points, col_Q2_im] = -np.imag(H_theta_Q2)
                 
-                # Fill A matrix for H_theta imaginary part
                 A[5*N_points:6*N_points, col_Q1_re] = np.imag(H_theta_Q1)
                 A[5*N_points:6*N_points, col_Q1_im] = np.real(H_theta_Q1)
                 A[5*N_points:6*N_points, col_Q2_re] = np.imag(H_theta_Q2)
                 A[5*N_points:6*N_points, col_Q2_im] = np.real(H_theta_Q2)
                 
-                # Fill A matrix for H_phi real part
                 A[6*N_points:7*N_points, col_Q1_re] = np.real(H_phi_Q1)
                 A[6*N_points:7*N_points, col_Q1_im] = -np.imag(H_phi_Q1)
                 A[6*N_points:7*N_points, col_Q2_re] = np.real(H_phi_Q2)
                 A[6*N_points:7*N_points, col_Q2_im] = -np.imag(H_phi_Q2)
                 
-                # Fill A matrix for H_phi imaginary part
                 A[7*N_points:8*N_points, col_Q1_re] = np.imag(H_phi_Q1)
                 A[7*N_points:8*N_points, col_Q1_im] = np.real(H_phi_Q1)
                 A[7*N_points:8*N_points, col_Q2_re] = np.imag(H_phi_Q2)
                 A[7*N_points:8*N_points, col_Q2_im] = np.real(H_phi_Q2)
         
-        # Build b vector (measurements)
+        # Build b vector
         b = np.concatenate([
             np.real(E_theta), np.imag(E_theta),
             np.real(E_phi), np.imag(E_phi)
@@ -1118,20 +1174,9 @@ class SphericalWaveExpansion:
     
     def near_field(self, r: np.ndarray, theta: np.ndarray, phi: np.ndarray) -> \
             Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], 
-                  Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+                Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """
-        Calculate near-field E and H components at arbitrary points.
-        
-        Uses full spherical wave expansion with Hankel functions.
-        
-        Args:
-            r: Radial distance(s) in meters
-            theta: Polar angle(s) in radians
-            phi: Azimuthal angle(s) in radians
-            
-        Returns:
-            E: Tuple of (E_r, E_theta, E_phi) components
-            H: Tuple of (H_r, H_theta, H_phi) components
+        Calculate near-field E and H components using batch Legendre computation.
         """
         if self.k is None:
             raise ValueError("Frequency must be set before computing near field")
@@ -1143,7 +1188,6 @@ class SphericalWaveExpansion:
         if not (r.shape == theta.shape == phi.shape):
             r, theta, phi = np.broadcast_arrays(r, theta, phi)
         
-        # Initialize field components
         E_r = np.zeros_like(r, dtype=complex)
         E_theta = np.zeros_like(theta, dtype=complex)
         E_phi = np.zeros_like(phi, dtype=complex)
@@ -1155,54 +1199,50 @@ class SphericalWaveExpansion:
         
         all_modes = set(self.Q1_coeffs.keys()) | set(self.Q2_coeffs.keys())
         
+        # PRE-COMPUTE ALL LEGENDRE FUNCTIONS - the only change
+        legendre_cache = compute_all_modes_legendre(self.NMAX, self.MMAX, theta)
+        
         for (n, m) in all_modes:
-            # Get pattern functions (theta/phi dependence)
-            P_norm, dP_norm = normalized_associated_legendre(n, m, theta)
+            # Use cached Legendre functions
+            if (n, m) in legendre_cache:
+                P_norm, dP_norm = legendre_cache[(n, m)]
+            else:
+                P_norm, dP_norm = normalized_associated_legendre(n, m, theta)
             
             # Radial functions
-            # h_n^(3) = j_n - i*y_n (outgoing wave)
             j_n = spherical_jn(n, kr)
             y_n = spherical_yn(n, kr)
             h_n = j_n - 1j * y_n
             
             # Derivatives
             if n == 0:
-                dh_n = -j_n + 1j * y_n  # d/d(kr)[h_0] = -h_1
+                dh_n = -j_n + 1j * y_n
             else:
                 j_n_minus = spherical_jn(n-1, kr)
                 y_n_minus = spherical_yn(n-1, kr)
                 h_n_minus = j_n_minus - 1j * y_n_minus
-                # d/d(kr)[h_n] = h_{n-1} - (n+1)/kr * h_n
                 dh_n = h_n_minus - (n + 1) / kr * h_n
             
-            # Azimuthal phase
             exp_imphi = np.exp(1j * m * phi)
             
-            # Common factors
             prefactor = np.sqrt(2 / (n * (n + 1)))
             if m == 0:
                 sign_factor = 1.0
             else:
                 sign_factor = (-m / abs(m)) ** m
-                        
-            # Safe sin(theta)
+            
             sin_theta = np.sin(theta)
             sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
             
-            # Q1 contribution (TE to r, TM from r in Hansen notation)
+            # Q1 contribution (TE to r)
             if (n, m) in self.Q1_coeffs:
                 Q1 = self.Q1_coeffs[(n, m)]
                 coef = prefactor * sign_factor * exp_imphi * Q1
                 
-                # E field from Q1 (proportional to M_mn in Hansen)
-                # M has no radial component
                 E_r += 0.0
                 E_theta += coef * (1j * m / sin_theta_safe) * P_norm * h_n / kr
                 E_phi += -coef * dP_norm * h_n / kr
                 
-                # H field from Q1 (curl of E / (i*omega*mu))
-                # This is proportional to curl(M) / (ik*Z0)
-                # Z0 = sqrt(mu/eps) = 377 ohms
                 Z0 = 376.730313668
                 factor_H = 1 / (1j * self.k * Z0)
                 
@@ -1210,18 +1250,15 @@ class SphericalWaveExpansion:
                 H_theta += factor_H * coef * dP_norm * (self.k * dh_n - h_n / r) / self.k
                 H_phi += factor_H * coef * (1j * m / sin_theta_safe) * P_norm * (self.k * dh_n - h_n / r) / self.k
             
-            # Q2 contribution (TM to r, TE from r)
+            # Q2 contribution (TM to r)
             if (n, m) in self.Q2_coeffs:
                 Q2 = self.Q2_coeffs[(n, m)]
                 coef = prefactor * sign_factor * exp_imphi * Q2
                 
-                # E field from Q2 (proportional to N_mn)
-                # N has all three components
                 E_r += coef * n * (n + 1) * P_norm * h_n / kr**2
                 E_theta += coef * dP_norm * (self.k * dh_n - h_n / r) / self.k
                 E_phi += coef * (1j * m / sin_theta_safe) * P_norm * (self.k * dh_n - h_n / r) / self.k
                 
-                # H field from Q2 (curl of E / (i*omega*mu))
                 Z0 = 376.730313668
                 factor_H = 1 / (1j * self.k * Z0)
                 
@@ -1229,16 +1266,7 @@ class SphericalWaveExpansion:
                 H_theta += -factor_H * coef * (1j * m / sin_theta_safe) * P_norm * h_n / kr
                 H_phi += factor_H * coef * dP_norm * h_n / kr
         
-        # To Check: I think this is double applied if we apply it here
-        # # Apply overall normalization
-        # # The field should have units of V/m for E and A/m for H
-        # E_r *= self.k
-        # E_theta *= self.k
-        # E_phi *= self.k
-        # H_r *= self.k
-        # H_theta *= self.k
-        # H_phi *= self.k
-        
+        # NO normalization - already correct in field functions
         return (E_r, E_theta, E_phi), (H_r, H_theta, H_phi)
     
     def near_field_cartesian(self, x: np.ndarray, y: np.ndarray, z: np.ndarray) -> \
