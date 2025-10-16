@@ -495,25 +495,25 @@ def far_field_pattern_functions(n: int, m: int,
     
     return (K1_theta, K1_phi), (K2_theta, K2_phi)
 
-def near_field_functions(n: int, m: int, r: np.ndarray, theta: np.ndarray, 
-                        phi: np.ndarray, k: float, legendre_cache: Dict = None):
+def near_field_pattern_functions(n: int, m: int, r: np.ndarray, 
+                                 theta: np.ndarray, phi: np.ndarray, 
+                                 k: float, legendre_cache: Dict = None):
     """
-    Calculate near-field function components matching existing near_field implementation.
-    Returns components needed for both E and H fields.
-    """
-    # Use theta_safe for poles like far_field does
-    theta_safe = np.copy(theta)
-    epsilon = 1e-3
-    at_north_pole = theta < epsilon
-    at_south_pole = theta > (np.pi - epsilon)
-    theta_safe = np.where(at_north_pole, epsilon, theta_safe)
-    theta_safe = np.where(at_south_pole, np.pi - epsilon, theta_safe)
+    Calculate near-field pattern functions for mode (n,m).
     
-    # Get Legendre from cache
+    Returns F vectors for Q1 (TE) and Q2 (TM) modes.
+    
+    Returns:
+        F1_E: (F1_E_r, F1_E_theta, F1_E_phi) for Q1 E-field
+        F2_E: (F2_E_r, F2_E_theta, F2_E_phi) for Q2 E-field  
+        F1_H: (F1_H_r, F1_H_theta, F1_H_phi) for Q1 H-field
+        F2_H: (F2_H_r, F2_H_theta, F2_H_phi) for Q2 H-field
+    """
+    # Get Legendre functions from cache (already has pole avoidance applied)
     if legendre_cache is not None and (n, m) in legendre_cache:
         P_norm, dP_norm = legendre_cache[(n, m)]
     else:
-        P_norm, dP_norm = normalized_associated_legendre(n, m, theta_safe)
+        P_norm, dP_norm = normalized_associated_legendre(n, m, theta)
     
     # Radial functions
     kr = k * r
@@ -521,6 +521,7 @@ def near_field_functions(n: int, m: int, r: np.ndarray, theta: np.ndarray,
     y_n = spherical_yn(n, kr)
     h_n = j_n - 1j * y_n
     
+    # Derivative of Hankel function
     if n == 0:
         dh_n = -j_n + 1j * y_n
     else:
@@ -531,6 +532,7 @@ def near_field_functions(n: int, m: int, r: np.ndarray, theta: np.ndarray,
     
     # Common factors
     prefactor = np.sqrt(2 / (n * (n + 1)))
+    
     if m == 0:
         sign_factor = 1.0
     else:
@@ -538,39 +540,33 @@ def near_field_functions(n: int, m: int, r: np.ndarray, theta: np.ndarray,
     
     exp_imphi = np.exp(1j * m * phi)
     
-    sin_theta = np.sin(theta_safe)
+    # Use original theta for sin_theta (matches what Legendre cache expects)
+    sin_theta = np.sin(theta)
     sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
     
     coef = prefactor * sign_factor * exp_imphi
     
-    # Return dict with all field components needed
-    # Q1 contributes to E as M-type (TE to r)
-    E1_r = 0.0
-    E1_theta = coef * (1j * m / sin_theta_safe) * P_norm * h_n / kr
-    E1_phi = -coef * dP_norm * h_n / kr
+    # Q1 (TE to r) field components - from Hansen
+    F1_E_r = 0.0
+    F1_E_theta = coef * (1j * m / sin_theta_safe) * P_norm * h_n / kr
+    F1_E_phi = -coef * dP_norm * h_n / kr
     
-    # Q2 contributes to E as N-type (TM to r)
-    E2_r = coef * n * (n + 1) * P_norm * h_n / kr**2
-    E2_theta = coef * dP_norm * (k * dh_n - h_n / r) / k
-    E2_phi = coef * (1j * m / sin_theta_safe) * P_norm * (k * dh_n - h_n / r) / k
+    F1_H_r = coef * n * (n + 1) * P_norm * h_n / kr**2
+    F1_H_theta = coef * dP_norm * (k * dh_n - h_n / r) / k
+    F1_H_phi = coef * (1j * m / sin_theta_safe) * P_norm * (k * dh_n - h_n / r) / k
     
-    # For H field: factor_H = 1 / (i*k*Z0)
-    # Q1 contributes to H as curl(M) type
-    H1_r = coef * n * (n + 1) * P_norm * h_n / kr**2
-    H1_theta = coef * dP_norm * (k * dh_n - h_n / r) / k
-    H1_phi = coef * (1j * m / sin_theta_safe) * P_norm * (k * dh_n - h_n / r) / k
+    # Q2 (TM to r) field components - from Hansen
+    F2_E_r = coef * n * (n + 1) * P_norm * h_n / kr**2
+    F2_E_theta = coef * dP_norm * (k * dh_n - h_n / r) / k
+    F2_E_phi = coef * (1j * m / sin_theta_safe) * P_norm * (k * dh_n - h_n / r) / k
     
-    # Q2 contributes to H as curl(N) type  
-    H2_r = 0.0
-    H2_theta = -coef * (1j * m / sin_theta_safe) * P_norm * h_n / kr
-    H2_phi = coef * dP_norm * h_n / kr
+    F2_H_r = 0.0
+    F2_H_theta = -coef * (1j * m / sin_theta_safe) * P_norm * h_n / kr
+    F2_H_phi = coef * dP_norm * h_n / kr
     
-    return {
-        'E1': (E1_r, E1_theta, E1_phi),
-        'E2': (E2_r, E2_theta, E2_phi),
-        'H1': (H1_r, H1_theta, H1_phi),
-        'H2': (H2_r, H2_theta, H2_phi)
-    }
+    return (F1_E_r, F1_E_theta, F1_E_phi), (F2_E_r, F2_E_theta, F2_E_phi), \
+           (F1_H_r, F1_H_theta, F1_H_phi), (F2_H_r, F2_H_theta, F2_H_phi)
+
 # ==============================================================================
 # Main SWE Class
 # ==============================================================================
@@ -1176,7 +1172,16 @@ class SphericalWaveExpansion:
             Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], 
                 Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """
-        Calculate near-field E and H components using batch Legendre computation.
+        Calculate near-field E and H components.
+        
+        Args:
+            r: Radial distance(s) in meters
+            theta: Polar angle(s) in radians
+            phi: Azimuthal angle(s) in radians
+            
+        Returns:
+            E: Tuple of (E_r, E_theta, E_phi) in V/m
+            H: Tuple of (H_r, H_theta, H_phi) in A/m
         """
         if self.k is None:
             raise ValueError("Frequency must be set before computing near field")
@@ -1188,6 +1193,7 @@ class SphericalWaveExpansion:
         if not (r.shape == theta.shape == phi.shape):
             r, theta, phi = np.broadcast_arrays(r, theta, phi)
         
+        # Initialize output arrays
         E_r = np.zeros_like(r, dtype=complex)
         E_theta = np.zeros_like(theta, dtype=complex)
         E_phi = np.zeros_like(phi, dtype=complex)
@@ -1195,80 +1201,49 @@ class SphericalWaveExpansion:
         H_theta = np.zeros_like(theta, dtype=complex)
         H_phi = np.zeros_like(phi, dtype=complex)
         
-        kr = self.k * r
-        
         all_modes = set(self.Q1_coeffs.keys()) | set(self.Q2_coeffs.keys())
         
-        # PRE-COMPUTE ALL LEGENDRE FUNCTIONS - the only change
+        if not all_modes:
+            return (E_r, E_theta, E_phi), (H_r, H_theta, H_phi)
+        
+        # Pre-compute Legendre functions
         legendre_cache = compute_all_modes_legendre(self.NMAX, self.MMAX, theta)
         
+        # Constants
+        Z0 = 376.730313668
+        k_over_sqrtZ0 = self.k / np.sqrt(Z0)
+        
+        # Loop through modes
         for (n, m) in all_modes:
-            # Use cached Legendre functions
-            if (n, m) in legendre_cache:
-                P_norm, dP_norm = legendre_cache[(n, m)]
-            else:
-                P_norm, dP_norm = normalized_associated_legendre(n, m, theta)
+            # Get near-field pattern functions for this mode
+            F1_E, F2_E, F1_H, F2_H = near_field_pattern_functions(
+                n, m, r, theta, phi, self.k, legendre_cache
+            )
             
-            # Radial functions
-            j_n = spherical_jn(n, kr)
-            y_n = spherical_yn(n, kr)
-            h_n = j_n - 1j * y_n
-            
-            # Derivatives
-            if n == 0:
-                dh_n = -j_n + 1j * y_n
-            else:
-                j_n_minus = spherical_jn(n-1, kr)
-                y_n_minus = spherical_yn(n-1, kr)
-                h_n_minus = j_n_minus - 1j * y_n_minus
-                dh_n = h_n_minus - (n + 1) / kr * h_n
-            
-            exp_imphi = np.exp(1j * m * phi)
-            
-            prefactor = np.sqrt(2 / (n * (n + 1)))
-            if m == 0:
-                sign_factor = 1.0
-            else:
-                sign_factor = (-m / abs(m)) ** m
-            
-            sin_theta = np.sin(theta)
-            sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
-            
-            # Q1 contribution (TE to r)
+            # Q1 contribution (TE to r modes)
             if (n, m) in self.Q1_coeffs:
                 Q1 = self.Q1_coeffs[(n, m)]
-                coef = prefactor * sign_factor * exp_imphi * Q1
+                E_r += k_over_sqrtZ0 * Q1 * F1_E[0]
+                E_theta += k_over_sqrtZ0 * Q1 * F1_E[1]
+                E_phi += k_over_sqrtZ0 * Q1 * F1_E[2]
                 
-                E_r += 0.0
-                E_theta += coef * (1j * m / sin_theta_safe) * P_norm * h_n / kr
-                E_phi += -coef * dP_norm * h_n / kr
-                
-                Z0 = 376.730313668
-                factor_H = 1 / (1j * self.k * Z0)
-                
-                H_r += factor_H * coef * n * (n + 1) * P_norm * h_n / kr**2
-                H_theta += factor_H * coef * dP_norm * (self.k * dh_n - h_n / r) / self.k
-                H_phi += factor_H * coef * (1j * m / sin_theta_safe) * P_norm * (self.k * dh_n - h_n / r) / self.k
+                H_r += (1 / (1j * self.k * Z0)) * k_over_sqrtZ0 * Q1 * F1_H[0]
+                H_theta += (1 / (1j * self.k * Z0)) * k_over_sqrtZ0 * Q1 * F1_H[1]
+                H_phi += (1 / (1j * self.k * Z0)) * k_over_sqrtZ0 * Q1 * F1_H[2]
             
-            # Q2 contribution (TM to r)
+            # Q2 contribution (TM to r modes)
             if (n, m) in self.Q2_coeffs:
                 Q2 = self.Q2_coeffs[(n, m)]
-                coef = prefactor * sign_factor * exp_imphi * Q2
+                E_r += k_over_sqrtZ0 * Q2 * F2_E[0]
+                E_theta += k_over_sqrtZ0 * Q2 * F2_E[1]
+                E_phi += k_over_sqrtZ0 * Q2 * F2_E[2]
                 
-                E_r += coef * n * (n + 1) * P_norm * h_n / kr**2
-                E_theta += coef * dP_norm * (self.k * dh_n - h_n / r) / self.k
-                E_phi += coef * (1j * m / sin_theta_safe) * P_norm * (self.k * dh_n - h_n / r) / self.k
-                
-                Z0 = 376.730313668
-                factor_H = 1 / (1j * self.k * Z0)
-                
-                H_r += 0.0
-                H_theta += -factor_H * coef * (1j * m / sin_theta_safe) * P_norm * h_n / kr
-                H_phi += factor_H * coef * dP_norm * h_n / kr
+                H_r += (1 / (1j * self.k * Z0)) * k_over_sqrtZ0 * Q2 * F2_H[0]
+                H_theta += (1 / (1j * self.k * Z0)) * k_over_sqrtZ0 * Q2 * F2_H[1]
+                H_phi += (1 / (1j * self.k * Z0)) * k_over_sqrtZ0 * Q2 * F2_H[2]
         
-        # NO normalization - already correct in field functions
         return (E_r, E_theta, E_phi), (H_r, H_theta, H_phi)
-    
+        
     def near_field_cartesian(self, x: np.ndarray, y: np.ndarray, z: np.ndarray) -> \
             Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray],
                   Tuple[np.ndarray, np.ndarray, np.ndarray]]:
