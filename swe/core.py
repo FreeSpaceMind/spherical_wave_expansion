@@ -499,70 +499,71 @@ def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
                                  theta: np.ndarray, phi: np.ndarray, 
                                  k: float, legendre_cache: Dict = None):
     """
-    Calculate near-field pattern functions for mode (n,m) using Hansen A1.45 and A1.46.
-    
-    Returns F vectors for Q1 (TE) and Q2 (TM) modes following Hansen equations exactly.
-    
-    Returns:
-        F1_E: (F1_E_r, F1_E_theta, F1_E_phi) for Q1 E-field
-        F2_E: (F2_E_r, F2_E_theta, F2_E_phi) for Q2 E-field  
-        F1_H: (F1_H_r, F1_H_theta, F1_H_phi) for Q1 H-field
-        F2_H: (F2_H_r, F2_H_theta, F2_H_phi) for Q2 H-field
+    Calculate near-field pattern functions matching far-field structure with radial functions.
     """
-    # Get Legendre functions from cache (already has pole avoidance applied)
+    # Get Legendre functions
     if legendre_cache is not None and (n, m) in legendre_cache:
         P_norm, dP_norm = legendre_cache[(n, m)]
     else:
         P_norm, dP_norm = normalized_associated_legendre(n, m, theta)
     
-    # Radial functions - Hansen A1.6: h_n^(3) = j_n - i*y_n
+    # Radial functions
     kr = k * r
     j_n = spherical_jn(n, kr)
     y_n = spherical_yn(n, kr)
-    z_n = j_n - 1j * y_n  # h_n^(3)
+    z_n = j_n + 1j * y_n
     
-    # Hansen A1.6: R_sn^(c)(kr) for s=2 is (1/kr)*d{kr*z_n^(c)}/d(kr)
+    # Derivative term
     if n == 0:
-        dz_n_dkr = -y_n - 1j * j_n
+        j_n_m1 = 0.0
+        y_n_m1 = -np.cos(kr) / kr
     else:
-        j_n_minus = spherical_jn(n-1, kr)
-        y_n_minus = spherical_yn(n-1, kr)
-        z_n_minus = j_n_minus - 1j * y_n_minus
-        dz_n_dkr = z_n_minus - (n + 1) / kr * z_n
+        j_n_m1 = spherical_jn(n-1, kr)
+        y_n_m1 = spherical_yn(n-1, kr)
     
-    # Normalization factor from Hansen
-    prefactor = (1 / np.sqrt(2 * np.pi)) * (1 / np.sqrt(n * (n + 1))) * ((-m / abs(m)) ** abs(m) if m != 0 else 1.0)
+    z_n_m1 = j_n_m1 + 1j * y_n_m1
     
-    exp_imphi = np.exp(1j * m * phi)
+    prefactor = 1 / np.sqrt(2 * np.pi) * 1 / np.sqrt(n * (n + 1))
     
-    # Apply pole avoidance to theta
+    if m == 0:
+        sign_factor = 1.0
+    else:
+        sign_factor = (-m / abs(m)) ** m
+    
+    phase = np.exp(1j * m * phi)
+    
+    # Apply pole avoidance
     theta_safe = np.copy(theta)
     epsilon = 1e-3
     theta_safe = np.where(theta < epsilon, epsilon, theta_safe)
     theta_safe = np.where(theta > (np.pi - epsilon), np.pi - epsilon, theta_safe)
     sin_theta = np.sin(theta_safe)
-    sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
+    mP_over_sin = m * P_norm / sin_theta
     
-    # Hansen A1.45: F^(c)_1mn for Q1 (TE to r)
-    F1_E_r = 0.0  # TE to r has no radial E component
-    F1_E_theta = prefactor * exp_imphi * (1j * m * P_norm / sin_theta_safe) * z_n / kr
-    F1_E_phi = prefactor * exp_imphi * (-dP_norm) * z_n / kr
+    coef = prefactor * sign_factor * phase
     
-    # Hansen A1.46: F^(c)_2mn for Q2 (TM to r)  
-    F2_E_r = prefactor * exp_imphi * n * (n + 1) * P_norm * z_n / kr**2
-    F2_E_theta = prefactor * exp_imphi * dP_norm * dz_n_dkr / kr
-    F2_E_phi = prefactor * exp_imphi * (1j * m * P_norm / sin_theta_safe) * dz_n_dkr / kr
+    # Q1 (TE): multiply far-field pattern by z_n
+    F1_E_r = 0.0
+    F1_E_theta = coef * (1j * mP_over_sin) * z_n
+    F1_E_phi = coef * (-dP_norm) * z_n
     
-    # H fields from Hansen - relationship with E fields
-    # For TE (Q1): H has all three components
-    F1_H_r = prefactor * exp_imphi * n * (n + 1) * P_norm * z_n / kr**2
-    F1_H_theta = prefactor * exp_imphi * dP_norm * dz_n_dkr / kr
-    F1_H_phi = prefactor * exp_imphi * (1j * m * P_norm / sin_theta_safe) * dz_n_dkr / kr
+    # Q2 (TM): radial term + angular terms with derivative
+    # Radial: uses z_n / (kr)
+    # Angular: uses (z_n_m1 - n*z_n/kr) which is the derivative without the (n+1) term
+    radial_deriv = z_n_m1 - n * z_n / kr
     
-    # For TM (Q2): H_r = 0
+    F2_E_r = coef * n * (n + 1) * P_norm * z_n / kr
+    F2_E_theta = coef * dP_norm * radial_deriv
+    F2_E_phi = coef * (1j * mP_over_sin) * radial_deriv
+    
+    # H fields - swap Q1/Q2 structure
+    F1_H_r = coef * n * (n + 1) * P_norm * z_n / kr
+    F1_H_theta = coef * dP_norm * radial_deriv
+    F1_H_phi = coef * (1j * mP_over_sin) * radial_deriv
+    
     F2_H_r = 0.0
-    F2_H_theta = prefactor * exp_imphi * (-1j * m * P_norm / sin_theta_safe) * z_n / kr
-    F2_H_phi = prefactor * exp_imphi * dP_norm * z_n / kr
+    F2_H_theta = coef * (-1j * mP_over_sin) * z_n
+    F2_H_phi = coef * dP_norm * z_n
     
     return (F1_E_r, F1_E_theta, F1_E_phi), (F2_E_r, F2_E_theta, F2_E_phi), \
            (F1_H_r, F1_H_theta, F1_H_phi), (F2_H_r, F2_H_theta, F2_H_phi)
@@ -1209,10 +1210,6 @@ class SphericalWaveExpansion:
         # Pre-compute Legendre functions
         legendre_cache = compute_all_modes_legendre(self.NMAX, self.MMAX, theta)
         
-        # Constants
-        Z0 = 376.730313668
-        k_over_sqrtZ0 = self.k / np.sqrt(Z0)
-        
         # Loop through modes
         for (n, m) in all_modes:
             # Get near-field pattern functions for this mode
@@ -1223,24 +1220,24 @@ class SphericalWaveExpansion:
             # Q1 contribution (TE to r modes)
             if (n, m) in self.Q1_coeffs:
                 Q1 = self.Q1_coeffs[(n, m)]
-                E_r += k_over_sqrtZ0 * Q1 * F1_E[0]
-                E_theta += k_over_sqrtZ0 * Q1 * F1_E[1]
-                E_phi += k_over_sqrtZ0 * Q1 * F1_E[2]
+                E_r += Q1 * F1_E[0]
+                E_theta += Q1 * F1_E[1]
+                E_phi += Q1 * F1_E[2]
                 
-                H_r += (1 / (1j * self.k * Z0)) * k_over_sqrtZ0 * Q1 * F1_H[0]
-                H_theta += (1 / (1j * self.k * Z0)) * k_over_sqrtZ0 * Q1 * F1_H[1]
-                H_phi += (1 / (1j * self.k * Z0)) * k_over_sqrtZ0 * Q1 * F1_H[2]
+                H_r += Q1 * F1_H[0]
+                H_theta += Q1 * F1_H[1]
+                H_phi += Q1 * F1_H[2]
             
             # Q2 contribution (TM to r modes)
             if (n, m) in self.Q2_coeffs:
                 Q2 = self.Q2_coeffs[(n, m)]
-                E_r += k_over_sqrtZ0 * Q2 * F2_E[0]
-                E_theta += k_over_sqrtZ0 * Q2 * F2_E[1]
-                E_phi += k_over_sqrtZ0 * Q2 * F2_E[2]
+                E_r += Q2 * F2_E[0]
+                E_theta += Q2 * F2_E[1]
+                E_phi += Q2 * F2_E[2]
                 
-                H_r += (1 / (1j * self.k * Z0)) * k_over_sqrtZ0 * Q2 * F2_H[0]
-                H_theta += (1 / (1j * self.k * Z0)) * k_over_sqrtZ0 * Q2 * F2_H[1]
-                H_phi += (1 / (1j * self.k * Z0)) * k_over_sqrtZ0 * Q2 * F2_H[2]
+                H_r += Q2 * F2_H[0]
+                H_theta += Q2 * F2_H[1]
+                H_phi += Q2 * F2_H[2]
         
         return (E_r, E_theta, E_phi), (H_r, H_theta, H_phi)
         
