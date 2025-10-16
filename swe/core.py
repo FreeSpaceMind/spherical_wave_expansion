@@ -499,9 +499,9 @@ def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
                                  theta: np.ndarray, phi: np.ndarray, 
                                  k: float, legendre_cache: Dict = None):
     """
-    Calculate near-field pattern functions for mode (n,m).
+    Calculate near-field pattern functions for mode (n,m) using Hansen A1.45 and A1.46.
     
-    Returns F vectors for Q1 (TE) and Q2 (TM) modes.
+    Returns F vectors for Q1 (TE) and Q2 (TM) modes following Hansen equations exactly.
     
     Returns:
         F1_E: (F1_E_r, F1_E_theta, F1_E_phi) for Q1 E-field
@@ -515,64 +515,54 @@ def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
     else:
         P_norm, dP_norm = normalized_associated_legendre(n, m, theta)
     
-    # Radial functions
+    # Radial functions - Hansen A1.6: h_n^(3) = j_n - i*y_n
     kr = k * r
     j_n = spherical_jn(n, kr)
     y_n = spherical_yn(n, kr)
-    h_n = j_n - 1j * y_n
+    z_n = j_n - 1j * y_n  # h_n^(3)
     
-    # Derivative of Hankel function
+    # Hansen A1.6: R_sn^(c)(kr) for s=2 is (1/kr)*d{kr*z_n^(c)}/d(kr)
     if n == 0:
-        dh_n = -j_n + 1j * y_n
+        dz_n_dkr = -y_n - 1j * j_n
     else:
         j_n_minus = spherical_jn(n-1, kr)
         y_n_minus = spherical_yn(n-1, kr)
-        h_n_minus = j_n_minus - 1j * y_n_minus
-        dh_n = h_n_minus - (n + 1) / kr * h_n
+        z_n_minus = j_n_minus - 1j * y_n_minus
+        dz_n_dkr = z_n_minus - (n + 1) / kr * z_n
     
-    # Common factors
-    prefactor = np.sqrt(2 / (n * (n + 1)))
-    
-    if m == 0:
-        sign_factor = 1.0
-    else:
-        sign_factor = (-m / abs(m)) ** m
+    # Normalization factor from Hansen
+    prefactor = (1 / np.sqrt(2 * np.pi)) * (1 / np.sqrt(n * (n + 1))) * ((-m / abs(m)) ** abs(m) if m != 0 else 1.0)
     
     exp_imphi = np.exp(1j * m * phi)
     
-    # Apply pole avoidance to theta to match Legendre cache computation
+    # Apply pole avoidance to theta
     theta_safe = np.copy(theta)
     epsilon = 1e-3
     theta_safe = np.where(theta < epsilon, epsilon, theta_safe)
     theta_safe = np.where(theta > (np.pi - epsilon), np.pi - epsilon, theta_safe)
-
-    # Compute sin_theta from the pole-avoided values
     sin_theta = np.sin(theta_safe)
     sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
     
-    coef = prefactor * sign_factor * exp_imphi
+    # Hansen A1.45: F^(c)_1mn for Q1 (TE to r)
+    F1_E_r = 0.0  # TE to r has no radial E component
+    F1_E_theta = prefactor * exp_imphi * (1j * m * P_norm / sin_theta_safe) * z_n / kr
+    F1_E_phi = prefactor * exp_imphi * (-dP_norm) * z_n / kr
     
-    # Use correct radial derivative: (1/kr)*d{krh_n}/d(kr) = h_{n-1} - n*h_n/kr
-    radial_deriv = h_n_minus - n * h_n / kr
-
-    # Q1 (TE to r) field components - from Hansen
-    F1_E_r = 0.0
-    F1_E_theta = coef * (1j * m / sin_theta_safe) * P_norm * h_n / kr
-    F1_E_phi = -coef * dP_norm * h_n / kr
+    # Hansen A1.46: F^(c)_2mn for Q2 (TM to r)  
+    F2_E_r = prefactor * exp_imphi * n * (n + 1) * P_norm * z_n / kr**2
+    F2_E_theta = prefactor * exp_imphi * dP_norm * dz_n_dkr / kr
+    F2_E_phi = prefactor * exp_imphi * (1j * m * P_norm / sin_theta_safe) * dz_n_dkr / kr
     
-    # Q1 contributes to H - same radial derivative
-    F1_H_r = coef * n * (n + 1) * P_norm * h_n / kr**2
-    F1_H_theta = coef * dP_norm * radial_deriv
-    F1_H_phi = coef * (1j * m / sin_theta_safe) * P_norm * radial_deriv
+    # H fields from Hansen - relationship with E fields
+    # For TE (Q1): H has all three components
+    F1_H_r = prefactor * exp_imphi * n * (n + 1) * P_norm * z_n / kr**2
+    F1_H_theta = prefactor * exp_imphi * dP_norm * dz_n_dkr / kr
+    F1_H_phi = prefactor * exp_imphi * (1j * m * P_norm / sin_theta_safe) * dz_n_dkr / kr
     
-    # Q2 (TM to r) field components - from Hansen A1.46
-    F2_E_r = coef * n * (n + 1) * P_norm * h_n / kr**2
-    F2_E_theta = coef * dP_norm * radial_deriv
-    F2_E_phi = coef * (1j * m / sin_theta_safe) * P_norm * radial_deriv
-
+    # For TM (Q2): H_r = 0
     F2_H_r = 0.0
-    F2_H_theta = -coef * (1j * m / sin_theta_safe) * P_norm * h_n / kr
-    F2_H_phi = coef * dP_norm * h_n / kr
+    F2_H_theta = prefactor * exp_imphi * (-1j * m * P_norm / sin_theta_safe) * z_n / kr
+    F2_H_phi = prefactor * exp_imphi * dP_norm * z_n / kr
     
     return (F1_E_r, F1_E_theta, F1_E_phi), (F2_E_r, F2_E_theta, F2_E_phi), \
            (F1_H_r, F1_H_theta, F1_H_phi), (F2_H_r, F2_H_theta, F2_H_phi)
