@@ -1209,6 +1209,10 @@ class SphericalWaveExpansion:
         
         # Pre-compute Legendre functions
         legendre_cache = compute_all_modes_legendre(self.NMAX, self.MMAX, theta)
+
+        # Scaling for 4pi power
+        E_prefactor = np.sqrt(4*np.pi)
+        H_prefactor = np.sqrt(4*np.pi) # NEED TO FIX THIS
         
         # Loop through modes
         for (n, m) in all_modes:
@@ -1220,24 +1224,24 @@ class SphericalWaveExpansion:
             # Q1 contribution (TE to r modes)
             if (n, m) in self.Q1_coeffs:
                 Q1 = self.Q1_coeffs[(n, m)]
-                E_r += Q1 * F1_E[0]
-                E_theta += Q1 * F1_E[1]
-                E_phi += Q1 * F1_E[2]
+                E_r += E_prefactor * Q1 * F1_E[0]
+                E_theta += E_prefactor * Q1 * F1_E[1]
+                E_phi += E_prefactor * Q1 * F1_E[2]
                 
-                H_r += Q1 * F1_H[0]
-                H_theta += Q1 * F1_H[1]
-                H_phi += Q1 * F1_H[2]
+                H_r += H_prefactor * Q1 * F1_H[0]
+                H_theta += H_prefactor * Q1 * F1_H[1]
+                H_phi += H_prefactor * Q1 * F1_H[2]
             
             # Q2 contribution (TM to r modes)
             if (n, m) in self.Q2_coeffs:
                 Q2 = self.Q2_coeffs[(n, m)]
-                E_r += Q2 * F2_E[0]
-                E_theta += Q2 * F2_E[1]
-                E_phi += Q2 * F2_E[2]
+                E_r += E_prefactor * Q2 * F2_E[0]
+                E_theta += E_prefactor * Q2 * F2_E[1]
+                E_phi += E_prefactor * Q2 * F2_E[2]
                 
-                H_r += Q2 * F2_H[0]
-                H_theta += Q2 * F2_H[1]
-                H_phi += Q2 * F2_H[2]
+                H_r += H_prefactor * Q2 * F2_H[0]
+                H_theta += H_prefactor * Q2 * F2_H[1]
+                H_phi += H_prefactor * Q2 * F2_H[2]
         
         return (E_r, E_theta, E_phi), (H_r, H_theta, H_phi)
         
