@@ -707,13 +707,22 @@ class SphericalWaveExpansion:
                             E_theta: np.ndarray,
                             E_phi: np.ndarray,
                             frequency: float,
-                            NMAX: int,
-                            MMAX: int = None):
+                            NMAX_initial: int = 10,
+                            MMAX: int = None,
+                            power_threshold: float = 0.99,
+                            high_mode_power_threshold: float = 0.01):
         """
-        Fit Q coefficients from far-field measurements using TICRA conventions.
+        Adaptively fit Q coefficients from far-field measurements.
+        
+        Iteratively increases NMAX until the highest 10% of modes contain
+        less than 1% of power, then truncates to retain 99% of power.
+        
+        Args:
+            NMAX_initial: Starting value for NMAX
+            MMAX: Maximum order (if None, equals NMAX)
+            power_threshold: Fraction of power to retain in final truncation (0.99 = 99%)
+            high_mode_power_threshold: Max power allowed in top 10% of modes (0.01 = 1%)
         """
-        if MMAX is None:
-            MMAX = NMAX
         
         # Convert to 1D arrays
         theta = np.atleast_1d(theta).flatten()
@@ -726,70 +735,189 @@ class SphericalWaveExpansion:
             raise ValueError("All input arrays must have the same length")
         
         k = 2 * np.pi * frequency / 299792458.0
-        
-        # Build mode list
-        modes = []
-        for n in range(1, NMAX + 1):
-            for m in range(-min(n, MMAX), min(n, MMAX) + 1):
-                modes.append((n, m))
-        
-        N_modes = len(modes)
-        
-        # PRE-COMPUTE ALL LEGENDRE FUNCTIONS
-        legendre_cache = compute_all_modes_legendre(NMAX, MMAX, theta)
-        
-        # Build design matrix using TICRA pattern functions
-        N_coeffs = 4 * N_modes
-        A_theta = np.zeros((N_points, N_coeffs), dtype=float)
-        A_phi = np.zeros((N_points, N_coeffs), dtype=float)
-        
-        for mode_idx, (n, m) in enumerate(modes):
-            # Use TICRA far-field pattern functions
-            (K1_theta, K1_phi), (K2_theta, K2_phi) = \
-                far_field_pattern_functions(n, m, theta, phi, legendre_cache)
-            
-            col_Q1_re = 4 * mode_idx
-            col_Q1_im = 4 * mode_idx + 1
-            col_Q2_re = 4 * mode_idx + 2
-            col_Q2_im = 4 * mode_idx + 3
-            
-            # Q1 contribution
-            A_theta[:, col_Q1_re] = k * np.real(K1_theta)
-            A_theta[:, col_Q1_im] = k * -np.imag(K1_theta)
-            A_phi[:, col_Q1_re] = k * np.real(K1_phi)
-            A_phi[:, col_Q1_im] = k * -np.imag(K1_phi)
-            
-            # Q2 contribution
-            A_theta[:, col_Q2_re] = k * np.real(K2_theta)
-            A_theta[:, col_Q2_im] = k * -np.imag(K2_theta)
-            A_phi[:, col_Q2_re] = k * np.real(K2_phi)
-            A_phi[:, col_Q2_im] = k * -np.imag(K2_phi)
-        
-        # Stack matrices and solve
-        A = np.vstack([A_theta, A_phi])
-        b = np.concatenate([np.real(E_theta), np.imag(E_theta),
-                            np.real(E_phi), np.imag(E_phi)])
-        
-        result = lsq_linear(A, b, verbose=0)
-        coeffs = result.x
-        
-        # Extract Q coefficients (already in TICRA convention)
-        Q1_coeffs = {}
-        Q2_coeffs = {}
-        
         Z0 = 376.730313668
         norm_factor = k * np.sqrt(Z0)
         
-        for mode_idx, (n, m) in enumerate(modes):
-            Q1_re = coeffs[4 * mode_idx] / norm_factor
-            Q1_im = coeffs[4 * mode_idx + 1] / norm_factor
-            Q2_re = coeffs[4 * mode_idx + 2] / norm_factor
-            Q2_im = coeffs[4 * mode_idx + 3] / norm_factor
-            
-            Q1_coeffs[(n, m)] = Q1_re + 1j * Q1_im
-            Q2_coeffs[(n, m)] = Q2_re + 1j * Q2_im
+        NMAX = NMAX_initial
+        max_iterations = 10
         
-        return cls(Q1_coeffs, Q2_coeffs, frequency, NMAX, MMAX)
+        for iteration in range(max_iterations):
+            if MMAX is None:
+                MMAX_current = NMAX
+            else:
+                MMAX_current = min(MMAX, NMAX)
+            
+            print(f"Iteration {iteration + 1}: Solving with NMAX={NMAX}, MMAX={MMAX_current}")
+            
+            # Build mode list
+            modes = []
+            for n in range(1, NMAX + 1):
+                for m in range(-min(n, MMAX_current), min(n, MMAX_current) + 1):
+                    modes.append((n, m))
+            
+            N_modes = len(modes)
+            
+            # PRE-COMPUTE LEGENDRE FUNCTIONS
+            legendre_cache = compute_all_modes_legendre(NMAX, MMAX_current, theta)
+            
+            # Build design matrix
+            N_coeffs = 4 * N_modes
+            A_theta = np.zeros((N_points, N_coeffs), dtype=float)
+            A_phi = np.zeros((N_points, N_coeffs), dtype=float)
+            
+            for mode_idx, (n, m) in enumerate(modes):
+                (K1_theta, K1_phi), (K2_theta, K2_phi) = \
+                    far_field_pattern_functions(n, m, theta, phi, legendre_cache)
+                
+                col_Q1_re = 4 * mode_idx
+                col_Q1_im = 4 * mode_idx + 1
+                col_Q2_re = 4 * mode_idx + 2
+                col_Q2_im = 4 * mode_idx + 3
+                
+                A_theta[:, col_Q1_re] = k * np.real(K1_theta)
+                A_theta[:, col_Q1_im] = k * -np.imag(K1_theta)
+                A_phi[:, col_Q1_re] = k * np.real(K1_phi)
+                A_phi[:, col_Q1_im] = k * -np.imag(K1_phi)
+                
+                A_theta[:, col_Q2_re] = k * np.real(K2_theta)
+                A_theta[:, col_Q2_im] = k * -np.imag(K2_theta)
+                A_phi[:, col_Q2_re] = k * np.real(K2_phi)
+                A_phi[:, col_Q2_im] = k * -np.imag(K2_phi)
+            
+            # Solve
+            A = np.vstack([A_theta, A_phi])
+            b = np.concatenate([np.real(E_theta), np.imag(E_theta),
+                                np.real(E_phi), np.imag(E_phi)])
+            
+            result = lsq_linear(A, b, verbose=0)
+            coeffs = result.x
+            
+            # Extract Q coefficients
+            Q1_coeffs = {}
+            Q2_coeffs = {}
+            
+            for mode_idx, (n, m) in enumerate(modes):
+                Q1_re = coeffs[4 * mode_idx] / norm_factor
+                Q1_im = coeffs[4 * mode_idx + 1] / norm_factor
+                Q2_re = coeffs[4 * mode_idx + 2] / norm_factor
+                Q2_im = coeffs[4 * mode_idx + 3] / norm_factor
+                
+                Q1_coeffs[(n, m)] = Q1_re + 1j * Q1_im
+                Q2_coeffs[(n, m)] = Q2_re + 1j * Q2_im
+            
+            # Calculate power per mode
+            mode_powers = []
+            total_power = 0.0
+            for (n, m) in modes:
+                mode_power = (abs(Q1_coeffs[(n, m)])**2 + abs(Q2_coeffs[(n, m)])**2) / 2.0
+                mode_powers.append(((n, m), mode_power))
+                total_power += mode_power
+            
+            # Sort by n (to check highest modes)
+            mode_powers_by_n = sorted(mode_powers, key=lambda x: x[0][0], reverse=True)
+            
+            # Check power in top 10% of n values
+            n_cutoff = int(np.ceil(0.1 * NMAX))
+            high_mode_power = 0.0
+            for (n, m), power in mode_powers_by_n:
+                if n > NMAX - n_cutoff:
+                    high_mode_power += power
+            
+            high_mode_fraction = high_mode_power / total_power if total_power > 0 else 0
+            print(f"  Power in top {n_cutoff} n-modes: {high_mode_fraction*100:.2f}%")
+            
+            # Check convergence
+            if high_mode_fraction < high_mode_power_threshold:
+                print(f"  Convergence achieved: high modes contain {high_mode_fraction*100:.2f}% < {high_mode_power_threshold*100:.0f}%")
+                
+                # Now truncate to retain power_threshold
+                mode_powers.sort(key=lambda x: x[1], reverse=True)
+                
+                cumulative_power = 0.0
+                Q1_truncated = {}
+                Q2_truncated = {}
+                NMAX_truncated = 0
+                MMAX_truncated = 0
+                
+                for (n, m), mode_power in mode_powers:
+                    Q1_truncated[(n, m)] = Q1_coeffs[(n, m)]
+                    Q2_truncated[(n, m)] = Q2_coeffs[(n, m)]
+                    cumulative_power += mode_power
+                    NMAX_truncated = max(NMAX_truncated, n)
+                    MMAX_truncated = max(MMAX_truncated, abs(m))
+                    
+                    if cumulative_power / total_power >= power_threshold:
+                        break
+                
+                print(f"\nTruncation: Keeping {len(Q1_truncated)} modes (NMAX={NMAX_truncated}, MMAX={MMAX_truncated})")
+                print(f"Retained power: {cumulative_power/total_power*100:.2f}%")
+                
+                # Recompute with truncated modes for consistency
+                print(f"\nRecomputing with truncated mode set...")
+                modes_final = list(Q1_truncated.keys())
+                
+                legendre_cache_final = compute_all_modes_legendre(NMAX_truncated, MMAX_truncated, theta)
+                
+                N_coeffs_final = 4 * len(modes_final)
+                A_theta_final = np.zeros((N_points, N_coeffs_final), dtype=float)
+                A_phi_final = np.zeros((N_points, N_coeffs_final), dtype=float)
+                
+                for mode_idx, (n, m) in enumerate(modes_final):
+                    (K1_theta, K1_phi), (K2_theta, K2_phi) = \
+                        far_field_pattern_functions(n, m, theta, phi, legendre_cache_final)
+                    
+                    col_Q1_re = 4 * mode_idx
+                    col_Q1_im = 4 * mode_idx + 1
+                    col_Q2_re = 4 * mode_idx + 2
+                    col_Q2_im = 4 * mode_idx + 3
+                    
+                    A_theta_final[:, col_Q1_re] = k * np.real(K1_theta)
+                    A_theta_final[:, col_Q1_im] = k * -np.imag(K1_theta)
+                    A_phi_final[:, col_Q1_re] = k * np.real(K1_phi)
+                    A_phi_final[:, col_Q1_im] = k * -np.imag(K1_phi)
+                    
+                    A_theta_final[:, col_Q2_re] = k * np.real(K2_theta)
+                    A_theta_final[:, col_Q2_im] = k * -np.imag(K2_theta)
+                    A_phi_final[:, col_Q2_re] = k * np.real(K2_phi)
+                    A_phi_final[:, col_Q2_im] = k * -np.imag(K2_phi)
+                
+                A_final = np.vstack([A_theta_final, A_phi_final])
+                result_final = lsq_linear(A_final, b, verbose=0)
+                coeffs_final = result_final.x
+                
+                Q1_final = {}
+                Q2_final = {}
+                
+                for mode_idx, (n, m) in enumerate(modes_final):
+                    Q1_re = coeffs_final[4 * mode_idx] / norm_factor
+                    Q1_im = coeffs_final[4 * mode_idx + 1] / norm_factor
+                    Q2_re = coeffs_final[4 * mode_idx + 2] / norm_factor
+                    Q2_im = coeffs_final[4 * mode_idx + 3] / norm_factor
+                    
+                    Q1_final[(n, m)] = Q1_re + 1j * Q1_im
+                    Q2_final[(n, m)] = Q2_re + 1j * Q2_im
+                
+                # Verify final power distribution
+                total_power_final = sum((abs(Q1_final[k])**2 + abs(Q2_final[k])**2)/2.0 for k in modes_final)
+                print(f"Final solution computed with {len(modes_final)} modes")
+                
+                return cls(Q1_final, Q2_final, frequency, NMAX_truncated, MMAX_truncated)
+            
+            else:
+                # Need more modes - increase based on how much power is in high modes
+                if high_mode_fraction > 0.05:  # >5% in high modes
+                    NMAX_increase = max(5, int(NMAX * 0.5))  # Increase by 50%
+                elif high_mode_fraction > 0.02:  # 2-5% in high modes
+                    NMAX_increase = max(3, int(NMAX * 0.3))  # Increase by 30%
+                else:  # 1-2% in high modes
+                    NMAX_increase = 2  # Small increase
+                
+                NMAX += NMAX_increase
+                print(f"  Increasing NMAX by {NMAX_increase} to {NMAX}")
+        
+        # If we hit max iterations without converging, return best result
+        print(f"\nWarning: Max iterations reached. Returning solution with NMAX={NMAX}")
+        return cls(Q1_coeffs, Q2_coeffs, frequency, NMAX, MMAX_current)
     
     @classmethod
     def from_sph_file(cls, filename: str) -> 'SphericalWaveExpansion':
@@ -938,58 +1066,138 @@ class SphericalWaveExpansion:
         
         return (E_x, E_y, E_z), (H_x, H_y, H_z)
     
-    def surface_currents(self, r: np.ndarray, theta: np.ndarray, phi: np.ndarray,
-                        surface_normal: str = 'outward') -> \
-            Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray],
-                  Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    def currents_on_surface(self, rr: np.ndarray, unr: np.ndarray, dSr: np.ndarray,
+                                swe_origin: np.ndarray = None,
+                                swe_rotation: Optional[Tuple[float, float, float]] = None,
+                                chunk_size: Optional[int] = None,
+                                n_threads: Optional[int] = None) -> \
+            Tuple[np.ndarray, np.ndarray]:
         """
-        Calculate equivalent surface currents on a surface.
+        Calculate equivalent surface currents on an arbitrary reflector surface from SWE source.
         
-        The surface is defined by the (r, theta, phi) points. Surface currents are:
-        J_s = n × H (electric surface current, A/m)
-        M_s = -n × E (magnetic surface current, V/m)
+        Uses the reciprocity-based surface current formulation from Hansen Appendix A1.
+        Surface currents: J = n × H, M = -n × E
         
         Args:
-            r: Radial distance(s) to surface points in meters
-            theta: Polar angle(s) in radians
-            phi: Azimuthal angle(s) in radians
-            surface_normal: Direction of normal ('outward' or 'inward')
+            rr: Nr x 3 array of reflector surface points (Cartesian, meters)
+            unr: Nr x 3 array of surface normal vectors (outward)
+            dSr: Nr array of surface element areas (m²)
+            swe_origin: 3-element array, SWE coordinate origin in reflector frame (meters)
+                        Default is [0, 0, 0]
+            swe_rotation: (alpha, beta, gamma) Euler angles (radians, ZYZ convention) 
+                        rotating SWE frame to reflector frame. Default is no rotation.
+            chunk_size: Points per chunk for parallel processing (None for auto)
+            n_threads: Number of worker threads (None for auto)
             
         Returns:
-            J: Tuple of (J_r, J_theta, J_phi) electric surface current
-            M: Tuple of (M_r, M_theta, M_phi) magnetic surface current
+            Jrr: Nr x 3 array of equivalent electric currents (A)
+            Mrr: Nr x 3 array of equivalent magnetic currents (V)
         """
-        # Get E and H fields at the surface
-        (E_r, E_theta, E_phi), (H_r, H_theta, H_phi) = self.near_field(r, theta, phi)
+        from concurrent.futures import ThreadPoolExecutor
+        import os
         
-        # For a spherical surface at radius r, the outward normal is n = r_hat
-        # J_s = n × H = r_hat × H
-        # M_s = -n × E = -r_hat × E
+        Nr = len(rr)
         
-        if surface_normal == 'outward':
-            sign = 1.0
-        elif surface_normal == 'inward':
-            sign = -1.0
+        # Default origin at coordinate system origin
+        if swe_origin is None:
+            swe_origin = np.array([0., 0., 0.])
+        
+        # Transform reflector points to SWE coordinate system
+        rr_swe = rr - swe_origin[np.newaxis, :]
+        
+        if swe_rotation is not None:
+            # Apply inverse rotation (reflector -> SWE frame)
+            rr_swe = self._apply_inverse_rotation(rr_swe, swe_rotation)
+            unr_swe = self._apply_inverse_rotation(unr, swe_rotation)
         else:
-            raise ValueError("surface_normal must be 'outward' or 'inward'")
+            unr_swe = unr.copy()
         
-        # J = r_hat × H
-        # In spherical coordinates: r_hat × (H_r, H_θ, H_φ) = (0, H_φ, -H_θ)
-        J_r = np.zeros_like(H_r)
-        J_theta = sign * H_phi
-        J_phi = -sign * H_theta
+        # Auto-optimize parameters
+        if chunk_size is None:
+            chunk_size = min(1000, max(100, Nr // 8))
+        if n_threads is None:
+            n_threads = min(8, os.cpu_count() or 1)
         
-        # M = -r_hat × E
-        M_r = np.zeros_like(E_r)
-        M_theta = -sign * E_phi
-        M_phi = sign * E_theta
+        # Create chunks
+        chunks = [(i, min(i + chunk_size, Nr)) for i in range(0, Nr, chunk_size)]
         
-        return (J_r, J_theta, J_phi), (M_r, M_theta, M_phi)
-    
-    def __repr__(self) -> str:
-        freq_str = f"{self.frequency/1e9:.3f} GHz" if self.frequency else "unset"
-        return (f"SphericalWaveExpansion(NMAX={self.NMAX}, MMAX={self.MMAX}, "
-                f"frequency={freq_str}, modes={len(self.Q1_coeffs)})")
+        # Worker function
+        def _compute_fields_chunk(start: int, end: int):
+            r_chunk = rr_swe[start:end]
+            x, y, z = r_chunk[:, 0], r_chunk[:, 1], r_chunk[:, 2]
+            (Ex, Ey, Ez), (Hx, Hy, Hz) = self.near_field_cartesian(x, y, z)
+            return np.stack([Ex, Ey, Ez], axis=1), np.stack([Hx, Hy, Hz], axis=1)
+        
+        # Parallel field calculation
+        E_total = np.zeros((Nr, 3), dtype=np.complex128)
+        H_total = np.zeros((Nr, 3), dtype=np.complex128)
+        
+        with ThreadPoolExecutor(max_workers=n_threads) as executor:
+            futures = [executor.submit(_compute_fields_chunk, start, end) for start, end in chunks]
+            for i, future in enumerate(futures):
+                start, end = chunks[i]
+                E_chunk, H_chunk = future.result()
+                E_total[start:end] = E_chunk
+                H_total[start:end] = H_chunk
+        
+        # Transform E and H back to reflector frame if rotated
+        if swe_rotation is not None:
+            E_total = self._apply_rotation(E_total, swe_rotation)
+            H_total = self._apply_rotation(H_total, swe_rotation)
+        
+        # Calculate surface currents: J = n × H, M = -n × E
+        Jr = np.cross(unr, H_total)
+        Mr = -np.cross(unr, E_total)
+        
+        # Apply surface element areas and sign convention (matches GetCurrents)
+        Jrr = -Jr * dSr[:, np.newaxis]
+        Mrr = Mr * dSr[:, np.newaxis]
+        
+        return Jrr, Mrr
+
+    def _apply_rotation(self, vectors: np.ndarray, angles: Tuple[float, float, float]) -> np.ndarray:
+        """
+        Apply ZYZ Euler rotation to vectors.
+        
+        Args:
+            vectors: N x 3 array of vectors
+            angles: (alpha, beta, gamma) Euler angles in radians
+            
+        Returns:
+            Rotated N x 3 array
+        """
+        alpha, beta, gamma = angles
+        
+        # ZYZ Euler rotation matrices
+        Rz_alpha = np.array([[np.cos(alpha), -np.sin(alpha), 0],
+                            [np.sin(alpha), np.cos(alpha), 0],
+                            [0, 0, 1]])
+        Ry_beta = np.array([[np.cos(beta), 0, np.sin(beta)],
+                            [0, 1, 0],
+                            [-np.sin(beta), 0, np.cos(beta)]])
+        Rz_gamma = np.array([[np.cos(gamma), -np.sin(gamma), 0],
+                            [np.sin(gamma), np.cos(gamma), 0],
+                            [0, 0, 1]])
+        
+        # Combined rotation: R = Rz(γ) Ry(β) Rz(α)
+        R = Rz_gamma @ Ry_beta @ Rz_alpha
+        
+        return vectors @ R.T
+
+    def _apply_inverse_rotation(self, vectors: np.ndarray, angles: Tuple[float, float, float]) -> np.ndarray:
+        """
+        Apply inverse ZYZ Euler rotation.
+        
+        Args:
+            vectors: N x 3 array of vectors
+            angles: (alpha, beta, gamma) Euler angles in radians
+            
+        Returns:
+            Inverse rotated N x 3 array
+        """
+        alpha, beta, gamma = angles
+        # Inverse rotation: apply in reverse order with negated angles
+        return self._apply_rotation(vectors, (-gamma, -beta, -alpha))
 
 
 # ==============================================================================
@@ -1218,50 +1426,3 @@ def write_ticra_sph(filename: str,
                     
                     f.write(f"  {Q1_pos.real:23.16E} {Q1_pos.imag:23.16E} "
                            f"{Q2_pos.real:23.16E} {Q2_pos.imag:23.16E}\n")
-
-# ==============================================================================
-# Example Usage
-# ==============================================================================
-
-def verify_against_hansen_table():
-    """
-    Verify implementation against values from Hansen's table (page 324).
-    """
-    import numpy as np
-    
-    theta = np.pi / 3  # 60 degrees for easy checking
-    cos_theta = np.cos(theta)
-    sin_theta = np.sin(theta)
-    
-    print("Verification against Hansen table (Appendix A1):")
-    print(f"θ = {np.degrees(theta):.1f}°, cos(θ) = {cos_theta:.4f}, sin(θ) = {sin_theta:.4f}\n")
-    
-    # Test cases from Hansen tables
-    # Page 322: Function values P̄^|m|_n(cos θ)  
-    # Page 324: Derivatives dP̄^|m|_n/dθ
-    test_cases = [
-        # (n, m, expected_P, expected_dP_dtheta, description)
-        (1, 0, np.sqrt(6)/2 * cos_theta, -np.sqrt(6)/2 * sin_theta, 
-         "P̄_1^0 = √6/2 cos θ, dP̄_1^0/dθ = -√6/2 sin θ"),
-        (1, 1, np.sqrt(3)/2 * sin_theta, np.sqrt(3)/2 * cos_theta,
-         "P̄_1^1 = √3/2 sin θ, dP̄_1^1/dθ = √3/2 cos θ"),
-        (2, 0, np.sqrt(10)/8 * (3*np.cos(2*theta) + 1), -3*np.sqrt(10)/4 * np.sin(2*theta),
-         "P̄_2^0 = √10/8 (3cos 2θ + 1), dP̄_2^0/dθ = -3√10/4 sin 2θ"),
-        (2, 1, np.sqrt(15)/4 * np.sin(2*theta), np.sqrt(15)/2 * np.cos(2*theta),
-         "P̄_2^1 = √15/4 sin 2θ, dP̄_2^1/dθ = √15/2 cos 2θ"),
-    ]
-    
-    print("Expected values at θ = 60° (from Hansen Appendix A1):")
-    print()
-    for n, m, exp_P, exp_dP, desc in test_cases:
-        P_norm, dP_norm = normalized_associated_legendre(n, m, theta)
-        
-        print(f"{desc}")
-        print(f"  P̄_{n}^{m}: computed={P_norm:.6f}, expected={exp_P:.6f}, " 
-              f"error={abs(P_norm - exp_P):.2e}")
-        print(f"  dP̄_{n}^{m}/dθ: computed={dP_norm:.6f}, expected={exp_dP:.6f}, "
-              f"error={abs(dP_norm - exp_dP):.2e}")
-        print()
-
-if __name__ == "__main__":
-    verify_against_hansen_table()
