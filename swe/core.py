@@ -556,14 +556,15 @@ def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
     F2_E_theta = coef * dP_norm * radial_deriv
     F2_E_phi = coef * (1j * mP_over_sin) * radial_deriv
     
-    # H fields - swap Q1/Q2 structure
-    F1_H_r = coef * n * (n + 1) * P_norm * z_n / kr
-    F1_H_theta = coef * dP_norm * radial_deriv
-    F1_H_phi = coef * (1j * mP_over_sin) * radial_deriv
-    
-    F2_H_r = 0.0
-    F2_H_theta = coef * (-1j * mP_over_sin) * z_n
-    F2_H_phi = coef * dP_norm * z_n
+    # H fields - indices swap per Hansen eq (A1.2): F_3-s,m,n
+    # Q1 uses F2 pattern (TM structure), Q2 uses F1 pattern (TE structure)
+    F1_H_r = F2_E_r
+    F1_H_theta = F2_E_theta  
+    F1_H_phi = F2_E_phi
+
+    F2_H_r = F1_E_r
+    F2_H_theta = F1_E_theta
+    F2_H_phi = F1_E_phi
     
     return (F1_E_r, F1_E_theta, F1_E_phi), (F2_E_r, F2_E_theta, F2_E_phi), \
            (F1_H_r, F1_H_theta, F1_H_phi), (F2_H_r, F2_H_theta, F2_H_phi)
@@ -1212,7 +1213,7 @@ class SphericalWaveExpansion:
 
         # Scaling for 4pi power
         E_prefactor = np.sqrt(4*np.pi)
-        H_prefactor = np.sqrt(4*np.pi) # NEED TO FIX THIS
+        H_prefactor = np.sqrt(4*np.pi)
         
         # Loop through modes
         for (n, m) in all_modes:
