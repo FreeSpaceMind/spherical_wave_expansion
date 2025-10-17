@@ -707,21 +707,33 @@ class SphericalWaveExpansion:
                             E_theta: np.ndarray,
                             E_phi: np.ndarray,
                             frequency: float,
-                            NMAX_initial: int = 10,
-                            MMAX: int = None,
+                            r0: float = None,
+                            NMAX_initial: int = None,
+                            MMAX_initial: int = None,
                             power_threshold: float = 0.99,
-                            high_mode_power_threshold: float = 0.01):
+                            high_mode_power_threshold: float = 0.01,
+                            azimuthal_power_threshold: float = 0.001):
         """
         Adaptively fit Q coefficients from far-field measurements.
         
         Iteratively increases NMAX until the highest 10% of modes contain
-        less than 1% of power, then truncates to retain 99% of power.
+        less than 1% of power, then truncates based on power distribution.
         
         Args:
-            NMAX_initial: Starting value for NMAX
-            MMAX: Maximum order (if None, equals NMAX)
-            power_threshold: Fraction of power to retain in final truncation (0.99 = 99%)
-            high_mode_power_threshold: Max power allowed in top 10% of modes (0.01 = 1%)
+            theta: Polar angles (radians)
+            phi: Azimuthal angles (radians)
+            E_theta: Theta component of electric field
+            E_phi: Phi component of electric field
+            frequency: Frequency in Hz
+            r0: Radius of minimum sphere enclosing sources (meters). Used to estimate NMAX.
+            NMAX_initial: Starting NMAX (if None, estimated from r0 or data)
+            MMAX_initial: Starting MMAX (if None, set to NMAX_initial)
+            power_threshold: Retain modes with this fraction of power (0.99 = 99%)
+            high_mode_power_threshold: Max power in top 10% n-modes (0.01 = 1%)
+            azimuthal_power_threshold: Min power per |m| to include (0.001 = 0.1%)
+        
+        Returns:
+            SphericalWaveExpansion object with adaptively determined modes
         """
         
         # Convert to 1D arrays
@@ -738,16 +750,28 @@ class SphericalWaveExpansion:
         Z0 = 376.730313668
         norm_factor = k * np.sqrt(Z0)
         
+        # Estimate NMAX from kr0 if provided (TICRA formula)
+        if NMAX_initial is None:
+            if r0 is not None:
+                kr0 = k * r0
+                NMAX_initial = int(np.ceil(kr0 + max(10, 3.6 * (kr0 ** (1/3)))))
+                print(f"Estimated NMAX from r0={r0}m: kr0={kr0:.2f}, NMAX={NMAX_initial}")
+            else:
+                # Fallback: estimate from angular sampling
+                theta_unique = np.unique(theta)
+                NMAX_initial = min(30, max(10, len(theta_unique) // 3))
+                print(f"Estimated NMAX from sampling: NMAX={NMAX_initial}")
+        
+        if MMAX_initial is None:
+            MMAX_initial = NMAX_initial
+        
         NMAX = NMAX_initial
         max_iterations = 10
         
         for iteration in range(max_iterations):
-            if MMAX is None:
-                MMAX_current = NMAX
-            else:
-                MMAX_current = min(MMAX, NMAX)
+            MMAX_current = min(MMAX_initial, NMAX)
             
-            print(f"Iteration {iteration + 1}: Solving with NMAX={NMAX}, MMAX={MMAX_current}")
+            print(f"\nIteration {iteration + 1}: Solving with NMAX={NMAX}, MMAX={MMAX_current}")
             
             # Build mode list
             modes = []
@@ -756,6 +780,7 @@ class SphericalWaveExpansion:
                     modes.append((n, m))
             
             N_modes = len(modes)
+            print(f"  Total modes: {N_modes}")
             
             # PRE-COMPUTE LEGENDRE FUNCTIONS
             legendre_cache = compute_all_modes_legendre(NMAX, MMAX_current, theta)
@@ -813,11 +838,13 @@ class SphericalWaveExpansion:
                 mode_powers.append(((n, m), mode_power))
                 total_power += mode_power
             
+            print(f"  Total power: {total_power:.6e}")
+            
             # Sort by n (to check highest modes)
             mode_powers_by_n = sorted(mode_powers, key=lambda x: x[0][0], reverse=True)
             
             # Check power in top 10% of n values
-            n_cutoff = int(np.ceil(0.1 * NMAX))
+            n_cutoff = max(1, int(np.ceil(0.1 * NMAX)))
             high_mode_power = 0.0
             for (n, m), power in mode_powers_by_n:
                 if n > NMAX - n_cutoff:
@@ -828,32 +855,55 @@ class SphericalWaveExpansion:
             
             # Check convergence
             if high_mode_fraction < high_mode_power_threshold:
-                print(f"  Convergence achieved: high modes contain {high_mode_fraction*100:.2f}% < {high_mode_power_threshold*100:.0f}%")
+                print(f"  ✓ Convergence achieved: high modes contain {high_mode_fraction*100:.2f}% < {high_mode_power_threshold*100:.0f}%")
                 
-                # Now truncate to retain power_threshold
+                # Calculate power per |m| for azimuthal truncation
+                power_per_m = {}
+                for m_abs in range(MMAX_current + 1):
+                    power_per_m[m_abs] = 0.0
+                    for n in range(max(1, m_abs), NMAX + 1):
+                        if m_abs == 0:
+                            power_per_m[0] += (abs(Q1_coeffs.get((n, 0), 0))**2 + 
+                                            abs(Q2_coeffs.get((n, 0), 0))**2) / 2.0
+                        else:
+                            for m_sign in [m_abs, -m_abs]:
+                                power_per_m[m_abs] += (abs(Q1_coeffs.get((n, m_sign), 0))**2 + 
+                                                    abs(Q2_coeffs.get((n, m_sign), 0))**2) / 2.0
+                
+                # Determine MMAX based on azimuthal power distribution
+                MMAX_truncated = 0
+                for m_abs in range(MMAX_current, -1, -1):  # Start from highest
+                    if power_per_m[m_abs] / total_power >= azimuthal_power_threshold:
+                        MMAX_truncated = m_abs
+                        break
+                
+                print(f"  Azimuthal truncation: MMAX {MMAX_current} → {MMAX_truncated} (threshold: {azimuthal_power_threshold*100:.1f}%)")
+                
+                # Now truncate to retain power_threshold with MMAX constraint
                 mode_powers.sort(key=lambda x: x[1], reverse=True)
                 
                 cumulative_power = 0.0
                 Q1_truncated = {}
                 Q2_truncated = {}
                 NMAX_truncated = 0
-                MMAX_truncated = 0
                 
                 for (n, m), mode_power in mode_powers:
-                    Q1_truncated[(n, m)] = Q1_coeffs[(n, m)]
-                    Q2_truncated[(n, m)] = Q2_coeffs[(n, m)]
-                    cumulative_power += mode_power
-                    NMAX_truncated = max(NMAX_truncated, n)
-                    MMAX_truncated = max(MMAX_truncated, abs(m))
-                    
-                    if cumulative_power / total_power >= power_threshold:
-                        break
+                    if abs(m) <= MMAX_truncated:  # Apply MMAX constraint
+                        Q1_truncated[(n, m)] = Q1_coeffs[(n, m)]
+                        Q2_truncated[(n, m)] = Q2_coeffs[(n, m)]
+                        cumulative_power += mode_power
+                        NMAX_truncated = max(NMAX_truncated, n)
+                        
+                        if cumulative_power / total_power >= power_threshold:
+                            break
                 
-                print(f"\nTruncation: Keeping {len(Q1_truncated)} modes (NMAX={NMAX_truncated}, MMAX={MMAX_truncated})")
-                print(f"Retained power: {cumulative_power/total_power*100:.2f}%")
+                retained_fraction = cumulative_power / total_power
+                print(f"\n  Power-based truncation: {len(Q1_truncated)} modes retained")
+                print(f"  NMAX: {NMAX} → {NMAX_truncated}, MMAX: {MMAX_current} → {MMAX_truncated}")
+                print(f"  Retained power: {retained_fraction*100:.2f}%")
                 
                 # Recompute with truncated modes for consistency
-                print(f"\nRecomputing with truncated mode set...")
+                print(f"\n  Recomputing with truncated mode set...")
                 modes_final = list(Q1_truncated.keys())
                 
                 legendre_cache_final = compute_all_modes_legendre(NMAX_truncated, MMAX_truncated, theta)
@@ -899,8 +949,27 @@ class SphericalWaveExpansion:
                 
                 # Verify final power distribution
                 total_power_final = sum((abs(Q1_final[k])**2 + abs(Q2_final[k])**2)/2.0 for k in modes_final)
-                print(f"Final solution computed with {len(modes_final)} modes")
                 
+                # Check high mode power in final solution
+                mode_powers_final = []
+                for (n, m) in modes_final:
+                    mode_power = (abs(Q1_final[(n, m)])**2 + abs(Q2_final[(n, m)])**2) / 2.0
+                    mode_powers_final.append(((n, m), mode_power))
+                
+                mode_powers_by_n_final = sorted(mode_powers_final, key=lambda x: x[0][0], reverse=True)
+                n_cutoff_final = max(1, int(np.ceil(0.1 * NMAX_truncated)))
+                high_mode_power_final = sum(power for (n, m), power in mode_powers_by_n_final 
+                                        if n > NMAX_truncated - n_cutoff_final)
+                high_mode_fraction_final = high_mode_power_final / total_power_final if total_power_final > 0 else 0
+                
+                print(f"  Final solution: {len(modes_final)} modes, total power = {total_power_final:.6e}")
+                print(f"  Final high mode check: {high_mode_fraction_final*100:.2f}% in top {n_cutoff_final} n-modes")
+                
+                if high_mode_fraction_final >= high_mode_power_threshold:
+                    print(f"  ⚠ Warning: High mode power criterion not met after truncation.")
+                    print(f"            Consider increasing NMAX_initial or adjusting thresholds.")
+                
+                print(f"\n✓ Adaptive fitting complete: NMAX={NMAX_truncated}, MMAX={MMAX_truncated}")
                 return cls(Q1_final, Q2_final, frequency, NMAX_truncated, MMAX_truncated)
             
             else:
@@ -913,10 +982,11 @@ class SphericalWaveExpansion:
                     NMAX_increase = 2  # Small increase
                 
                 NMAX += NMAX_increase
-                print(f"  Increasing NMAX by {NMAX_increase} to {NMAX}")
+                print(f"  → Increasing NMAX by {NMAX_increase} to {NMAX}")
         
         # If we hit max iterations without converging, return best result
-        print(f"\nWarning: Max iterations reached. Returning solution with NMAX={NMAX}")
+        print(f"\n⚠ Warning: Max iterations ({max_iterations}) reached without full convergence.")
+        print(f"  Returning solution with NMAX={NMAX}, MMAX={MMAX_current}")
         return cls(Q1_coeffs, Q2_coeffs, frequency, NMAX, MMAX_current)
     
     @classmethod
