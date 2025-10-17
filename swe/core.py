@@ -499,21 +499,30 @@ def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
                                  theta: np.ndarray, phi: np.ndarray, 
                                  k: float, legendre_cache: Dict = None):
     """
-    Calculate near-field pattern functions matching far-field structure with radial functions.
+    Calculate near-field pattern functions using TICRA convention.
+    Uses Hankel function of second kind h_n^(2) = j_n - i*y_n
     """
+    abs_m = abs(m)
+    
+    # Apply pole avoidance
+    theta_safe = np.copy(theta)
+    epsilon = 1e-3
+    theta_safe = np.where(theta < epsilon, epsilon, theta_safe)
+    theta_safe = np.where(theta > (np.pi - epsilon), np.pi - epsilon, theta_safe)
+    
     # Get Legendre functions
     if legendre_cache is not None and (n, m) in legendre_cache:
         P_norm, dP_norm = legendre_cache[(n, m)]
     else:
-        P_norm, dP_norm = normalized_associated_legendre(n, m, theta)
+        P_norm, dP_norm = normalized_associated_legendre(n, m, theta_safe)
     
-    # Radial functions
+    # Radial functions - Hankel function of second kind
     kr = k * r
     j_n = spherical_jn(n, kr)
     y_n = spherical_yn(n, kr)
-    z_n = j_n + 1j * y_n
+    h_n = j_n - 1j * y_n  # h_n^(2)
     
-    # Derivative term
+    # Derivative of kr*h_n
     if n == 0:
         j_n_m1 = 0.0
         y_n_m1 = -np.cos(kr) / kr
@@ -521,47 +530,42 @@ def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
         j_n_m1 = spherical_jn(n-1, kr)
         y_n_m1 = spherical_yn(n-1, kr)
     
-    z_n_m1 = j_n_m1 + 1j * y_n_m1
+    h_n_m1 = j_n_m1 - 1j * y_n_m1
+    dkrh_n = kr * h_n_m1 - n * h_n  # d/d(kr){kr*h_n^(2)}
     
+    # Common factors from equations (4.214-4.215)
     prefactor = 1 / np.sqrt(2 * np.pi) * 1 / np.sqrt(n * (n + 1))
     
+    # TICRA sign factor: (m/|m|)^m (positive, not negative)
     if m == 0:
         sign_factor = 1.0
     else:
-        sign_factor = (-m / abs(m)) ** m
+        sign_factor = (m / abs(m)) ** m
     
-    phase = np.exp(1j * m * phi)
+    # TICRA phase convention: exp(-jmφ)
+    phase = np.exp(-1j * m * phi)
     
-    # Apply pole avoidance
-    theta_safe = np.copy(theta)
-    epsilon = 1e-3
-    theta_safe = np.where(theta < epsilon, epsilon, theta_safe)
-    theta_safe = np.where(theta > (np.pi - epsilon), np.pi - epsilon, theta_safe)
     sin_theta = np.sin(theta_safe)
-    mP_over_sin = m * P_norm / sin_theta
+    jmP_over_sin = 1j * m * P_norm / sin_theta
     
     coef = prefactor * sign_factor * phase
     
-    # Q1 (TE): multiply far-field pattern by z_n
+    # Mode 1 (TE): m'_nm components from eq (4.216)
+    # Note: TICRA uses negative signs
     F1_E_r = 0.0
-    F1_E_theta = coef * (1j * mP_over_sin) * z_n
-    F1_E_phi = coef * (-dP_norm) * z_n
+    F1_E_theta = -coef * h_n * jmP_over_sin
+    F1_E_phi = -coef * h_n * dP_norm
     
-    # Q2 (TM): radial term + angular terms with derivative
-    # Radial: uses z_n / (kr)
-    # Angular: uses (z_n_m1 - n*z_n/kr) which is the derivative without the (n+1) term
-    radial_deriv = z_n_m1 - n * z_n / kr
+    # Mode 2 (TM): n'_nm components from eq (4.217)
+    F2_E_r = coef * (n * (n + 1) / kr) * h_n * P_norm
+    F2_E_theta = coef * (dkrh_n / kr) * dP_norm
+    F2_E_phi = -coef * (dkrh_n / kr) * jmP_over_sin  # Note negative sign
     
-    F2_E_r = coef * n * (n + 1) * P_norm * z_n / kr
-    F2_E_theta = coef * dP_norm * radial_deriv
-    F2_E_phi = coef * (1j * mP_over_sin) * radial_deriv
-    
-    # H fields - indices swap per Hansen eq (A1.2): F_3-s,m,n
-    # Q1 uses F2 pattern (TM structure), Q2 uses F1 pattern (TE structure)
+    # H fields - swap per reciprocity
     F1_H_r = F2_E_r
-    F1_H_theta = F2_E_theta  
+    F1_H_theta = F2_E_theta
     F1_H_phi = F2_E_phi
-
+    
     F2_H_r = F1_E_r
     F2_H_theta = F1_E_theta
     F2_H_phi = F1_E_phi
@@ -697,341 +701,6 @@ class SphericalWaveExpansion:
         return E_theta, E_phi
     
     @classmethod
-    def from_spherical_near_field_batch(cls,
-                                        r,
-                                        theta: np.ndarray,
-                                        phi: np.ndarray,
-                                        E_theta: np.ndarray,
-                                        E_phi: np.ndarray,
-                                        frequency: float,
-                                        NMAX: int,
-                                        MMAX: int = None,
-                                        use_H: bool = False,
-                                        H_theta: np.ndarray = None,
-                                        H_phi: np.ndarray = None):
-        """
-        Optimized from_spherical_near_field using batch Legendre computation.
-        
-        This is a classmethod, so add @classmethod decorator when integrating.
-        """
-        if MMAX is None:
-            MMAX = NMAX
-        
-        # Convert to 1D arrays
-        r = np.atleast_1d(r)
-        if r.size == 1:
-            r = np.full(len(theta), r.item())
-        
-        theta = np.atleast_1d(theta).flatten()
-        phi = np.atleast_1d(phi).flatten()
-        E_theta = np.atleast_1d(E_theta).flatten()
-        E_phi = np.atleast_1d(E_phi).flatten()
-        
-        N_points = len(theta)
-        if not (len(r) == len(phi) == len(E_theta) == len(E_phi) == N_points):
-            raise ValueError("All input arrays must have the same length")
-        
-        k = 2 * np.pi * frequency / 299792458.0
-        
-        # Build mode list
-        modes = []
-        for n in range(1, NMAX + 1):
-            for m in range(-min(n, MMAX), min(n, MMAX) + 1):
-                modes.append((n, m))
-        
-        N_modes = len(modes)
-        
-        # Determine if using H field
-        use_H_field = False
-        if use_H and H_theta is not None and H_phi is not None:
-            H_theta = np.atleast_1d(H_theta).flatten()
-            H_phi = np.atleast_1d(H_phi).flatten()
-            use_H_field = True
-        
-        # PRE-COMPUTE ALL LEGENDRE FUNCTIONS ONCE
-        legendre_cache = compute_all_modes_legendre(NMAX, MMAX, theta)
-        
-        # Build design matrix
-        N_coeffs = 4 * N_modes
-        
-        if use_H_field:
-            A = np.zeros((8 * N_points, N_coeffs), dtype=float)
-        else:
-            A = np.zeros((4 * N_points, N_coeffs), dtype=float)
-        
-        kr = k * r
-        sin_theta = np.sin(theta)
-        sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
-        
-        for mode_idx, (n, m) in enumerate(modes):
-            # Get cached Legendre functions
-            P_norm, dP_norm = legendre_cache[(n, m)]
-            
-            # Radial functions (still need to compute these)
-            j_n = spherical_jn(n, kr)
-            y_n = spherical_yn(n, kr)
-            h_n = j_n - 1j * y_n
-            
-            # Derivatives
-            if n == 0:
-                dh_n = -j_n + 1j * y_n
-            else:
-                j_n_minus = spherical_jn(n-1, kr)
-                y_n_minus = spherical_yn(n-1, kr)
-                h_n_minus = j_n_minus - 1j * y_n_minus
-                dh_n = h_n_minus - (n + 1) / kr * h_n
-            
-            exp_imphi = np.exp(1j * m * phi)
-            
-            prefactor = np.sqrt(2 / (n * (n + 1)))
-            if m == 0:
-                sign_factor = 1.0
-            else:
-                sign_factor = (-m / abs(m)) ** m
-            
-            coef = prefactor * sign_factor * exp_imphi * k
-            
-            # Column indices
-            col_Q1_re = 4 * mode_idx
-            col_Q1_im = 4 * mode_idx + 1
-            col_Q2_re = 4 * mode_idx + 2
-            col_Q2_im = 4 * mode_idx + 3
-            
-            # Q1 contribution to E field
-            E_theta_Q1 = coef * (1j * m / sin_theta_safe) * P_norm * h_n / kr
-            E_phi_Q1 = -coef * dP_norm * h_n / kr
-            
-            # Q2 contribution to E field
-            E_theta_Q2 = coef * dP_norm * (k * dh_n - h_n / r) / k
-            E_phi_Q2 = coef * (1j * m / sin_theta_safe) * P_norm * (k * dh_n - h_n / r) / k
-            
-            # Fill A matrix for E_theta (real and imaginary parts)
-            A[0*N_points:1*N_points, col_Q1_re] = np.real(E_theta_Q1)
-            A[0*N_points:1*N_points, col_Q1_im] = -np.imag(E_theta_Q1)
-            A[0*N_points:1*N_points, col_Q2_re] = np.real(E_theta_Q2)
-            A[0*N_points:1*N_points, col_Q2_im] = -np.imag(E_theta_Q2)
-            
-            A[1*N_points:2*N_points, col_Q1_re] = np.imag(E_theta_Q1)
-            A[1*N_points:2*N_points, col_Q1_im] = np.real(E_theta_Q1)
-            A[1*N_points:2*N_points, col_Q2_re] = np.imag(E_theta_Q2)
-            A[1*N_points:2*N_points, col_Q2_im] = np.real(E_theta_Q2)
-            
-            # Fill A matrix for E_phi (real and imaginary parts)
-            A[2*N_points:3*N_points, col_Q1_re] = np.real(E_phi_Q1)
-            A[2*N_points:3*N_points, col_Q1_im] = -np.imag(E_phi_Q1)
-            A[2*N_points:3*N_points, col_Q2_re] = np.real(E_phi_Q2)
-            A[2*N_points:3*N_points, col_Q2_im] = -np.imag(E_phi_Q2)
-            
-            A[3*N_points:4*N_points, col_Q1_re] = np.imag(E_phi_Q1)
-            A[3*N_points:4*N_points, col_Q1_im] = np.real(E_phi_Q1)
-            A[3*N_points:4*N_points, col_Q2_re] = np.imag(E_phi_Q2)
-            A[3*N_points:4*N_points, col_Q2_im] = np.real(E_phi_Q2)
-            
-            # H field contributions if requested
-            if use_H_field:
-                Z0 = 376.730313668
-                factor_H = k / (1j * k * Z0)
-                
-                H_theta_Q1 = factor_H * coef * dP_norm * (k * dh_n - h_n / r) / k / k
-                H_phi_Q1 = factor_H * coef * (1j * m / sin_theta_safe) * P_norm * (k * dh_n - h_n / r) / k / k
-                
-                H_theta_Q2 = -factor_H * coef * (1j * m / sin_theta_safe) * P_norm * h_n / kr / k
-                H_phi_Q2 = factor_H * coef * dP_norm * h_n / kr / k
-                
-                # Fill H field rows
-                A[4*N_points:5*N_points, col_Q1_re] = np.real(H_theta_Q1)
-                A[4*N_points:5*N_points, col_Q1_im] = -np.imag(H_theta_Q1)
-                A[4*N_points:5*N_points, col_Q2_re] = np.real(H_theta_Q2)
-                A[4*N_points:5*N_points, col_Q2_im] = -np.imag(H_theta_Q2)
-                
-                A[5*N_points:6*N_points, col_Q1_re] = np.imag(H_theta_Q1)
-                A[5*N_points:6*N_points, col_Q1_im] = np.real(H_theta_Q1)
-                A[5*N_points:6*N_points, col_Q2_re] = np.imag(H_theta_Q2)
-                A[5*N_points:6*N_points, col_Q2_im] = np.real(H_theta_Q2)
-                
-                A[6*N_points:7*N_points, col_Q1_re] = np.real(H_phi_Q1)
-                A[6*N_points:7*N_points, col_Q1_im] = -np.imag(H_phi_Q1)
-                A[6*N_points:7*N_points, col_Q2_re] = np.real(H_phi_Q2)
-                A[6*N_points:7*N_points, col_Q2_im] = -np.imag(H_phi_Q2)
-                
-                A[7*N_points:8*N_points, col_Q1_re] = np.imag(H_phi_Q1)
-                A[7*N_points:8*N_points, col_Q1_im] = np.real(H_phi_Q1)
-                A[7*N_points:8*N_points, col_Q2_re] = np.imag(H_phi_Q2)
-                A[7*N_points:8*N_points, col_Q2_im] = np.real(H_phi_Q2)
-        
-        # Build b vector
-        b = np.concatenate([
-            np.real(E_theta), np.imag(E_theta),
-            np.real(E_phi), np.imag(E_phi)
-        ])
-        
-        if use_H_field:
-            b = np.concatenate([
-                b,
-                np.real(H_theta), np.imag(H_theta),
-                np.real(H_phi), np.imag(H_phi)
-            ])
-        
-        # Solve least squares
-        result = lsq_linear(A, b, verbose=0)
-        coeffs = result.x
-        
-        # Extract Q coefficients
-        Q1_coeffs = {}
-        Q2_coeffs = {}
-        
-        for mode_idx, (n, m) in enumerate(modes):
-            Q1_re = coeffs[4 * mode_idx]
-            Q1_im = coeffs[4 * mode_idx + 1]
-            Q2_re = coeffs[4 * mode_idx + 2]
-            Q2_im = coeffs[4 * mode_idx + 3]
-            
-            Q1_coeffs[(n, m)] = Q1_re + 1j * Q1_im
-            Q2_coeffs[(n, m)] = Q2_re + 1j * Q2_im
-        
-        return cls(Q1_coeffs, Q2_coeffs, frequency, NMAX, MMAX)
-    
-    @classmethod
-    def from_planar_near_field(cls,
-                               x: np.ndarray,
-                               y: np.ndarray,
-                               z_scan: float,
-                               E_x: np.ndarray,
-                               E_y: np.ndarray,
-                               frequency: float,
-                               NMAX: int,
-                               MMAX: Optional[int] = None,
-                               origin_offset: Tuple[float, float, float] = (0., 0., 0.)) -> 'SphericalWaveExpansion':
-        """
-        Create SWE object from planar near-field measurements.
-        
-        Planar near-field scanners measure tangential E fields on a plane.
-        This method transforms the planar measurements to spherical wave coefficients.
-        
-        Args:
-            x: X coordinates of measurement points in meters (1D array)
-            y: Y coordinates of measurement points in meters (1D array)
-            z_scan: Z coordinate of scan plane in meters (scalar)
-            E_x: Measured E_x component (1D array)
-            E_y: Measured E_y component (1D array)
-            frequency: Frequency in Hz
-            NMAX: Maximum degree for expansion
-            MMAX: Maximum order (default: NMAX)
-            origin_offset: (x0, y0, z0) offset of spherical coordinate origin from planar scan
-            
-        Returns:
-            SphericalWaveExpansion object with fitted coefficients
-        """
-        if MMAX is None:
-            MMAX = NMAX
-        
-        # Convert planar measurements to spherical coordinates relative to origin
-        x_rel = x - origin_offset[0]
-        y_rel = y - origin_offset[1]
-        z_rel = z_scan - origin_offset[2]
-        
-        # For each measurement point, compute (r, theta, phi)
-        r, theta, phi = cartesian_to_spherical(x_rel, y_rel, np.full_like(x_rel, z_rel))
-        
-        # Convert E field from Cartesian to spherical components
-        # We need E_theta and E_phi at each measurement point
-        # First, get unit vectors
-        sin_theta = np.sin(theta)
-        cos_theta = np.cos(theta)
-        sin_phi = np.sin(phi)
-        cos_phi = np.cos(phi)
-        
-        # E_z = 0 on the measurement plane (tangential components only)
-        E_z = np.zeros_like(E_x)
-        
-        # Transform to spherical components
-        # theta_hat = cos(theta)cos(phi) x_hat + cos(theta)sin(phi) y_hat - sin(theta) z_hat
-        # phi_hat = -sin(phi) x_hat + cos(phi) y_hat
-        E_theta = (cos_theta * cos_phi * E_x + cos_theta * sin_phi * E_y - sin_theta * E_z)
-        E_phi = (-sin_phi * E_x + cos_phi * E_y)
-        
-        # Now use spherical near-field fitting
-        return cls.from_spherical_near_field(
-            r, theta, phi, E_theta, E_phi,
-            frequency, NMAX, MMAX
-        )
-    
-    @classmethod
-    def from_cylindrical_near_field(cls,
-                                    rho: np.ndarray,
-                                    phi: np.ndarray,
-                                    z: np.ndarray,
-                                    E_rho: np.ndarray,
-                                    E_z: np.ndarray,
-                                    frequency: float,
-                                    NMAX: int,
-                                    MMAX: Optional[int] = None,
-                                    origin_offset: Tuple[float, float, float] = (0., 0., 0.)) -> 'SphericalWaveExpansion':
-        """
-        Create SWE object from cylindrical near-field measurements.
-        
-        Cylindrical near-field scanners measure tangential E fields on a cylinder.
-        
-        Args:
-            rho: Radial coordinate in cylindrical system (meters, 1D array)
-            phi: Azimuthal angle in cylindrical system (radians, 1D array)
-            z: Vertical coordinate (meters, 1D array)
-            E_rho: Measured E_rho component (tangential, 1D array)
-            E_z: Measured E_z component (tangential, 1D array)
-            frequency: Frequency in Hz
-            NMAX: Maximum degree for expansion
-            MMAX: Maximum order (default: NMAX)
-            origin_offset: (x0, y0, z0) offset of spherical origin from cylindrical origin
-            
-        Returns:
-            SphericalWaveExpansion object with fitted coefficients
-        """
-        if MMAX is None:
-            MMAX = NMAX
-        
-        # Convert cylindrical to Cartesian
-        x = rho * np.cos(phi)
-        y = rho * np.sin(phi)
-        
-        # Apply origin offset
-        x_rel = x - origin_offset[0]
-        y_rel = y - origin_offset[1]
-        z_rel = z - origin_offset[2]
-        
-        # Convert to spherical coordinates
-        r, theta, phi_sph = cartesian_to_spherical(x_rel, y_rel, z_rel)
-        
-        # Convert E field from cylindrical to spherical components
-        # Need to transform E_rho and E_z to E_theta and E_phi
-        # Cylindrical: (rho_hat, phi_hat, z_hat)
-        # Spherical: (r_hat, theta_hat, phi_hat)
-        
-        # Note: phi_cyl = phi_sph (azimuthal angles are the same)
-        # E_phi_cyl = E_phi_sph
-        
-        sin_theta = np.sin(theta)
-        cos_theta = np.cos(theta)
-        
-        # rho_hat = sin(theta) r_hat + cos(theta) theta_hat
-        # z_hat = cos(theta) r_hat - sin(theta) theta_hat
-        # phi_hat is the same in both systems
-        
-        # E_rho = E_rho_cyl * rho_hat = E_rho_cyl * (sin(theta) r_hat + cos(theta) theta_hat)
-        # E_z = E_z_cyl * z_hat = E_z_cyl * (cos(theta) r_hat - sin(theta) theta_hat)
-        # E_phi_cyl = 0 (tangential measurement on cylinder)
-        
-        # In spherical components:
-        # E_r = E_rho * sin(theta) + E_z * cos(theta)  (but we don't need this)
-        E_theta = E_rho * cos_theta - E_z * sin_theta
-        E_phi = np.zeros_like(E_rho)  # E_phi_cyl was zero
-        
-        # Now use spherical near-field fitting
-        return cls.from_spherical_near_field(
-            r, theta, phi_sph, E_theta, E_phi,
-            frequency, NMAX, MMAX
-        )
-    
-    @classmethod
     def from_far_field(cls,
                             theta: np.ndarray,
                             phi: np.ndarray,
@@ -1041,9 +710,7 @@ class SphericalWaveExpansion:
                             NMAX: int,
                             MMAX: int = None):
         """
-        Optimized from_far_field using batch Legendre computation.
-        
-        This is a classmethod, so add @classmethod decorator when integrating.
+        Fit Q coefficients from far-field measurements using TICRA conventions.
         """
         if MMAX is None:
             MMAX = NMAX
@@ -1071,13 +738,13 @@ class SphericalWaveExpansion:
         # PRE-COMPUTE ALL LEGENDRE FUNCTIONS
         legendre_cache = compute_all_modes_legendre(NMAX, MMAX, theta)
         
-        # Build design matrix - now much faster with cached Legendre
+        # Build design matrix using TICRA pattern functions
         N_coeffs = 4 * N_modes
         A_theta = np.zeros((N_points, N_coeffs), dtype=float)
         A_phi = np.zeros((N_points, N_coeffs), dtype=float)
         
         for mode_idx, (n, m) in enumerate(modes):
-            # Use cached Legendre functions
+            # Use TICRA far-field pattern functions
             (K1_theta, K1_phi), (K2_theta, K2_phi) = \
                 far_field_pattern_functions(n, m, theta, phi, legendre_cache)
             
@@ -1106,7 +773,7 @@ class SphericalWaveExpansion:
         result = lsq_linear(A, b, verbose=0)
         coeffs = result.x
         
-        # Extract Q coefficients
+        # Extract Q coefficients (already in TICRA convention)
         Q1_coeffs = {}
         Q2_coeffs = {}
         
@@ -1483,89 +1150,74 @@ def write_ticra_sph(filename: str,
     """
     Write spherical wave coefficients to TICRA .sph file format.
     
-    Applies inverse normalization to convert from Q_smn coefficients
-    to Q'_smn file format according to TICRA spec equation (6):
-    Q'_smn = (1/√8π) * Q*_smn
-    
-    Args:
-        filename: Output file path
-        Q1_coeffs: Q₁ coefficients dictionary
-        Q2_coeffs: Q₂ coefficients dictionary
-        frequency_GHz: Frequency in GHz
-        NTHE: Number of theta samples
-        NPHI: Number of phi samples
-        NMAX: Maximum degree
-        MMAX: Maximum order
-        description: Description text
+    Input coefficients should be in TICRA working convention.
+    They will be conjugated before writing to match the .sph file format.
     """
-    from datetime import datetime
     
     with open(filename, 'w') as f:
         # Record 1: PRGTAG
-        timestamp = datetime.now().strftime("%Y/%m/%d at %H:%M:%S")
-        f.write(f"File created by SWE module on {timestamp}, {description}, "
-                f"Freq [GHz]: {frequency_GHz:15.9f}\n")
+        f.write(f"TICRA-SWE Freq [GHz]: {frequency_GHz:.6f}\n")
         
         # Record 2: IDSTRG
-        f.write("SWE\n")
+        f.write(f"{description}\n")
         
-        # Record 3: Control data
-        f.write(f"{NTHE:6d} {NPHI:6d} {NMAX:6d} {MMAX:6d}\n")
+        # Record 3: NTHE, NPHI, NMAX, MMAX
+        f.write(f"{NTHE:5d}{NPHI:5d}{NMAX:5d}{MMAX:5d}\n")
         
         # Record 4: Rotation angles
-        f.write(f"Rotation angles (Theta, Phi, Chi)=({0.0:.5f}, {0.0:.5f}, {0.0:.5f})\n")
+        f.write("Rotation angles = (  0.00000,  0.00000,  0.00000)\n")
         
-        # Records 5-6: Dummy data (5 real numbers each)
-        f.write(f"  {'0.0000':>14s}  {'180.00':>14s}  {'0.0000':>14s}  {'359.99':>14s}  {'0.00000':>14s}\n")
-        f.write(f"  {'0.0000':>14s}  {'180.00':>14s}  {'0.0000':>14s}  {'359.99':>14s}  {'0.00000':>14s}\n")
-        
-        # Records 7-8: Dummy file names
-        f.write("SWEP_DUMMY_FILE_NAME\n")
-        f.write("SWEP_DUMMY_FILE_NAME\n")
+        # Records 5-8: Dummy data
+        f.write("Dummy text string\n")
+        f.write("  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00\n")
+        f.write("  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00\n")
+        f.write("Dummy text string\n")
+        f.write("Dummy text string\n")
         
         # Write coefficients for each |m|
-        for m_val in range(MMAX + 1):
-            # Calculate power for this mode (sum of |Q'|^2 over all n)
-            # Note: Power is calculated from Q' coefficients in the file
+        for m_val in range(0, MMAX + 1):
+            # Calculate power for this m
             power = 0.0
             for n in range(max(1, m_val), NMAX + 1):
-                for m_sign in ([-m_val, m_val] if m_val > 0 else [0]):
-                    if (n, m_sign) in Q1_coeffs:
-                        # Convert to Q' for power calculation
-                        Q1_prime = Q1_coeffs[(n, m_sign)]
-                        power += abs(Q1_prime)**2
-                    if (n, m_sign) in Q2_coeffs:
-                        Q2_prime = Q2_coeffs[(n, m_sign)]
-                        power += abs(Q2_prime)**2
+                if m_val == 0:
+                    Q1 = Q1_coeffs.get((n, 0), 0.0)
+                    Q2 = Q2_coeffs.get((n, 0), 0.0)
+                    power += abs(Q1)**2 + abs(Q2)**2
+                else:
+                    Q1_pos = Q1_coeffs.get((n, m_val), 0.0)
+                    Q2_pos = Q2_coeffs.get((n, m_val), 0.0)
+                    Q1_neg = Q1_coeffs.get((n, -m_val), 0.0)
+                    Q2_neg = Q2_coeffs.get((n, -m_val), 0.0)
+                    power += abs(Q1_pos)**2 + abs(Q2_pos)**2 + abs(Q1_neg)**2 + abs(Q2_neg)**2
             
-            # Write mode header
-            f.write(f"{m_val:6d}  {power:24.16E}\n")
+            power = power / 2.0
             
-            # Write coefficients
+            # Write m header
+            f.write(f"{m_val:5d}  {power:23.16E}\n")
+            
+            # Write coefficients for each n
             for n in range(max(1, m_val), NMAX + 1):
                 if m_val == 0:
-                    # m=0 case: one line per n
-                    # Apply inverse normalization: Q' = conj(Q) / sqrt(8π)
-                    Q1 = Q1_coeffs.get((n, 0), 0.0 + 0.0j)
-                    Q2 = Q2_coeffs.get((n, 0), 0.0 + 0.0j)
+                    # Conjugate before writing (reverse read operation)
+                    Q1 = np.conj(Q1_coeffs.get((n, 0), 0.0))
+                    Q2 = np.conj(Q2_coeffs.get((n, 0), 0.0))
                     
                     f.write(f"  {Q1.real:23.16E} {Q1.imag:23.16E} "
                            f"{Q2.real:23.16E} {Q2.imag:23.16E}\n")
                 else:
-                    # -m line
-                    Q1_neg = Q1_coeffs.get((n, -m_val), 0.0 + 0.0j)
-                    Q2_neg = Q2_coeffs.get((n, -m_val), 0.0 + 0.0j)
+                    # -m line (conjugate before writing)
+                    Q1_neg = np.conj(Q1_coeffs.get((n, -m_val), 0.0))
+                    Q2_neg = np.conj(Q2_coeffs.get((n, -m_val), 0.0))
                     
                     f.write(f"  {Q1_neg.real:23.16E} {Q1_neg.imag:23.16E} "
                            f"{Q2_neg.real:23.16E} {Q2_neg.imag:23.16E}\n")
                     
-                    # +m line
-                    Q1_pos = Q1_coeffs.get((n, m_val), 0.0 + 0.0j)
-                    Q2_pos = Q2_coeffs.get((n, m_val), 0.0 + 0.0j)
+                    # +m line (conjugate before writing)
+                    Q1_pos = np.conj(Q1_coeffs.get((n, m_val), 0.0))
+                    Q2_pos = np.conj(Q2_coeffs.get((n, m_val), 0.0))
                     
                     f.write(f"  {Q1_pos.real:23.16E} {Q1_pos.imag:23.16E} "
                            f"{Q2_pos.real:23.16E} {Q2_pos.imag:23.16E}\n")
-
 
 # ==============================================================================
 # Example Usage
