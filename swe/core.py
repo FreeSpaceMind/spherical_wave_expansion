@@ -478,20 +478,20 @@ def far_field_pattern_functions(n: int, m: int,
     if m == 0:
         sign_factor = 1.0
     else:
-        sign_factor = (-m / abs(m)) ** m
+        sign_factor = (m / abs(m)) ** m
     
-    phase = np.exp(1j * m * phi)
-    i_factor_1 = (-1j) ** (n + 1)
-    i_factor_2 = (-1j) ** n
+    phase = np.exp(-1j * m * phi)
+    i_factor_1 = (1j) ** (n)
+    i_factor_2 = (1j) ** (n + 1)
     
     sin_theta = np.sin(theta_safe)
     mP_over_sin = m * P_norm / sin_theta
     
     K1_theta = prefactor * sign_factor * phase * i_factor_1 * (1j * mP_over_sin)
-    K1_phi = prefactor * sign_factor * phase * i_factor_1 * (-dP_norm_dtheta)
+    K1_phi = prefactor * sign_factor * phase * i_factor_1 * (dP_norm_dtheta)
     
-    K2_theta = prefactor * sign_factor * phase * i_factor_2 * dP_norm_dtheta
-    K2_phi = prefactor * sign_factor * phase * i_factor_2 * (1j * mP_over_sin)
+    K2_theta = prefactor * sign_factor * phase * i_factor_2 * (dP_norm_dtheta)
+    K2_phi = prefactor * sign_factor * phase * i_factor_2 * (-1j * mP_over_sin)
     
     return (K1_theta, K1_phi), (K2_theta, K2_phi)
 
@@ -1454,6 +1454,12 @@ def read_ticra_sph(filename: str) -> Dict:
         else:
             line_idx += 1
     
+    # conjugate coefficients to match Q_smn definition
+    for key in Q1_coeffs:
+        Q1_coeffs[key] = np.conj(Q1_coeffs[key])
+    for key in Q2_coeffs:
+        Q2_coeffs[key] = np.conj(Q2_coeffs[key])
+
     return {
         'frequency': frequency,
         'NTHE': NTHE,
