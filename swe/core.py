@@ -603,7 +603,7 @@ def compute_mode_coefficients_batch(args):
         K1_theta = prefactor * sign_factor * phase * i_factor_1 * mP_over_sin
         K1_phi = prefactor * sign_factor * phase * i_factor_1 * dP_norm_2d
         
-        K2_theta = prefactor * sign_factor * phase * i_factor_2 * (-dP_norm_2d)
+        K2_theta = prefactor * sign_factor * phase * i_factor_2 * (dP_norm_2d)
         K2_phi = prefactor * sign_factor * phase * i_factor_2 * (-mP_over_sin)
         
         # Inner product: ∫∫ (E · F*) sin(θ) dθ dφ
@@ -758,8 +758,8 @@ class SphericalWaveExpansion:
                             r0: float = None,
                             NMAX_initial: int = 100,  # Start larger
                             MMAX_initial: int = 50,
-                            power_threshold: float = 0.995,
-                            high_mode_power_threshold: float = 0.005,
+                            power_threshold: float = 0.999,
+                            high_mode_power_threshold: float = 0.001,
                             azimuthal_power_threshold: float = 0.00005,
                             use_multiprocessing: bool = True,
                             n_workers: int = None):
@@ -777,8 +777,8 @@ class SphericalWaveExpansion:
             r0: Radius of minimum sphere enclosing sources (meters)
             NMAX_initial: Starting NMAX (default: 50)
             MMAX_initial: Starting MMAX (if None, grows with NMAX)
-            power_threshold: Retain modes with this fraction of power (0.995 = 99.5%)
-            high_mode_power_threshold: Max power in top 10% n-modes (0.005 = 0.5%)
+            power_threshold: Retain modes with this fraction of power (0.999 = 99.9%)
+            high_mode_power_threshold: Max power in top 10% n-modes (0.001 = 0.51)
             azimuthal_power_threshold: Min power per |m| to include (0.00005 = 0.005%)
             use_multiprocessing: Enable parallel computation
             n_workers: Number of parallel workers (None = auto-detect)
@@ -914,7 +914,7 @@ class SphericalWaveExpansion:
                     K1_theta = prefactor * sign_factor * phase * i_factor_1 * mP_over_sin
                     K1_phi = prefactor * sign_factor * phase * i_factor_1 * dP_norm_2d
                     
-                    K2_theta = prefactor * sign_factor * phase * i_factor_2 * (-dP_norm_2d)
+                    K2_theta = prefactor * sign_factor * phase * i_factor_2 * (dP_norm_2d)
                     K2_phi = prefactor * sign_factor * phase * i_factor_2 * (-mP_over_sin)
                     
                     integrand_1 = (E_THETA * np.conj(K1_theta) + E_PHI * np.conj(K1_phi)) * sin_theta
