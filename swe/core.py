@@ -1195,16 +1195,13 @@ class SphericalWaveExpansion:
                         Default is [0, 0, 0]
             swe_rotation: (alpha, beta, gamma) Euler angles (radians, ZYZ convention) 
                         rotating SWE frame to reflector frame. Default is no rotation.
-            chunk_size: Points per chunk for parallel processing (None for auto)
-            n_threads: Number of worker threads (None for auto)
+            chunk_size: Points per chunk for processing (None for single batch)
+            n_threads: Ignored (kept for compatibility)
             
         Returns:
             Jrr: Nr x 3 array of equivalent electric currents (A)
             Mrr: Nr x 3 array of equivalent magnetic currents (V)
         """
-        from concurrent.futures import ThreadPoolExecutor
-        import os
-        
         Nr = len(rr)
         
         # Default origin at coordinate system origin
@@ -1221,46 +1218,25 @@ class SphericalWaveExpansion:
         else:
             unr_swe = unr.copy()
         
-        # Auto-optimize parameters
-        if chunk_size is None:
-            chunk_size = min(1000, max(100, Nr // 8))
-        if n_threads is None:
-            n_threads = min(8, os.cpu_count() or 1)
+        # OPTIMIZATION: Process all points in one call to near_field_cartesian
+        # This allows vectorization and pre-computation of Legendre functions
+        x, y, z = rr_swe[:, 0], rr_swe[:, 1], rr_swe[:, 2]
+        (Ex, Ey, Ez), (Hx, Hy, Hz) = self.near_field_cartesian(x, y, z)
         
-        # Create chunks
-        chunks = [(i, min(i + chunk_size, Nr)) for i in range(0, Nr, chunk_size)]
-        
-        # Worker function
-        def _compute_fields_chunk(start: int, end: int):
-            r_chunk = rr_swe[start:end]
-            x, y, z = r_chunk[:, 0], r_chunk[:, 1], r_chunk[:, 2]
-            (Ex, Ey, Ez), (Hx, Hy, Hz) = self.near_field_cartesian(x, y, z)
-            return np.stack([Ex, Ey, Ez], axis=1), np.stack([Hx, Hy, Hz], axis=1)
-        
-        # Parallel field calculation
-        E_total = np.zeros((Nr, 3), dtype=np.complex128)
-        H_total = np.zeros((Nr, 3), dtype=np.complex128)
-        
-        with ThreadPoolExecutor(max_workers=n_threads) as executor:
-            futures = [executor.submit(_compute_fields_chunk, start, end) for start, end in chunks]
-            for i, future in enumerate(futures):
-                start, end = chunks[i]
-                E_chunk, H_chunk = future.result()
-                E_total[start:end] = E_chunk
-                H_total[start:end] = H_chunk
+        E_total = np.stack([Ex, Ey, Ez], axis=1)
+        H_total = np.stack([Hx, Hy, Hz], axis=1)
         
         # Transform E and H back to reflector frame if rotated
         if swe_rotation is not None:
             E_total = self._apply_rotation(E_total, swe_rotation)
             H_total = self._apply_rotation(H_total, swe_rotation)
         
-        Z0 = 376.730313668  # Intrinsic impedance of free space in ohms
-
-        # Calculate surface currents: J = n × H, M = -n × E
-        Jr = np.cross(unr, H_total, axis=-1) * Z0
-        Mr = -np.cross(unr, E_total, axis=-1) * Z0**2
+        # Calculate surface currents with impedance scaling
+        Z0 = 376.730313668
+        Jr = np.cross(unr, H_total) * Z0
+        Mr = -np.cross(unr, E_total) * Z0**2
         
-        # Apply surface element areas and sign convention (matches GetCurrents)
+        # Apply surface element areas and sign convention
         Jrr = -Jr * dSr[:, np.newaxis]
         Mrr = Mr * dSr[:, np.newaxis]
         
