@@ -1254,9 +1254,11 @@ class SphericalWaveExpansion:
             E_total = self._apply_rotation(E_total, swe_rotation)
             H_total = self._apply_rotation(H_total, swe_rotation)
         
+        Z0 = 376.730313668  # Intrinsic impedance of free space in ohms
+
         # Calculate surface currents: J = n × H, M = -n × E
-        Jr = np.cross(unr, H_total)
-        Mr = -np.cross(unr, E_total)
+        Jr = np.cross(unr, H_total, axis=-1) * Z0
+        Mr = -np.cross(unr, E_total, axis=-1) * Z0**2
         
         # Apply surface element areas and sign convention (matches GetCurrents)
         Jrr = -Jr * dSr[:, np.newaxis]
