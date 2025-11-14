@@ -1225,6 +1225,10 @@ class SphericalWaveExpansion:
         
         E_total = np.stack([Ex, Ey, Ez], axis=1)
         H_total = np.stack([Hx, Hy, Hz], axis=1)
+
+        # Conjugate fields to correct phase progression
+        E_total = np.conj(E_total)
+        H_total = np.conj(H_total)
         
         # Transform E and H back to reflector frame if rotated
         if swe_rotation is not None:
@@ -1233,8 +1237,8 @@ class SphericalWaveExpansion:
         
         # Calculate surface currents with impedance scaling
         Z0 = 376.730313668
-        Jr = np.cross(unr, H_total) * Z0
-        Mr = -np.cross(unr, E_total) * Z0**2
+        Jr = np.cross(unr, H_total, axis=-1) * np.sqrt(4*np.pi)
+        Mr = -np.cross(unr, E_total, axis=-1) * Z0 * np.sqrt(4*np.pi)
         
         # Apply surface element areas and sign convention
         Jrr = -Jr * dSr[:, np.newaxis]
