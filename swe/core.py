@@ -576,20 +576,85 @@ def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
            (F1_H_r, F1_H_theta, F1_H_phi), (F2_H_r, F2_H_theta, F2_H_phi)
 
 def compute_mode_coefficients_batch(args):
-    """Compute Q coefficients for a batch of modes - for parallel processing"""
+    """Compute Q coefficients for a batch of modes - with FFT optimization for phi integration."""
+    modes_batch, THETA, PHI, E_THETA, E_PHI, sin_theta, theta_unique, phi_unique, norm_factor, legendre_data = args
+    
+    # Check if phi is uniformly spaced
+    dphi = np.diff(phi_unique)
+    use_fft = len(phi_unique) > 4 and np.allclose(dphi, dphi[0], rtol=1e-6)
+    
+    if not use_fft:
+        # Fall back to original trapz method (for non-uniform phi grids)
+        return compute_mode_coefficients_batch_trapz(args)
+    
+    # FFT-optimized method for uniform phi grids
+    results = []
+    N_phi = len(phi_unique)
+    
+    for n, m in modes_batch:
+        # Unpack Legendre data
+        P_norm, dP_norm = legendre_data[(n, m)]
+        P_norm_2d = P_norm[:, np.newaxis]
+        dP_norm_2d = dP_norm[:, np.newaxis]
+        
+        # TICRA pattern functions WITHOUT exp(-imφ) phase term
+        prefactor = np.sqrt(2 / (n * (n + 1)))
+        sign_factor = (m / abs(m)) ** m if m != 0 else 1.0
+        i_factor_1 = (1j) ** n
+        i_factor_2 = (1j) ** (n + 1)
+        
+        sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
+        mP_over_sin = 1j * m * P_norm_2d / sin_theta_safe
+        
+        # Pattern functions without exp(-imφ)
+        K1_theta_base = prefactor * sign_factor * i_factor_1 * mP_over_sin
+        K1_phi_base = prefactor * sign_factor * i_factor_1 * dP_norm_2d
+        K2_theta_base = prefactor * sign_factor * i_factor_2 * dP_norm_2d
+        K2_phi_base = prefactor * sign_factor * i_factor_2 * (-mP_over_sin)
+        
+        # Integrand without exp(-imφ) in K (but will have exp(+imφ) from conjugate)
+        # We'll compute: ∫∫ E * conj(K_base) * exp(+imφ) * sin(θ) dθ dφ
+        integrand_1_base = (E_THETA * np.conj(K1_theta_base) + 
+                            E_PHI * np.conj(K1_phi_base)) * sin_theta
+        integrand_2_base = (E_THETA * np.conj(K2_theta_base) + 
+                            E_PHI * np.conj(K2_phi_base)) * sin_theta
+        
+        # Use FFT for phi integration
+        # We need: ∫ integrand_base * exp(+imφ) dφ
+        # Multiply by exp(+imφ) then take FFT to extract DC component
+        phi_grid = phi_unique[np.newaxis, :]  # shape (1, N_phi)
+        exp_plus_imphi = np.exp(1j * m * phi_grid)
+        
+        # Multiply integrand by exp(+imφ)
+        integrand_1_with_phase = integrand_1_base * exp_plus_imphi
+        integrand_2_with_phase = integrand_2_base * exp_plus_imphi
+        
+        # FFT along phi axis (axis=1), extract DC component (k=0)
+        # FFT gives sum, so divide by N_phi and multiply by 2π to get integral
+        phi_integral_1 = np.fft.fft(integrand_1_with_phase, axis=1)[:, 0] * (2 * np.pi / N_phi)
+        phi_integral_2 = np.fft.fft(integrand_2_with_phase, axis=1)[:, 0] * (2 * np.pi / N_phi)
+        
+        # Now integrate over theta
+        Q1 = np.trapz(phi_integral_1, theta_unique, axis=0) * norm_factor
+        Q2 = np.trapz(phi_integral_2, theta_unique, axis=0) * norm_factor
+        
+        mode_power = (abs(Q1)**2 + abs(Q2)**2) / 2.0
+        results.append(((n, m), Q1, Q2, mode_power))
+    
+    return results
+
+
+def compute_mode_coefficients_batch_trapz(args):
+    """Original trapz method - fallback for non-uniform grids."""
     modes_batch, THETA, PHI, E_THETA, E_PHI, sin_theta, theta_unique, phi_unique, norm_factor, legendre_data = args
     
     results = []
     
     for n, m in modes_batch:
-        # Unpack Legendre data for this mode
         P_norm, dP_norm = legendre_data[(n, m)]
-        
-        # Broadcast to 2D grid
         P_norm_2d = P_norm[:, np.newaxis]
         dP_norm_2d = dP_norm[:, np.newaxis]
         
-        # TICRA pattern functions
         prefactor = np.sqrt(2 / (n * (n + 1)))
         sign_factor = (m / abs(m)) ** m if m != 0 else 1.0
         phase = np.exp(-1j * m * PHI)
@@ -599,14 +664,11 @@ def compute_mode_coefficients_batch(args):
         sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
         mP_over_sin = 1j * m * P_norm_2d / sin_theta_safe
         
-        # Pattern functions
         K1_theta = prefactor * sign_factor * phase * i_factor_1 * mP_over_sin
         K1_phi = prefactor * sign_factor * phase * i_factor_1 * dP_norm_2d
-        
         K2_theta = prefactor * sign_factor * phase * i_factor_2 * (dP_norm_2d)
         K2_phi = prefactor * sign_factor * phase * i_factor_2 * (-mP_over_sin)
         
-        # Inner product: ∫∫ (E · F*) sin(θ) dθ dφ
         integrand_1 = (E_THETA * np.conj(K1_theta) + E_PHI * np.conj(K1_phi)) * sin_theta
         Q1 = np.trapz(np.trapz(integrand_1, phi_unique, axis=1), theta_unique, axis=0)
         Q1 *= norm_factor
@@ -615,9 +677,7 @@ def compute_mode_coefficients_batch(args):
         Q2 = np.trapz(np.trapz(integrand_2, phi_unique, axis=1), theta_unique, axis=0)
         Q2 *= norm_factor
         
-        # Calculate mode power
         mode_power = (abs(Q1)**2 + abs(Q2)**2) / 2.0
-        
         results.append(((n, m), Q1, Q2, mode_power))
     
     return results
@@ -759,8 +819,8 @@ class SphericalWaveExpansion:
                             NMAX_initial: int = 100,  # Start larger
                             MMAX_initial: int = 50,
                             power_threshold: float = 0.999,
-                            high_mode_power_threshold: float = 0.001,
-                            azimuthal_power_threshold: float = 0.00005,
+                            high_mode_power_threshold: float = 0.00001,
+                            azimuthal_power_threshold: float = 0.00001,
                             use_multiprocessing: bool = True,
                             n_workers: int = None):
         """
@@ -937,8 +997,6 @@ class SphericalWaveExpansion:
             mode_powers_array = np.array([p for _, p in mode_powers])
             total_power = np.sum(mode_powers_array)
             
-            print(f"  Total power: {total_power:.6e}")
-            
             # Check power in top 10% of n values
             n_values = np.array([n for (n, m), _ in mode_powers])
             n_cutoff = max(1, int(np.ceil(0.1 * NMAX)))
@@ -957,46 +1015,69 @@ class SphericalWaveExpansion:
                 for (n, m), mode_power in mode_powers:
                     power_per_m[abs(m)] += mode_power
                 
-                # Determine MMAX based on azimuthal power distribution
-                # Keep all m where power is above threshold
+                # Calculate power per |m| for azimuthal truncation
+                power_per_m = np.zeros(MMAX_current + 1)
+                for (n, m), mode_power in mode_powers:
+                    power_per_m[abs(m)] += mode_power
+
+                # Find MMAX where tail is small AND cumulative power is sufficient
                 MMAX_truncated = 0
-                for m_abs in range(MMAX_current, -1, -1):
-                    if power_per_m[m_abs] / total_power >= azimuthal_power_threshold:
-                        MMAX_truncated = m_abs
-                        break  # Found the highest m with significant power
+                for m_test in range(0, MMAX_current + 1):
+                    # Cumulative power up to m_test
+                    cumulative_m = sum(power_per_m[m] for m in range(0, m_test + 1))
+                    cumulative_m_fraction = cumulative_m / total_power if total_power > 0 else 0
+                    
+                    # Check power in top modes near m_test
+                    m_cutoff = max(1, int(np.ceil(0.1 * m_test))) if m_test > 0 else 0
+                    high_m = range(max(0, m_test - m_cutoff + 1), m_test + 1)
+                    high_m_power = sum(power_per_m[m] for m in high_m)
+                    high_m_fraction = high_m_power / total_power if total_power > 0 else 0
+                    
+                    # Accept if BOTH: tail is small AND we have enough power
+                    if (high_m_fraction < azimuthal_power_threshold and 
+                        cumulative_m_fraction >= power_threshold):
+                        MMAX_truncated = m_test
+                        break  # <-- ADD THIS
 
-                # Alternative: print diagnostic info
-                print(f"  Power per |m|:")
-                for m_abs in range(min(10, MMAX_current + 1)):
-                    print(f"    |m|={m_abs}: {power_per_m[m_abs]/total_power*100:.3f}%")
-                if MMAX_current > 10:
-                    print(f"    ... (showing first 10)")
-                    print(f"    |m|={MMAX_current}: {power_per_m[MMAX_current]/total_power*100:.3f}%")
+                print(f"\n  Azimuthal truncation: MMAX {MMAX_current} → {MMAX_truncated}")
+                print(f"    Tail power at m={MMAX_truncated}: {high_m_fraction*100:.3f}%")
+                print(f"    Cumulative m power: {cumulative_m_fraction*100:.2f}%")
+                
+                # Find highest n where tail modes have negligible power
+                power_by_n = {n: 0 for n in range(1, NMAX+1)}
+                for (n, m), pwr in mode_powers:
+                    power_by_n[n] += pwr
 
-                print(f"  Azimuthal truncation: MMAX {MMAX_current} → {MMAX_truncated} (threshold: {azimuthal_power_threshold*100:.2f}%)")
-                
-                # Power-based mode truncation
-                mode_powers_sorted = sorted(mode_powers, key=lambda x: x[1], reverse=True)
-                
-                cumulative_power = 0.0
-                Q1_final = {}
-                Q2_final = {}
-                NMAX_truncated = 0
-                
-                for (n, m), mode_power in mode_powers_sorted:
-                    if abs(m) <= MMAX_truncated:
-                        Q1_final[(n, m)] = Q1_coeffs[(n, m)]
-                        Q2_final[(n, m)] = Q2_coeffs[(n, m)]
-                        cumulative_power += mode_power
-                        NMAX_truncated = max(NMAX_truncated, n)
-                        
-                        if cumulative_power / total_power >= power_threshold:
-                            break
-                
-                retained_fraction = cumulative_power / total_power
-                print(f"\n  Power-based truncation: {len(Q1_final)} modes retained")
-                print(f"  NMAX: {NMAX} → {NMAX_truncated}, MMAX: {MMAX_current} → {MMAX_truncated}")
-                print(f"  Retained power: {retained_fraction*100:.2f}%")
+                NMAX_truncated = 1
+                for n_test in range(1, NMAX+1):
+                    # Check power in top 10% of modes at this truncation level
+                    n_cutoff = max(1, int(np.ceil(0.1 * n_test)))
+                    high_modes = range(max(1, n_test - n_cutoff + 1), n_test + 1)
+                    high_power = sum(power_by_n.get(n, 0) for n in high_modes)
+                    high_power_fraction = high_power / total_power if total_power > 0 else 0
+                    
+                    # Also check cumulative power up to n_test
+                    cumulative = sum(power_by_n.get(n, 0) for n in range(1, n_test+1))
+                    cumulative_fraction = cumulative / total_power if total_power > 0 else 0
+                    
+                    # Accept if both: (1) tail is small AND (2) we have enough total power
+                    if (high_power_fraction < high_mode_power_threshold and 
+                        cumulative_fraction >= power_threshold):
+                        NMAX_truncated = n_test
+                        break
+
+                print(f"  N-based truncation: NMAX {NMAX} → {NMAX_truncated}")
+                print(f"    Tail power at n={NMAX_truncated}: {high_power_fraction*100:.2f}%")
+                print(f"    Cumulative power: {cumulative_fraction*100:.2f}%")
+
+                # Keep ALL modes up to NMAX_truncated and MMAX_truncated
+                Q1_final = {(n,m): Q1_coeffs[(n,m)] for (n,m) in Q1_coeffs.keys() 
+                            if n <= NMAX_truncated and abs(m) <= MMAX_truncated}
+                Q2_final = {(n,m): Q2_coeffs[(n,m)] for (n,m) in Q2_coeffs.keys() 
+                            if n <= NMAX_truncated and abs(m) <= MMAX_truncated}
+
+                retained_power = sum(power_by_n.get(n, 0) for n in range(1, NMAX_truncated+1))
+                retained_fraction = retained_power / total_power
                 
                 # Verify final power distribution
                 n_values_final = np.array([n for (n, m) in Q1_final.keys()])
@@ -1016,6 +1097,25 @@ class SphericalWaveExpansion:
                     print(f"  ⚠ Warning: High mode power criterion not met after truncation ({high_mode_fraction_final*100:.2f}% >= {high_mode_power_threshold*100:.0f}%).")
                 
                 print(f"\n✓ Adaptive coefficient extraction complete: NMAX={NMAX_truncated}, MMAX={MMAX_truncated}")
+
+                # Check if final grid is adequately sampled
+                theta_samples = len(theta_unique)
+                phi_samples = len(phi_unique)
+                theta_required = 2 * NMAX_truncated + 1
+                phi_required = 2 * MMAX_truncated + 1
+
+                print(f"\n=== Sampling Check ===")
+                print(f"  Theta: {theta_samples} samples (need {theta_required}) - {'✓ OK' if theta_samples >= theta_required else '⚠ UNDERSAMPLED'}")
+                print(f"  Phi:   {phi_samples} samples (need {phi_required}) - {'✓ OK' if phi_samples >= phi_required else '⚠ UNDERSAMPLED'}")
+
+                if theta_samples < theta_required or phi_samples < phi_required:
+                    warnings.warn(
+                        f"Input pattern is undersampled for NMAX={NMAX_truncated}, MMAX={MMAX_truncated}. "
+                        f"Need at least {theta_required}×{phi_required} grid, but have {theta_samples}×{phi_samples}. "
+                        f"Results may be inaccurate due to aliasing.",
+                        UserWarning
+                    )
+
                 return cls(Q1_final, Q2_final, frequency, NMAX_truncated, MMAX_truncated)
             
             else:
