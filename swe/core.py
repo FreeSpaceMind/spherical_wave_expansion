@@ -1441,7 +1441,7 @@ def read_ticra_sph(filename: str) -> Dict:
     rotation_line = lines[line_idx].strip()
     line_idx += 1
     if 'Rotation angles' in rotation_line:
-        angles_str = rotation_line.split('=')[1].strip('()')
+        angles_str = rotation_line.split('=')[1].strip().strip('()')
         rotation_angles = tuple(float(x.strip()) for x in angles_str.split(','))
     else:
         rotation_angles = (0.0, 0.0, 0.0)
