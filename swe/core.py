@@ -878,10 +878,6 @@ class SphericalWaveExpansion:
             kr0 = k * r0
             NMAX_estimated = int(np.ceil(kr0 + max(10, 3.6 * (kr0 ** (1/3)))))
             NMAX_initial = max(NMAX_initial, NMAX_estimated)
-            print(f"Estimated NMAX from r0={r0}m: kr0={kr0:.2f}, NMAX={NMAX_estimated}")
-            print(f"Using NMAX_initial={NMAX_initial}")
-        else:
-            print(f"Using NMAX_initial={NMAX_initial}")
         
         # MMAX_initial = None means let it grow with NMAX
         use_adaptive_mmax = (MMAX_initial is None)
@@ -905,10 +901,7 @@ class SphericalWaveExpansion:
             else:
                 MMAX_current = min(MMAX_initial, NMAX)
             
-            print(f"\nIteration {iteration + 1}: Computing coefficients for NMAX={NMAX}, MMAX={MMAX_current}")
-            
             # Pre-compute Legendre functions for all modes
-            print(f"  Computing Legendre functions...")
             legendre_cache = compute_all_modes_legendre(NMAX, MMAX_current, THETA[:, 0])
             
             # Build mode list
@@ -918,15 +911,12 @@ class SphericalWaveExpansion:
                     modes.append((n, m))
             
             total_modes = len(modes)
-            print(f"  Extracting {total_modes} mode coefficients via integration...")
             
             # Compute coefficients (parallel or serial)
             if use_multiprocessing and total_modes > 100:
                 # Split modes into batches for parallel processing
                 batch_size = max(10, total_modes // (n_workers * 4))
                 mode_batches = [modes[i:i + batch_size] for i in range(0, len(modes), batch_size)]
-                
-                print(f"    Using {n_workers} workers, {len(mode_batches)} batches...")
                 
                 # Prepare arguments for each batch
                 args_list = []
@@ -991,8 +981,6 @@ class SphericalWaveExpansion:
                     mode_power = (abs(Q1)**2 + abs(Q2)**2) / 2.0
                     mode_powers.append(((n, m), mode_power))
             
-            print(f"    Completed {len(Q1_coeffs)} modes")
-            
             # Calculate total power
             mode_powers_array = np.array([p for _, p in mode_powers])
             total_power = np.sum(mode_powers_array)
@@ -1004,12 +992,9 @@ class SphericalWaveExpansion:
             high_mode_power = np.sum(mode_powers_array[high_n_mask])
             
             high_mode_fraction = high_mode_power / total_power if total_power > 0 else 0
-            print(f"  Power in top {n_cutoff} n-modes: {high_mode_fraction*100:.2f}%")
             
             # Check convergence
             if high_mode_fraction < high_mode_power_threshold:
-                print(f"  ✓ Convergence achieved: high modes contain {high_mode_fraction*100:.2f}% < {high_mode_power_threshold*100:.0f}%")
-                
                 # Calculate power per |m| for azimuthal truncation
                 power_per_m = np.zeros(MMAX_current + 1)
                 for (n, m), mode_power in mode_powers:
@@ -1037,11 +1022,7 @@ class SphericalWaveExpansion:
                     if (high_m_fraction < azimuthal_power_threshold and 
                         cumulative_m_fraction >= power_threshold):
                         MMAX_truncated = m_test
-                        break  # <-- ADD THIS
-
-                print(f"\n  Azimuthal truncation: MMAX {MMAX_current} → {MMAX_truncated}")
-                print(f"    Tail power at m={MMAX_truncated}: {high_m_fraction*100:.3f}%")
-                print(f"    Cumulative m power: {cumulative_m_fraction*100:.2f}%")
+                        break
                 
                 # Find highest n where tail modes have negligible power
                 power_by_n = {n: 0 for n in range(1, NMAX+1)}
@@ -1066,10 +1047,6 @@ class SphericalWaveExpansion:
                         NMAX_truncated = n_test
                         break
 
-                print(f"  N-based truncation: NMAX {NMAX} → {NMAX_truncated}")
-                print(f"    Tail power at n={NMAX_truncated}: {high_power_fraction*100:.2f}%")
-                print(f"    Cumulative power: {cumulative_fraction*100:.2f}%")
-
                 # Keep ALL modes up to NMAX_truncated and MMAX_truncated
                 Q1_final = {(n,m): Q1_coeffs[(n,m)] for (n,m) in Q1_coeffs.keys() 
                             if n <= NMAX_truncated and abs(m) <= MMAX_truncated}
@@ -1090,23 +1067,11 @@ class SphericalWaveExpansion:
                 high_mode_power_final = np.sum(mode_powers_final[high_n_mask_final])
                 high_mode_fraction_final = high_mode_power_final / total_power_final if total_power_final > 0 else 0
                 
-                print(f"  Final solution: {len(Q1_final)} modes, total power = {total_power_final:.6e}")
-                print(f"  Final high mode check: {high_mode_fraction_final*100:.2f}% in top {n_cutoff_final} n-modes")
-                
-                if high_mode_fraction_final >= high_mode_power_threshold:
-                    print(f"  ⚠ Warning: High mode power criterion not met after truncation ({high_mode_fraction_final*100:.2f}% >= {high_mode_power_threshold*100:.0f}%).")
-                
-                print(f"\n✓ Adaptive coefficient extraction complete: NMAX={NMAX_truncated}, MMAX={MMAX_truncated}")
-
                 # Check if final grid is adequately sampled
                 theta_samples = len(theta_unique)
                 phi_samples = len(phi_unique)
                 theta_required = 2 * NMAX_truncated + 1
                 phi_required = 2 * MMAX_truncated + 1
-
-                print(f"\n=== Sampling Check ===")
-                print(f"  Theta: {theta_samples} samples (need {theta_required}) - {'✓ OK' if theta_samples >= theta_required else '⚠ UNDERSAMPLED'}")
-                print(f"  Phi:   {phi_samples} samples (need {phi_required}) - {'✓ OK' if phi_samples >= phi_required else '⚠ UNDERSAMPLED'}")
 
                 if theta_samples < theta_required or phi_samples < phi_required:
                     warnings.warn(
@@ -1121,11 +1086,13 @@ class SphericalWaveExpansion:
             else:
                 # Need more modes
                 NMAX += 50
-                print(f"  → Increasing NMAX to {NMAX}")
         
         # Max iterations reached
-        print(f"\n⚠ Warning: Max iterations ({max_iterations}) reached without full convergence.")
-        print(f"  Returning solution with NMAX={NMAX}, MMAX={MMAX_current}")
+        warnings.warn(
+            "Maximum iterations reached in adaptive mode calculation. "
+            "Results may be inaccurate.",
+            UserWarning
+        )
         return cls(Q1_coeffs, Q2_coeffs, frequency, NMAX, MMAX_current)
 
     @classmethod
@@ -1337,8 +1304,8 @@ class SphericalWaveExpansion:
         
         # Calculate surface currents with impedance scaling
         Z0 = 376.730313668
-        Jr = np.cross(unr, H_total, axis=-1) * np.sqrt(4*np.pi)
-        Mr = -np.cross(unr, E_total, axis=-1) * Z0 * np.sqrt(4*np.pi)
+        Jr = -np.cross(unr, H_total, axis=-1) / np.sqrt(4 * np.pi / 2 / Z0)
+        Mr = np.cross(unr, E_total, axis=-1) / np.sqrt(4 * np.pi / 2)
         
         # Apply surface element areas and sign convention
         Jrr = -Jr * dSr[:, np.newaxis]
