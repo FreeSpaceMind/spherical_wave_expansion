@@ -9,6 +9,8 @@ dist/
 *.egg-info/
 *.egg
 
+.claude/
+
 # Unit test / coverage
 .pytest_cache/
 .coverage

@@ -41,15 +41,26 @@ References:
 - IEEE Std 1720-2012: Recommended Practice for Near-Field Antenna Measurements
 """
 
+import logging
 import math
 import numpy as np
-np.math = math 
+np.math = math
 from scipy.special import lpmv, spherical_jn, spherical_yn
 from scipy.optimize import lsq_linear
 from typing import Dict, Tuple, Optional, Union
 import warnings
 from multiprocessing import Pool
 import os
+
+# Optional Numba acceleration for performance-critical functions
+try:
+    from numba import jit, prange
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+
+# Configure module-level logger
+logger = logging.getLogger(__name__)
 
 
 # ==============================================================================
@@ -497,9 +508,92 @@ def far_field_pattern_functions(n: int, m: int,
     
     return (K1_theta, K1_phi), (K2_theta, K2_phi)
 
-def near_field_pattern_functions(n: int, m: int, r: np.ndarray, 
-                                 theta: np.ndarray, phi: np.ndarray, 
-                                 k: float, legendre_cache: Dict = None):
+
+def _precompute_bessel_scipy(nmax: int, kr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Scipy-based Bessel pre-computation (fallback when Numba not available)."""
+    N = len(kr)
+    j_all = np.zeros((nmax + 1, N))
+    y_all = np.zeros((nmax + 1, N))
+
+    for n in range(nmax + 1):
+        j_all[n] = spherical_jn(n, kr)
+        y_all[n] = spherical_yn(n, kr)
+
+    return j_all, y_all
+
+
+# Define Numba-accelerated version if available
+if HAS_NUMBA:
+    @jit(nopython=True, parallel=True, cache=True)
+    def _precompute_bessel_numba(nmax, kr):
+        """
+        Numba-accelerated spherical Bessel computation using recurrence relations.
+
+        Uses upward recurrence which is stable for y_n (growing) and j_n when n < kr.
+        For n > kr, j_n may lose some precision, but this is acceptable for most
+        antenna applications where kr is typically larger than nmax.
+        """
+        N = len(kr)
+        j_all = np.zeros((nmax + 1, N))
+        y_all = np.zeros((nmax + 1, N))
+
+        # Parallel loop over spatial points
+        for i in prange(N):
+            x = kr[i]
+            if x < 1e-30:
+                x = 1e-30  # Avoid division by zero
+
+            sin_x = np.sin(x)
+            cos_x = np.cos(x)
+
+            # Initial values (analytic formulas)
+            j_all[0, i] = sin_x / x                          # j_0
+            y_all[0, i] = -cos_x / x                         # y_0
+
+            if nmax >= 1:
+                j_all[1, i] = sin_x / (x * x) - cos_x / x    # j_1
+                y_all[1, i] = -cos_x / (x * x) - sin_x / x   # y_1
+
+            # Upward recurrence: f_{n+1} = (2n+1)/x * f_n - f_{n-1}
+            for n in range(1, nmax):
+                factor = (2 * n + 1) / x
+                j_all[n + 1, i] = factor * j_all[n, i] - j_all[n - 1, i]
+                y_all[n + 1, i] = factor * y_all[n, i] - y_all[n - 1, i]
+
+        return j_all, y_all
+
+
+def precompute_spherical_bessel(nmax: int, kr: np.ndarray,
+                                 use_numba: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Pre-compute all spherical Bessel functions j_n and y_n for n=0 to nmax.
+
+    This provides a significant speedup when computing near-field patterns,
+    since Bessel functions depend only on (n, kr), not on the azimuthal order m.
+    Pre-computing eliminates redundant calls when looping over modes.
+
+    Args:
+        nmax: Maximum order n
+        kr: Array of k*r values, shape (N,)
+        use_numba: If True and Numba is available, use JIT-compiled version
+                   with recurrence relations for additional speedup
+
+    Returns:
+        j_all: Array of shape (nmax+1, N) containing j_0, j_1, ..., j_nmax
+        y_all: Array of shape (nmax+1, N) containing y_0, y_1, ..., y_nmax
+    """
+    kr = np.atleast_1d(kr).ravel()
+
+    if use_numba and HAS_NUMBA:
+        return _precompute_bessel_numba(nmax, kr)
+    else:
+        return _precompute_bessel_scipy(nmax, kr)
+
+
+def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
+                                 theta: np.ndarray, phi: np.ndarray,
+                                 k: float, legendre_cache: Dict = None,
+                                 bessel_cache: Tuple[np.ndarray, np.ndarray] = None):
     """
     Calculate near-field pattern functions using TICRA convention.
     Uses Hankel function of second kind h_n^(2) = j_n - i*y_n
@@ -520,18 +614,30 @@ def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
     
     # Radial functions - Hankel function of second kind
     kr = k * r
-    j_n = spherical_jn(n, kr)
-    y_n = spherical_yn(n, kr)
-    h_n = j_n - 1j * y_n  # h_n^(2)
-    
-    # Derivative of kr*h_n
-    if n == 0:
-        j_n_m1 = 0.0
-        y_n_m1 = -np.cos(kr) / kr
+
+    if bessel_cache is not None:
+        # Use pre-computed Bessel functions (much faster for many modes)
+        j_all, y_all = bessel_cache
+        j_n = j_all[n]
+        y_n = y_all[n]
+        if n == 0:
+            j_n_m1 = 0.0
+            y_n_m1 = -np.cos(kr) / kr
+        else:
+            j_n_m1 = j_all[n - 1]
+            y_n_m1 = y_all[n - 1]
     else:
-        j_n_m1 = spherical_jn(n-1, kr)
-        y_n_m1 = spherical_yn(n-1, kr)
-    
+        # Fallback to scipy calls (backward compatibility)
+        j_n = spherical_jn(n, kr)
+        y_n = spherical_yn(n, kr)
+        if n == 0:
+            j_n_m1 = 0.0
+            y_n_m1 = -np.cos(kr) / kr
+        else:
+            j_n_m1 = spherical_jn(n - 1, kr)
+            y_n_m1 = spherical_yn(n - 1, kr)
+
+    h_n = j_n - 1j * y_n  # h_n^(2)
     h_n_m1 = j_n_m1 - 1j * y_n_m1
     dkrh_n = kr * h_n_m1 - n * h_n  # d/d(kr){kr*h_n^(2)}
     
@@ -717,19 +823,24 @@ class SphericalWaveExpansion:
         self.Q1_coeffs = Q1_coeffs if Q1_coeffs is not None else {}
         self.Q2_coeffs = Q2_coeffs if Q2_coeffs is not None else {}
         self._frequency = frequency
-        
+
         # Auto-detect NMAX and MMAX if not provided
         if NMAX is None or MMAX is None:
             all_keys = list(self.Q1_coeffs.keys()) + list(self.Q2_coeffs.keys())
             if all_keys:
                 self.NMAX = max(n for n, m in all_keys)
                 self.MMAX = max(abs(m) for n, m in all_keys)
+                logger.debug(f"Auto-detected NMAX={self.NMAX}, MMAX={self.MMAX} from {len(all_keys)} mode keys")
             else:
                 self.NMAX = NMAX if NMAX is not None else 0
                 self.MMAX = MMAX if MMAX is not None else 0
         else:
             self.NMAX = NMAX
             self.MMAX = MMAX
+
+        n_modes = len(self.Q1_coeffs) + len(self.Q2_coeffs)
+        if n_modes > 0:
+            logger.debug(f"SphericalWaveExpansion initialized: NMAX={self.NMAX}, MMAX={self.MMAX}, {len(self.Q1_coeffs)} Q1 modes, {len(self.Q2_coeffs)} Q2 modes")
     
     @property
     def frequency(self) -> Optional[float]:
@@ -758,34 +869,37 @@ class SphericalWaveExpansion:
     def far_field(self, theta: np.ndarray, phi: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         Optimized far_field calculation using batch Legendre computation.
-        
+
         Replace the existing far_field method with this one.
-        
+
         Args:
             theta: Polar angle(s) in radians
             phi: Azimuthal angle(s) in radians
-            
+
         Returns:
             E_theta: Theta component of electric field
             E_phi: Phi component of electric field
         """
         if self.k is None:
             raise ValueError("Frequency must be set before computing far field")
-        
+
         theta = np.atleast_1d(theta)
         phi = np.atleast_1d(phi)
-        
+
         if theta.shape != phi.shape:
             theta, phi = np.broadcast_arrays(theta, phi)
-        
+
+        logger.debug(f"Computing far field at {len(theta.flatten())} points, NMAX={self.NMAX}, MMAX={self.MMAX}")
+
         E_theta = np.zeros_like(theta, dtype=complex)
         E_phi = np.zeros_like(phi, dtype=complex)
-        
+
         all_modes = set(self.Q1_coeffs.keys()) | set(self.Q2_coeffs.keys())
-        
+
         if not all_modes:
+            logger.debug("No modes present, returning zero field")
             return E_theta, E_phi
-        
+
         # PRE-COMPUTE ALL LEGENDRE FUNCTIONS AT ONCE
         # This is the key optimization - compute once, use many times
         legendre_cache = compute_all_modes_legendre(self.NMAX, self.MMAX, theta)
@@ -877,7 +991,10 @@ class SphericalWaveExpansion:
         if r0 is not None:
             kr0 = k * r0
             NMAX_estimated = int(np.ceil(kr0 + max(10, 3.6 * (kr0 ** (1/3)))))
+            logger.debug(f"Estimated NMAX from r0={r0}m: kr0={kr0:.2f}, NMAX={NMAX_estimated}")
             NMAX_initial = max(NMAX_initial, NMAX_estimated)
+
+        logger.info(f"Starting SWE coefficient extraction: NMAX_initial={NMAX_initial}, frequency={frequency/1e9:.4f} GHz")
         
         # MMAX_initial = None means let it grow with NMAX
         use_adaptive_mmax = (MMAX_initial is None)
@@ -900,8 +1017,11 @@ class SphericalWaveExpansion:
                 MMAX_current = NMAX
             else:
                 MMAX_current = min(MMAX_initial, NMAX)
-            
+
+            logger.info(f"Iteration {iteration + 1}: Computing coefficients for NMAX={NMAX}, MMAX={MMAX_current}")
+
             # Pre-compute Legendre functions for all modes
+            logger.debug("Computing Legendre functions...")
             legendre_cache = compute_all_modes_legendre(NMAX, MMAX_current, THETA[:, 0])
             
             # Build mode list
@@ -911,12 +1031,14 @@ class SphericalWaveExpansion:
                     modes.append((n, m))
             
             total_modes = len(modes)
-            
+            logger.debug(f"Extracting {total_modes} mode coefficients via integration...")
+
             # Compute coefficients (parallel or serial)
             if use_multiprocessing and total_modes > 100:
                 # Split modes into batches for parallel processing
                 batch_size = max(10, total_modes // (n_workers * 4))
                 mode_batches = [modes[i:i + batch_size] for i in range(0, len(modes), batch_size)]
+                logger.debug(f"Using {n_workers} workers, {len(mode_batches)} batches...")
                 
                 # Prepare arguments for each batch
                 args_list = []
@@ -939,6 +1061,7 @@ class SphericalWaveExpansion:
                         Q1_coeffs[(n, m)] = Q1
                         Q2_coeffs[(n, m)] = Q2
                         mode_powers.append(((n, m), mode_power))
+                logger.debug(f"Completed {len(Q1_coeffs)} modes")
             
             else:
                 # Serial computation
@@ -992,9 +1115,11 @@ class SphericalWaveExpansion:
             high_mode_power = np.sum(mode_powers_array[high_n_mask])
             
             high_mode_fraction = high_mode_power / total_power if total_power > 0 else 0
-            
+            logger.debug(f"Power in top {n_cutoff} n-modes: {high_mode_fraction*100:.2f}%")
+
             # Check convergence
             if high_mode_fraction < high_mode_power_threshold:
+                logger.info(f"Convergence achieved: high modes contain {high_mode_fraction*100:.2f}% < {high_mode_power_threshold*100:.0f}%")
                 # Calculate power per |m| for azimuthal truncation
                 power_per_m = np.zeros(MMAX_current + 1)
                 for (n, m), mode_power in mode_powers:
@@ -1019,9 +1144,10 @@ class SphericalWaveExpansion:
                     high_m_fraction = high_m_power / total_power if total_power > 0 else 0
                     
                     # Accept if BOTH: tail is small AND we have enough power
-                    if (high_m_fraction < azimuthal_power_threshold and 
+                    if (high_m_fraction < azimuthal_power_threshold and
                         cumulative_m_fraction >= power_threshold):
                         MMAX_truncated = m_test
+                        logger.debug(f"Azimuthal truncation: MMAX {MMAX_current} -> {MMAX_truncated}, tail power: {high_m_fraction*100:.3f}%")
                         break
                 
                 # Find highest n where tail modes have negligible power
@@ -1074,6 +1200,11 @@ class SphericalWaveExpansion:
                 phi_required = 2 * MMAX_truncated + 1
 
                 if theta_samples < theta_required or phi_samples < phi_required:
+                    logger.warning(
+                        f"Input pattern is undersampled for NMAX={NMAX_truncated}, MMAX={MMAX_truncated}. "
+                        f"Need at least {theta_required}x{phi_required} grid, but have {theta_samples}x{phi_samples}. "
+                        f"Results may be inaccurate due to aliasing."
+                    )
                     warnings.warn(
                         f"Input pattern is undersampled for NMAX={NMAX_truncated}, MMAX={MMAX_truncated}. "
                         f"Need at least {theta_required}×{phi_required} grid, but have {theta_samples}×{phi_samples}. "
@@ -1081,13 +1212,22 @@ class SphericalWaveExpansion:
                         UserWarning
                     )
 
+                logger.info(
+                    f"SWE extraction complete: NMAX={NMAX_truncated}, MMAX={MMAX_truncated}, "
+                    f"retained power={retained_fraction*100:.2f}%, {len(Q1_final)} modes"
+                )
                 return cls(Q1_final, Q2_final, frequency, NMAX_truncated, MMAX_truncated)
             
             else:
                 # Need more modes
+                logger.debug(f"High mode power fraction {high_mode_fraction*100:.2f}% exceeds threshold, increasing NMAX from {NMAX} to {NMAX + 50}")
                 NMAX += 50
-        
+
         # Max iterations reached
+        logger.warning(
+            f"Maximum iterations ({max_iterations}) reached in adaptive mode calculation. "
+            f"Final NMAX={NMAX}, MMAX={MMAX_current}. Results may be inaccurate."
+        )
         warnings.warn(
             "Maximum iterations reached in adaptive mode calculation. "
             "Results may be inaccurate.",
@@ -1099,18 +1239,19 @@ class SphericalWaveExpansion:
     def from_sph_file(cls, filename: str) -> 'SphericalWaveExpansion':
         """
         Create SWE object from TICRA .sph file.
-        
+
         Args:
             filename: Path to .sph file
-            
+
         Returns:
             SphericalWaveExpansion object
         """
+        logger.info(f"Creating SphericalWaveExpansion from file: {filename}")
         data = read_ticra_sph(filename)
-        
+
         # Convert frequency from GHz to Hz
         frequency = data['frequency'] * 1e9 if data['frequency'] is not None else None
-        
+
         return cls(
             Q1_coeffs=data['Q1_coeffs'],
             Q2_coeffs=data['Q2_coeffs'],
@@ -1119,18 +1260,19 @@ class SphericalWaveExpansion:
             MMAX=data['MMAX']
         )
     
-    def to_sph_file(self, filename: str, 
+    def to_sph_file(self, filename: str,
                    NTHE: int = 181, NPHI: int = 361,
                    description: str = "Generated by SWE module"):
         """
         Write SWE object to TICRA .sph file.
-        
+
         Args:
             filename: Output file path
             NTHE: Number of theta samples (for header)
             NPHI: Number of phi samples (for header)
             description: Description text
         """
+        logger.info(f"Writing SphericalWaveExpansion to file: {filename}")
         write_ticra_sph(
             filename,
             self.Q1_coeffs,
@@ -1142,30 +1284,32 @@ class SphericalWaveExpansion:
         )
     
     def near_field(self, r: np.ndarray, theta: np.ndarray, phi: np.ndarray) -> \
-            Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], 
+            Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray],
                 Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """
         Calculate near-field E and H components.
-        
+
         Args:
             r: Radial distance(s) in meters
             theta: Polar angle(s) in radians
             phi: Azimuthal angle(s) in radians
-            
+
         Returns:
             E: Tuple of (E_r, E_theta, E_phi) in V/m
             H: Tuple of (H_r, H_theta, H_phi) in A/m
         """
         if self.k is None:
             raise ValueError("Frequency must be set before computing near field")
-        
+
         r = np.atleast_1d(r)
         theta = np.atleast_1d(theta)
         phi = np.atleast_1d(phi)
-        
+
         if not (r.shape == theta.shape == phi.shape):
             r, theta, phi = np.broadcast_arrays(r, theta, phi)
-        
+
+        logger.debug(f"Computing near field at {len(r.flatten())} points, NMAX={self.NMAX}, MMAX={self.MMAX}")
+
         # Initialize output arrays
         E_r = np.zeros_like(r, dtype=complex)
         E_theta = np.zeros_like(theta, dtype=complex)
@@ -1173,24 +1317,30 @@ class SphericalWaveExpansion:
         H_r = np.zeros_like(r, dtype=complex)
         H_theta = np.zeros_like(theta, dtype=complex)
         H_phi = np.zeros_like(phi, dtype=complex)
-        
+
         all_modes = set(self.Q1_coeffs.keys()) | set(self.Q2_coeffs.keys())
-        
+
         if not all_modes:
+            logger.debug("No modes present, returning zero fields")
             return (E_r, E_theta, E_phi), (H_r, H_theta, H_phi)
-        
+
         # Pre-compute Legendre functions
         legendre_cache = compute_all_modes_legendre(self.NMAX, self.MMAX, theta)
+
+        # Pre-compute ALL spherical Bessel functions for n=0 to NMAX
+        # This eliminates redundant scipy calls since Bessel functions depend on (n, kr), not m
+        kr = self.k * r.ravel()
+        bessel_cache = precompute_spherical_bessel(self.NMAX, kr)
 
         # Scaling for 4pi power
         E_prefactor = np.sqrt(4*np.pi)
         H_prefactor = np.sqrt(4*np.pi)
-        
+
         # Loop through modes
         for (n, m) in all_modes:
             # Get near-field pattern functions for this mode
             F1_E, F2_E, F1_H, F2_H = near_field_pattern_functions(
-                n, m, r, theta, phi, self.k, legendre_cache
+                n, m, r, theta, phi, self.k, legendre_cache, bessel_cache
             )
             
             # Q1 contribution (TE to r modes)
@@ -1250,26 +1400,27 @@ class SphericalWaveExpansion:
             Tuple[np.ndarray, np.ndarray]:
         """
         Calculate equivalent surface currents on an arbitrary reflector surface from SWE source.
-        
+
         Uses the reciprocity-based surface current formulation from Hansen Appendix A1.
         Surface currents: J = n × H, M = -n × E
-        
+
         Args:
             rr: Nr x 3 array of reflector surface points (Cartesian, meters)
             unr: Nr x 3 array of surface normal vectors (outward)
             dSr: Nr array of surface element areas (m²)
             swe_origin: 3-element array, SWE coordinate origin in reflector frame (meters)
                         Default is [0, 0, 0]
-            swe_rotation: (alpha, beta, gamma) Euler angles (radians, ZYZ convention) 
+            swe_rotation: (alpha, beta, gamma) Euler angles (radians, ZYZ convention)
                         rotating SWE frame to reflector frame. Default is no rotation.
             chunk_size: Points per chunk for processing (None for single batch)
             n_threads: Ignored (kept for compatibility)
-            
+
         Returns:
             Jrr: Nr x 3 array of equivalent electric currents (A)
             Mrr: Nr x 3 array of equivalent magnetic currents (V)
         """
         Nr = len(rr)
+        logger.debug(f"Computing surface currents on {Nr} surface points")
         
         # Default origin at coordinate system origin
         if swe_origin is None:
@@ -1293,7 +1444,12 @@ class SphericalWaveExpansion:
         E_total = np.stack([Ex, Ey, Ez], axis=1)
         H_total = np.stack([Hx, Hy, Hz], axis=1)
 
-        # Conjugate fields to correct phase progression
+        # reverse the 4pi power scaling applied in near field calculation
+        Z0 = 376.730313668
+        E_total /= np.sqrt(4 * np.pi / Z0)
+        H_total /= np.sqrt(4 * np.pi / Z0)
+
+        # Conjugate fields to correct phase progression (negative vs. positive time progression)
         E_total = np.conj(E_total)
         H_total = np.conj(H_total)
         
@@ -1303,13 +1459,12 @@ class SphericalWaveExpansion:
             H_total = self._apply_rotation(H_total, swe_rotation)
         
         # Calculate surface currents with impedance scaling
-        Z0 = 376.730313668
-        Jr = -np.cross(unr, H_total, axis=-1) / np.sqrt(4 * np.pi / 2 / Z0)
-        Mr = np.cross(unr, E_total, axis=-1) / np.sqrt(4 * np.pi / 2)
+        Jr = np.cross(unr, H_total, axis=-1)
+        Mr = np.cross(unr, E_total, axis=-1) * Z0
         
         # Apply surface element areas and sign convention
-        Jrr = -Jr * dSr[:, np.newaxis]
-        Mrr = Mr * dSr[:, np.newaxis]
+        Jrr = Jr * dSr[:, np.newaxis]
+        Mrr = -Mr * dSr[:, np.newaxis]
         
         return Jrr, Mrr
 
@@ -1365,18 +1520,18 @@ class SphericalWaveExpansion:
 def read_ticra_sph(filename: str) -> Dict:
     """
     Read TICRA .sph file containing spherical wave expansion coefficients.
-    
+
     Args:
         filename: Path to the .sph file
-        
+
     Returns:
         Dictionary containing all data from .sph file
     """
+    logger.info(f"Reading TICRA .sph file: {filename}")
 
     # NORMALIZATION FACTOR (from Ticra)
     # ticra has a comment about 1/sqrt(8pi) normalization, but that doesn't apply in this formulation
     normalization_factor = 1
-
 
     with open(filename, 'r') as f:
         lines = f.readlines()
@@ -1493,6 +1648,9 @@ def read_ticra_sph(filename: str) -> Dict:
     for key in Q2_coeffs:
         Q2_coeffs[key] = np.conj(Q2_coeffs[key])
 
+    logger.info(f"Loaded SWE: NMAX={NMAX}, MMAX={MMAX}, frequency={frequency} GHz, {len(Q1_coeffs)} Q1 modes, {len(Q2_coeffs)} Q2 modes")
+    logger.debug(f"Rotation angles: {rotation_angles}")
+
     return {
         'frequency': frequency,
         'NTHE': NTHE,
@@ -1515,11 +1673,13 @@ def write_ticra_sph(filename: str,
                     description: str = "Generated by SWE module"):
     """
     Write spherical wave coefficients to TICRA .sph file format.
-    
+
     Input coefficients should be in TICRA working convention.
     They will be conjugated before writing to match the .sph file format.
     """
-    
+    logger.info(f"Writing TICRA .sph file: {filename}")
+    logger.debug(f"Writing SWE: NMAX={NMAX}, MMAX={MMAX}, frequency={frequency_GHz} GHz, {len(Q1_coeffs)} Q1 modes, {len(Q2_coeffs)} Q2 modes")
+
     with open(filename, 'w') as f:
         # Record 1: PRGTAG
         f.write(f"TICRA-SWE Freq [GHz]: {frequency_GHz:.6f}\n")
