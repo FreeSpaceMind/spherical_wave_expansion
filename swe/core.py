@@ -1394,9 +1394,7 @@ class SphericalWaveExpansion:
     
     def currents_on_surface(self, rr: np.ndarray, unr: np.ndarray, dSr: np.ndarray,
                                 swe_origin: np.ndarray = None,
-                                swe_rotation: Optional[Tuple[float, float, float]] = None,
-                                chunk_size: Optional[int] = None,
-                                n_threads: Optional[int] = None) -> \
+                                swe_rotation: Optional[Tuple[float, float, float]] = None) -> \
             Tuple[np.ndarray, np.ndarray]:
         """
         Calculate equivalent surface currents on an arbitrary reflector surface from SWE source.
@@ -1412,8 +1410,6 @@ class SphericalWaveExpansion:
                         Default is [0, 0, 0]
             swe_rotation: (alpha, beta, gamma) Euler angles (radians, ZYZ convention)
                         rotating SWE frame to reflector frame. Default is no rotation.
-            chunk_size: Points per chunk for processing (None for single batch)
-            n_threads: Ignored (kept for compatibility)
 
         Returns:
             Jrr: Nr x 3 array of equivalent electric currents (A)
