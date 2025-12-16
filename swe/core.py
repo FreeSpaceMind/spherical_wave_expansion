@@ -469,8 +469,6 @@ def far_field_pattern_functions(n: int, m: int,
     Returns:
         (K1_theta, K1_phi), (K2_theta, K2_phi)
     """
-    abs_m = abs(m)
-    
     # Always apply pole avoidance for consistency
     theta_safe = np.copy(theta)
     epsilon = 1e-3
@@ -491,17 +489,19 @@ def far_field_pattern_functions(n: int, m: int,
     if m == 0:
         sign_factor = 1.0
     else:
-        sign_factor = (m / abs(m)) ** m
+        sign_factor = (-m / abs(m)) ** m
     
+    # Ticra sign convention: negative phase progression
     phase = np.exp(-1j * m * phi)
-    i_factor_1 = (1j) ** (n)
-    i_factor_2 = (1j) ** (n + 1)
+    i_factor_1 = (1j) ** (n + 1)
+    i_factor_2 = (1j) ** (n)
     
     sin_theta = np.sin(theta_safe)
     mP_over_sin = m * P_norm / sin_theta
     
-    K1_theta = prefactor * sign_factor * phase * i_factor_1 * (1j * mP_over_sin)
-    K1_phi = prefactor * sign_factor * phase * i_factor_1 * (dP_norm_dtheta)
+    # note that signs 
+    K1_theta = prefactor * sign_factor * phase * i_factor_1 * (-1j * mP_over_sin)
+    K1_phi = prefactor * sign_factor * phase * i_factor_1 * (-dP_norm_dtheta)
     
     K2_theta = prefactor * sign_factor * phase * i_factor_2 * (dP_norm_dtheta)
     K2_phi = prefactor * sign_factor * phase * i_factor_2 * (-1j * mP_over_sin)
@@ -642,13 +642,12 @@ def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
     dkrh_n = kr * h_n_m1 - n * h_n  # d/d(kr){kr*h_n^(2)}
     
     # Common factors from equations (4.214-4.215)
-    prefactor = 1 / np.sqrt(2 * np.pi) * 1 / np.sqrt(n * (n + 1))
+    prefactor = np.sqrt(2) / np.sqrt(2 * np.pi) * 1 / np.sqrt(n * (n + 1))
     
-    # TICRA sign factor: (m/|m|)^m (positive, not negative)
     if m == 0:
         sign_factor = 1.0
     else:
-        sign_factor = (m / abs(m)) ** m
+        sign_factor = (-m / abs(m)) ** m
     
     # TICRA phase convention: exp(-jmφ)
     phase = np.exp(-1j * m * phi)
@@ -670,10 +669,11 @@ def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
     F2_E_phi = -coef * (dkrh_n / kr) * jmP_over_sin  # Note negative sign
     
     # H fields - swap per reciprocity
+    # Note: Pattern functions are normalized such that H = E_swap (impedance absorbed in normalization)
     F1_H_r = F2_E_r
     F1_H_theta = F2_E_theta
     F1_H_phi = F2_E_phi
-    
+
     F2_H_r = F1_E_r
     F2_H_theta = F1_E_theta
     F2_H_phi = F1_E_phi
@@ -1332,9 +1332,10 @@ class SphericalWaveExpansion:
         kr = self.k * r.ravel()
         bessel_cache = precompute_spherical_bessel(self.NMAX, kr)
 
-        # Scaling for 4pi power
-        E_prefactor = np.sqrt(4*np.pi)
-        H_prefactor = np.sqrt(4*np.pi)
+        # scaling factors from Ticra (eq 4.212 abd 4.213)
+        Z0 = 376.730313668
+        E_prefactor = self.k * np.sqrt(Z0)
+        H_prefactor = 1j*self.k/np.sqrt(Z0)
 
         # Loop through modes
         for (n, m) in all_modes:
@@ -1399,8 +1400,9 @@ class SphericalWaveExpansion:
         """
         Calculate equivalent surface currents on an arbitrary reflector surface from SWE source.
 
-        Uses the reciprocity-based surface current formulation from Hansen Appendix A1.
-        Surface currents: J = n × H, M = -n × E
+        Two modes are supported:
+        - Surface Equivalence Theorem (default): J = n × H, M = -n × E
+        - Physical Optics (physical_optics=True): J = 2(n × H), M = 0 for PEC reflectors
 
         Args:
             rr: Nr x 3 array of reflector surface points (Cartesian, meters)
@@ -1440,11 +1442,6 @@ class SphericalWaveExpansion:
         E_total = np.stack([Ex, Ey, Ez], axis=1)
         H_total = np.stack([Hx, Hy, Hz], axis=1)
 
-        # reverse the 4pi power scaling applied in near field calculation
-        Z0 = 376.730313668
-        E_total /= np.sqrt(4 * np.pi / Z0)
-        H_total /= np.sqrt(4 * np.pi / Z0)
-
         # Conjugate fields to correct phase progression (negative vs. positive time progression)
         E_total = np.conj(E_total)
         H_total = np.conj(H_total)
@@ -1454,13 +1451,13 @@ class SphericalWaveExpansion:
             E_total = self._apply_rotation(E_total, swe_rotation)
             H_total = self._apply_rotation(H_total, swe_rotation)
         
-        # Calculate surface currents with impedance scaling
+        # Calculate surface currents
         Jr = np.cross(unr, H_total, axis=-1)
-        Mr = np.cross(unr, E_total, axis=-1) * Z0
+        Mr = -np.cross(unr, E_total, axis=-1)
         
         # Apply surface element areas and sign convention
-        Jrr = Jr * dSr[:, np.newaxis]
-        Mrr = -Mr * dSr[:, np.newaxis]
+        Jrr = -Jr * dSr[:, np.newaxis]
+        Mrr = Mr * dSr[:, np.newaxis]
         
         return Jrr, Mrr
 
