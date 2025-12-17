@@ -499,7 +499,8 @@ def far_field_pattern_functions(n: int, m: int,
     sin_theta = np.sin(theta_safe)
     mP_over_sin = m * P_norm / sin_theta
     
-    # note that signs 
+    # signs are tricky here, had to compare near field form of Ticra and Hansen to 
+    # derive far field forms for Ticra
     K1_theta = prefactor * sign_factor * phase * i_factor_1 * (-1j * mP_over_sin)
     K1_phi = prefactor * sign_factor * phase * i_factor_1 * (-dP_norm_dtheta)
     
@@ -642,7 +643,7 @@ def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
     dkrh_n = kr * h_n_m1 - n * h_n  # d/d(kr){kr*h_n^(2)}
     
     # Common factors from equations (4.214-4.215)
-    prefactor = np.sqrt(2) / np.sqrt(2 * np.pi) * 1 / np.sqrt(n * (n + 1))
+    prefactor = 1 / np.sqrt(2 * np.pi) * 1 / np.sqrt(n * (n + 1))
     
     if m == 0:
         sign_factor = 1.0
@@ -1091,11 +1092,11 @@ class SphericalWaveExpansion:
                     K2_phi = prefactor * sign_factor * phase * i_factor_2 * (-mP_over_sin)
                     
                     integrand_1 = (E_THETA * np.conj(K1_theta) + E_PHI * np.conj(K1_phi)) * sin_theta
-                    Q1 = np.trapz(np.trapz(integrand_1, phi_unique, axis=1), theta_unique, axis=0)
+                    Q1 = np.trapezoid(np.trapezoid(integrand_1, phi_unique, axis=1), theta_unique, axis=0)
                     Q1 *= norm_factor
                     
                     integrand_2 = (E_THETA * np.conj(K2_theta) + E_PHI * np.conj(K2_phi)) * sin_theta
-                    Q2 = np.trapz(np.trapz(integrand_2, phi_unique, axis=1), theta_unique, axis=0)
+                    Q2 = np.trapezoid(np.trapezoid(integrand_2, phi_unique, axis=1), theta_unique, axis=0)
                     Q2 *= norm_factor
                     
                     Q1_coeffs[(n, m)] = Q1
@@ -1523,8 +1524,7 @@ def read_ticra_sph(filename: str) -> Dict:
     logger.info(f"Reading TICRA .sph file: {filename}")
 
     # NORMALIZATION FACTOR (from Ticra)
-    # ticra has a comment about 1/sqrt(8pi) normalization, but that doesn't apply in this formulation
-    normalization_factor = 1
+    normalization_factor = 1/np.sqrt(8*np.pi)
 
     with open(filename, 'r') as f:
         lines = f.readlines()
@@ -1673,6 +1673,9 @@ def write_ticra_sph(filename: str,
     logger.info(f"Writing TICRA .sph file: {filename}")
     logger.debug(f"Writing SWE: NMAX={NMAX}, MMAX={MMAX}, frequency={frequency_GHz} GHz, {len(Q1_coeffs)} Q1 modes, {len(Q2_coeffs)} Q2 modes")
 
+    # normalization factor (between Ticra and Hansen
+    normalization_factor = np.sqrt(8*np.pi)
+
     with open(filename, 'w') as f:
         # Record 1: PRGTAG
         f.write(f"TICRA-SWE Freq [GHz]: {frequency_GHz:.6f}\n")
@@ -1717,23 +1720,23 @@ def write_ticra_sph(filename: str,
             # Write coefficients for each n
             for n in range(max(1, m_val), NMAX + 1):
                 if m_val == 0:
-                    # Conjugate before writing (reverse read operation)
-                    Q1 = np.conj(Q1_coeffs.get((n, 0), 0.0))
-                    Q2 = np.conj(Q2_coeffs.get((n, 0), 0.0))
+                    # Conjugate and scale before writing (reverse read operation)
+                    Q1 = np.conj(Q1_coeffs.get((n, 0), 0.0))*normalization_factor
+                    Q2 = np.conj(Q2_coeffs.get((n, 0), 0.0))*normalization_factor
                     
                     f.write(f"  {Q1.real:23.16E} {Q1.imag:23.16E} "
                            f"{Q2.real:23.16E} {Q2.imag:23.16E}\n")
                 else:
                     # -m line (conjugate before writing)
-                    Q1_neg = np.conj(Q1_coeffs.get((n, -m_val), 0.0))
-                    Q2_neg = np.conj(Q2_coeffs.get((n, -m_val), 0.0))
+                    Q1_neg = np.conj(Q1_coeffs.get((n, -m_val), 0.0))*normalization_factor
+                    Q2_neg = np.conj(Q2_coeffs.get((n, -m_val), 0.0))*normalization_factor
                     
                     f.write(f"  {Q1_neg.real:23.16E} {Q1_neg.imag:23.16E} "
                            f"{Q2_neg.real:23.16E} {Q2_neg.imag:23.16E}\n")
                     
                     # +m line (conjugate before writing)
-                    Q1_pos = np.conj(Q1_coeffs.get((n, m_val), 0.0))
-                    Q2_pos = np.conj(Q2_coeffs.get((n, m_val), 0.0))
+                    Q1_pos = np.conj(Q1_coeffs.get((n, m_val), 0.0))*normalization_factor
+                    Q2_pos = np.conj(Q2_coeffs.get((n, m_val), 0.0))*normalization_factor
                     
                     f.write(f"  {Q1_pos.real:23.16E} {Q1_pos.imag:23.16E} "
                            f"{Q2_pos.real:23.16E} {Q2_pos.imag:23.16E}\n")
