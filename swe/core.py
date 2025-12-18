@@ -17,7 +17,7 @@ Key Features:
   * Cylindrical near-field measurements
 
 Physical Conventions:
-- Time dependence: exp(+iωt)
+- Time dependence: exp(jωt) (matches Ticra)
 - Frequency: Hz
 - Wavenumber k: rad/m
 - Electric field E: V/m
@@ -1435,30 +1435,21 @@ class SphericalWaveExpansion:
         else:
             unr_swe = unr.copy()
         
-        # OPTIMIZATION: Process all points in one call to near_field_cartesian
-        # This allows vectorization and pre-computation of Legendre functions
+        # Calculate near field at surface
         x, y, z = rr_swe[:, 0], rr_swe[:, 1], rr_swe[:, 2]
         (Ex, Ey, Ez), (Hx, Hy, Hz) = self.near_field_cartesian(x, y, z)
         
-        E_total = np.stack([Ex, Ey, Ez], axis=1)
-        H_total = np.stack([Hx, Hy, Hz], axis=1)
+        E_total = np.column_stack([Ex, Ey, Ez])
+        H_total = np.column_stack([Hx, Hy, Hz])
 
-        # Conjugate fields to correct phase progression (negative vs. positive time progression)
-        E_total = np.conj(E_total)
-        H_total = np.conj(H_total)
-        
         # Transform E and H back to reflector frame if rotated
         if swe_rotation is not None:
             E_total = self._apply_rotation(E_total, swe_rotation)
             H_total = self._apply_rotation(H_total, swe_rotation)
         
         # Calculate surface currents
-        Jr = np.cross(unr, H_total, axis=-1)
-        Mr = -np.cross(unr, E_total, axis=-1)
-        
-        # Apply surface element areas and sign convention
-        Jrr = -Jr * dSr[:, np.newaxis]
-        Mrr = Mr * dSr[:, np.newaxis]
+        Jrr = np.cross(unr_swe, H_total, axis=-1) * dSr[:, np.newaxis]
+        Mrr = -np.cross(unr_swe, E_total, axis=-1) * dSr[:, np.newaxis]
         
         return Jrr, Mrr
 
@@ -1524,7 +1515,7 @@ def read_ticra_sph(filename: str) -> Dict:
     logger.info(f"Reading TICRA .sph file: {filename}")
 
     # NORMALIZATION FACTOR (from Ticra)
-    normalization_factor = 1/np.sqrt(8*np.pi)
+    normalization_factor = 1*np.sqrt(8*np.pi)
 
     with open(filename, 'r') as f:
         lines = f.readlines()
@@ -1674,7 +1665,7 @@ def write_ticra_sph(filename: str,
     logger.debug(f"Writing SWE: NMAX={NMAX}, MMAX={MMAX}, frequency={frequency_GHz} GHz, {len(Q1_coeffs)} Q1 modes, {len(Q2_coeffs)} Q2 modes")
 
     # normalization factor (between Ticra and Hansen
-    normalization_factor = np.sqrt(8*np.pi)
+    normalization_factor = 1/np.sqrt(8*np.pi)
 
     with open(filename, 'w') as f:
         # Record 1: PRGTAG
