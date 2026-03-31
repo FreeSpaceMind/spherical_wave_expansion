@@ -20,6 +20,14 @@ from .core import (
     spherical_to_cartesian_field,
 )
 
+from .ticra_io import (
+    read_grasp_cut,
+    write_grasp_cut,
+    cut_to_fields,
+    read_grasp_grd,
+    write_grasp_grd,
+)
+
 __all__ = [
     "SphericalWaveExpansion",
     "read_ticra_sph",
@@ -29,4 +37,9 @@ __all__ = [
     "cartesian_to_spherical",
     "spherical_to_cartesian",
     "spherical_to_cartesian_field",
+    "read_grasp_cut",
+    "write_grasp_cut",
+    "cut_to_fields",
+    "read_grasp_grd",
+    "write_grasp_grd",
 ]
