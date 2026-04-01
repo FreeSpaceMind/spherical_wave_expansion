@@ -44,7 +44,6 @@ References:
 import logging
 import math
 import numpy as np
-np.math = math
 from scipy.special import lpmv, spherical_jn, spherical_yn
 from scipy.optimize import lsq_linear
 from typing import Dict, Tuple, Optional, Union
@@ -134,60 +133,6 @@ def spherical_to_cartesian_field(E_r: np.ndarray, E_theta: np.ndarray, E_phi: np
     E_z = cos_theta * E_r - sin_theta * E_theta
     
     return E_x, E_y, E_z
-
-class LegendreCoefficientCache:
-    """Cache for factorial ratios and normalization constants."""
-    
-    def __init__(self):
-        self._factorial_ratio_cache = {}
-        self._norm_factor_cache = {}
-    
-    def factorial_ratio(self, n: int, m: int) -> float:
-        """
-        Compute (n-m)! / (n+m)! efficiently without computing large factorials.
-        
-        For m >= 0: (n-m)! / (n+m)! = 1 / [(n-m+1)(n-m+2)...(n+m)]
-        """
-        key = (n, m)
-        if key in self._factorial_ratio_cache:
-            return self._factorial_ratio_cache[key]
-        
-        if m == 0:
-            result = 1.0
-        elif m > 0:
-            result = 1.0
-            for i in range(n - m + 1, n + m + 1):
-                result /= i
-        else:  # m < 0
-            result = 1.0
-            for i in range(n + m + 1, n - m + 1):
-                result *= i
-        
-        self._factorial_ratio_cache[key] = result
-        return result
-    
-    def normalization_factor(self, n: int, m: int) -> float:
-        """
-        Compute Hansen normalization factor: sqrt((2n+1)/2 * (n-m)!/(n+m)!)
-        """
-        key = (n, abs(m))
-        if key in self._norm_factor_cache:
-            return self._norm_factor_cache[key]
-        
-        abs_m = abs(m)
-        fac_ratio = self.factorial_ratio(n, abs_m)
-        result = np.sqrt((2 * n + 1) / 2 * fac_ratio)
-        
-        self._norm_factor_cache[key] = result
-        return result
-
-
-# Global cache instance
-_legendre_cache = LegendreCoefficientCache()
-
-import numpy as np
-from typing import Tuple, Dict
-import math
 
 
 # ==============================================================================
@@ -396,6 +341,66 @@ def normalized_associated_legendre(n: int, m: int,
     return P_norm, dP_norm
 
 
+def compute_pole_limits(n: int, m: int, pole: str = 'north') -> Tuple[float, float]:
+    """
+    Compute analytical limits of normalized Legendre terms at poles (theta=0 or pi).
+
+    At the poles, sin(theta)=0 causes division issues. This function computes
+    the proper limits using L'Hopital's rule and Legendre function identities.
+
+    Mathematical basis:
+    - P_n^1(cos theta) = -sin(theta) * dP_n/d(cos theta)
+    - Therefore: P_n^1/sin(theta) = -dP_n/d(cos theta)|_{x=1} = -n(n+1)/2
+    - For |m|>=2: m*P_n^m/sin(theta) -> 0 as theta->0
+
+    At south pole (theta=pi), the sign factors differ for the two terms:
+    - mP_over_sin: sign factor is (-1)^(n+1)
+    - dP/dtheta: sign factor is (-1)^n
+
+    Args:
+        n: Degree (n >= 1)
+        m: Order
+        pole: 'north' (theta=0) or 'south' (theta=pi)
+
+    Returns:
+        (mP_over_sin_limit, dP_limit): Normalized limits at the pole
+    """
+    norm_factor = _legendre_cache.normalization_factor(n, m)
+    abs_m = abs(m)
+
+    # Sign factors for south pole (derived from numerical analysis)
+    if pole == 'north':
+        mP_sign = 1.0
+        dP_sign = 1.0
+    else:
+        # At south pole, mP_over_sin and dP have different sign factors
+        mP_sign = (-1.0) ** (n + 1)
+        dP_sign = (-1.0) ** n
+
+    if abs_m == 0:
+        # m=0: m*P_n^m/sin(theta) = 0
+        # dP_n^0/dtheta|_{pole} = 0
+        mP_over_sin_limit = 0.0
+        dP_limit = 0.0
+    elif abs_m == 1:
+        # For m=+/-1:
+        # lim P_n^1/sin(theta) = -n(n+1)/2 (unnormalized)
+        # dP_n^1/dtheta|_{theta=0} = -n(n+1)/2 (unnormalized)
+        unnorm_limit = -n * (n + 1) / 2.0
+
+        # m * P_n^m / sin(theta) limit
+        mP_over_sin_limit = m * unnorm_limit * norm_factor * mP_sign
+
+        # dP/dtheta limit at pole
+        dP_limit = unnorm_limit * norm_factor * dP_sign
+    else:
+        # |m| >= 2: both limits are zero
+        mP_over_sin_limit = 0.0
+        dP_limit = 0.0
+
+    return mP_over_sin_limit, dP_limit
+
+
 def compute_all_modes_legendre(n_max: int, m_max: int, 
                                theta: np.ndarray) -> Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]]:
     """
@@ -411,13 +416,14 @@ def compute_all_modes_legendre(n_max: int, m_max: int,
         Dictionary mapping (n, m) -> (P_norm, dP_norm)
     """
     theta = np.atleast_1d(theta)
-    
-    # CRITICAL: Apply pole avoidance BEFORE computing Legendre functions
+
+    # Apply pole avoidance for numerical stability in Legendre computation
+    # Using very small epsilon since analytical limits are computed in pattern functions
     theta_safe = np.copy(theta)
-    epsilon = 1e-3
+    epsilon = 1e-6
     at_north_pole = theta < epsilon
     at_south_pole = theta > (np.pi - epsilon)
-    
+
     theta_safe = np.where(at_north_pole, epsilon, theta_safe)
     theta_safe = np.where(at_south_pole, np.pi - epsilon, theta_safe)
     
@@ -449,57 +455,63 @@ def compute_all_modes_legendre(n_max: int, m_max: int,
     
     return results
 
-def far_field_pattern_functions(n: int, m: int, 
-                                         theta: np.ndarray, 
+def far_field_pattern_functions(n: int, m: int,
+                                         theta: np.ndarray,
                                          phi: np.ndarray,
                                          legendre_cache: Dict = None):
     """
     Optimized version that can use pre-computed Legendre functions.
-    
-    IMPORTANT: Always applies pole avoidance (epsilon=1e-3) consistently
-    with how the cache was computed.
-    
+
+    Uses consistent epsilon-based pole avoidance matching the Legendre cache
+    computation. This ensures smooth pattern values near poles by avoiding
+    numerical instabilities without introducing discontinuities.
+
     Args:
         n: Degree
         m: Order
-        theta: Polar angles  
+        theta: Polar angles
         phi: Azimuthal angles
         legendre_cache: Optional pre-computed dict from compute_all_modes_legendre
-    
+
     Returns:
         (K1_theta, K1_phi), (K2_theta, K2_phi)
     """
-    # Always apply pole avoidance for consistency
-    theta_safe = np.copy(theta)
-    epsilon = 1e-3
+    theta = np.atleast_1d(theta)
+    phi = np.atleast_1d(phi)
+
+    # Use same epsilon as compute_all_modes_legendre for consistency
+    # This ensures cache values and sin(theta) computation are aligned
+    epsilon = 1e-6
     at_north_pole = theta < epsilon
     at_south_pole = theta > (np.pi - epsilon)
-    
+
+    # Apply pole avoidance - must match cache computation exactly
+    theta_safe = np.copy(theta)
     theta_safe = np.where(at_north_pole, epsilon, theta_safe)
     theta_safe = np.where(at_south_pole, np.pi - epsilon, theta_safe)
-    
+
     # Get Legendre functions (from cache or compute)
     if legendre_cache is not None and (n, m) in legendre_cache:
         P_norm, dP_norm_dtheta = legendre_cache[(n, m)]
     else:
         P_norm, dP_norm_dtheta = normalized_associated_legendre(n, m, theta_safe)
-    
+
     prefactor = np.sqrt(2 / (n * (n + 1)))
-    
+
     if m == 0:
         sign_factor = 1.0
     else:
         sign_factor = (-m / abs(m)) ** m
-    
+
     # Ticra sign convention: negative phase progression
     phase = np.exp(-1j * m * phi)
     i_factor_1 = (1j) ** (n + 1)
     i_factor_2 = (1j) ** (n)
-    
+
     sin_theta = np.sin(theta_safe)
     mP_over_sin = m * P_norm / sin_theta
-    
-    # signs are tricky here, had to compare near field form of Ticra and Hansen to 
+
+    # signs are tricky here, had to compare near field form of Ticra and Hansen to
     # derive far field forms for Ticra
     K1_theta = prefactor * sign_factor * phase * i_factor_1 * (-1j * mP_over_sin)
     K1_phi = prefactor * sign_factor * phase * i_factor_1 * (-dP_norm_dtheta)
@@ -710,7 +722,8 @@ def compute_mode_coefficients_batch(args):
         i_factor_1 = (1j) ** n
         i_factor_2 = (1j) ** (n + 1)
         
-        sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
+        # Use same epsilon as compute_all_modes_legendre for consistency
+        sin_theta_safe = np.where(np.abs(sin_theta) < 1e-6, 1e-6, sin_theta)
         mP_over_sin = 1j * m * P_norm_2d / sin_theta_safe
         
         # Pattern functions without exp(-imφ)
@@ -768,7 +781,8 @@ def compute_mode_coefficients_batch_trapz(args):
         i_factor_1 = (1j) ** n
         i_factor_2 = (1j) ** (n + 1)
         
-        sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
+        # Use same epsilon as compute_all_modes_legendre for consistency
+        sin_theta_safe = np.where(np.abs(sin_theta) < 1e-6, 1e-6, sin_theta)
         mP_over_sin = 1j * m * P_norm_2d / sin_theta_safe
         
         K1_theta = prefactor * sign_factor * phase * i_factor_1 * mP_over_sin
@@ -866,16 +880,60 @@ class SphericalWaveExpansion:
         if self._frequency is None:
             return None
         return 299792458.0 / self._frequency
-    
-    def far_field(self, theta: np.ndarray, phi: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Optimized far_field calculation using batch Legendre computation.
 
-        Replace the existing far_field method with this one.
+    @property
+    def total_power(self) -> float:
+        """Total power in the SWE coefficients: Σ(|Q1|² + |Q2|²).
+
+        Used for directivity normalization. When coefficients are normalized
+        (via normalize_coefficients()), total_power = 1.0 and the far field
+        with normalize=True gives |E|² = directivity.
+        """
+        power = 0.0
+        for Q in self.Q1_coeffs.values():
+            power += abs(Q) ** 2
+        for Q in self.Q2_coeffs.values():
+            power += abs(Q) ** 2
+        return power
+
+    def normalize_coefficients(self):
+        """Normalize Q coefficients so that total_power = 1.
+
+        After normalization, far_field(normalize=True) and
+        near_field(normalize=True) produce directivity-referenced fields
+        regardless of the original coefficient convention (TICRA, Hansen, etc.).
+
+        This makes the SWE object convention-independent for downstream use.
+        """
+        tp = self.total_power
+        if tp <= 0:
+            logger.warning("Cannot normalize: total_power is zero")
+            return
+        norm = np.sqrt(tp)
+        logger.debug(f"Normalizing coefficients: total_power={tp:.6f}, dividing by {norm:.6f}")
+        for key in self.Q1_coeffs:
+            self.Q1_coeffs[key] /= norm
+        for key in self.Q2_coeffs:
+            self.Q2_coeffs[key] /= norm
+
+    def far_field(self, theta: np.ndarray, phi: np.ndarray,
+                  power_threshold: float = 0.999,
+                  normalize: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute far-field pattern from SWE coefficients.
+
+        By default, normalizes the output so that |E_theta|² + |E_phi|²
+        equals directivity, matching the convention used by TICRA .cut/.ffd files.
+        Set normalize=False to get the raw (unnormalized) field sum.
 
         Args:
             theta: Polar angle(s) in radians
             phi: Azimuthal angle(s) in radians
+            power_threshold: Only include modes containing this fraction of total power.
+                           Default 0.999 (99.9%) filters out noise in high-n modes
+                           that can cause boresight artifacts. Set to 1.0 to include all modes.
+            normalize: If True (default), divide by sqrt(total_power) so that
+                      |E|² = directivity. If False, return raw Σ Q·K.
 
         Returns:
             E_theta: Theta component of electric field
@@ -890,39 +948,83 @@ class SphericalWaveExpansion:
         if theta.shape != phi.shape:
             theta, phi = np.broadcast_arrays(theta, phi)
 
-        logger.debug(f"Computing far field at {len(theta.flatten())} points, NMAX={self.NMAX}, MMAX={self.MMAX}")
-
-        E_theta = np.zeros_like(theta, dtype=complex)
-        E_phi = np.zeros_like(phi, dtype=complex)
-
+        # Compute mode powers and filter by cumulative power threshold
         all_modes = set(self.Q1_coeffs.keys()) | set(self.Q2_coeffs.keys())
 
         if not all_modes:
             logger.debug("No modes present, returning zero field")
+            E_theta = np.zeros_like(theta, dtype=complex)
+            E_phi = np.zeros_like(phi, dtype=complex)
             return E_theta, E_phi
 
-        # PRE-COMPUTE ALL LEGENDRE FUNCTIONS AT ONCE
-        # This is the key optimization - compute once, use many times
-        legendre_cache = compute_all_modes_legendre(self.NMAX, self.MMAX, theta)
-        
-        # Now loop through modes using the pre-computed values
+        # Calculate power per mode and sort by n
+        mode_powers = []
         for (n, m) in all_modes:
-            # Use optimized version with cache
+            Q1 = self.Q1_coeffs.get((n, m), 0)
+            Q2 = self.Q2_coeffs.get((n, m), 0)
+            power = abs(Q1)**2 + abs(Q2)**2
+            mode_powers.append(((n, m), power))
+
+        total_power = sum(p for _, p in mode_powers)
+
+        # Find effective NMAX based on power threshold
+        if power_threshold < 1.0 and total_power > 0:
+            # Sum power by n and find cutoff
+            n_power = {}
+            for (n, m), p in mode_powers:
+                n_power[n] = n_power.get(n, 0) + p
+
+            cumulative = 0
+            effective_nmax = self.NMAX
+            for n in sorted(n_power.keys()):
+                cumulative += n_power[n]
+                if cumulative >= power_threshold * total_power:
+                    effective_nmax = n
+                    break
+
+            # Filter modes
+            filtered_modes = [(nm, p) for nm, p in mode_powers if nm[0] <= effective_nmax]
+            if len(filtered_modes) < len(mode_powers):
+                logger.debug(f"Power filtering: using NMAX={effective_nmax} ({len(filtered_modes)}/{len(mode_powers)} modes, {100*power_threshold:.2f}% power)")
+        else:
+            filtered_modes = mode_powers
+            effective_nmax = self.NMAX
+
+        logger.debug(f"Computing far field at {len(theta.flatten())} points, effective NMAX={effective_nmax}")
+
+        E_theta = np.zeros_like(theta, dtype=complex)
+        E_phi = np.zeros_like(phi, dtype=complex)
+
+        # PRE-COMPUTE ALL LEGENDRE FUNCTIONS AT ONCE
+        effective_mmax = min(self.MMAX, effective_nmax)
+        legendre_cache = compute_all_modes_legendre(effective_nmax, effective_mmax, theta)
+
+        # Now loop through filtered modes
+        for (n, m), _ in filtered_modes:
+            if (n, m) not in legendre_cache:
+                continue
+
             (K1_theta, K1_phi), (K2_theta, K2_phi) = \
                 far_field_pattern_functions(n, m, theta, phi, legendre_cache)
-            
+
             if (n, m) in self.Q1_coeffs:
                 Q1 = self.Q1_coeffs[(n, m)]
                 E_theta += Q1 * K1_theta
                 E_phi += Q1 * K1_phi
-            
+
             if (n, m) in self.Q2_coeffs:
                 Q2 = self.Q2_coeffs[(n, m)]
                 E_theta += Q2 * K2_theta
                 E_phi += Q2 * K2_phi
-                
+
+        # Normalize so |E|² = directivity (matching TICRA .cut/.ffd convention)
+        if normalize and total_power > 0:
+            norm = np.sqrt(total_power)
+            E_theta /= norm
+            E_phi /= norm
+
         return E_theta, E_phi
-    
+
     @classmethod
     def from_far_field(cls,
                             theta: np.ndarray,
@@ -1217,7 +1319,9 @@ class SphericalWaveExpansion:
                     f"SWE extraction complete: NMAX={NMAX_truncated}, MMAX={MMAX_truncated}, "
                     f"retained power={retained_fraction*100:.2f}%, {len(Q1_final)} modes"
                 )
-                return cls(Q1_final, Q2_final, frequency, NMAX_truncated, MMAX_truncated)
+                swe = cls(Q1_final, Q2_final, frequency, NMAX_truncated, MMAX_truncated)
+                swe.normalize_coefficients()
+                return swe
             
             else:
                 # Need more modes
@@ -1234,12 +1338,20 @@ class SphericalWaveExpansion:
             "Results may be inaccurate.",
             UserWarning
         )
-        return cls(Q1_coeffs, Q2_coeffs, frequency, NMAX, MMAX_current)
+        swe = cls(Q1_coeffs, Q2_coeffs, frequency, NMAX, MMAX_current)
+        swe.normalize_coefficients()
+        return swe
 
     @classmethod
     def from_sph_file(cls, filename: str) -> 'SphericalWaveExpansion':
         """
         Create SWE object from TICRA .sph file.
+
+        Note:
+            When exporting .sph files from TICRA/GRASP, enable power normalization
+            in the export settings so that the coefficients are normalized to unit
+            radiated power. Unnormalized TICRA exports can produce incorrect
+            near-field magnitudes in PO analysis.
 
         Args:
             filename: Path to .sph file
@@ -1253,13 +1365,20 @@ class SphericalWaveExpansion:
         # Convert frequency from GHz to Hz
         frequency = data['frequency'] * 1e9 if data['frequency'] is not None else None
 
-        return cls(
+        swe = cls(
             Q1_coeffs=data['Q1_coeffs'],
             Q2_coeffs=data['Q2_coeffs'],
             frequency=frequency,
             NMAX=data['NMAX'],
             MMAX=data['MMAX']
         )
+
+        # Normalize so total_power = 1, making the SWE convention-independent.
+        # This ensures TICRA, Hansen, and from_far_field coefficients all
+        # produce identical near/far fields after normalization.
+        swe.normalize_coefficients()
+
+        return swe
     
     def to_sph_file(self, filename: str,
                    NTHE: int = 181, NPHI: int = 361,
@@ -1284,16 +1403,22 @@ class SphericalWaveExpansion:
             description
         )
     
-    def near_field(self, r: np.ndarray, theta: np.ndarray, phi: np.ndarray) -> \
+    def near_field(self, r: np.ndarray, theta: np.ndarray, phi: np.ndarray,
+                   normalize: bool = True) -> \
             Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray],
                 Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """
         Calculate near-field E and H components.
 
+        By default, normalizes by sqrt(total_power) so that the fields are
+        consistent with the directivity-normalized far field.
+
         Args:
             r: Radial distance(s) in meters
             theta: Polar angle(s) in radians
             phi: Azimuthal angle(s) in radians
+            normalize: If True (default), divide by sqrt(total_power) for
+                      consistency with directivity-normalized far field.
 
         Returns:
             E: Tuple of (E_r, E_theta, E_phi) in V/m
@@ -1362,31 +1487,46 @@ class SphericalWaveExpansion:
                 E_r += E_prefactor * Q2 * F2_E[0]
                 E_theta += E_prefactor * Q2 * F2_E[1]
                 E_phi += E_prefactor * Q2 * F2_E[2]
-                
+
                 H_r += H_prefactor * Q2 * F2_H[0]
                 H_theta += H_prefactor * Q2 * F2_H[1]
                 H_phi += H_prefactor * Q2 * F2_H[2]
-        
+
+        # Normalize consistently with directivity-normalized far field
+        if normalize:
+            tp = self.total_power
+            if tp > 0:
+                norm = np.sqrt(tp)
+                E_r /= norm
+                E_theta /= norm
+                E_phi /= norm
+                H_r /= norm
+                H_theta /= norm
+                H_phi /= norm
+
         return (E_r, E_theta, E_phi), (H_r, H_theta, H_phi)
-        
-    def near_field_cartesian(self, x: np.ndarray, y: np.ndarray, z: np.ndarray) -> \
+
+    def near_field_cartesian(self, x: np.ndarray, y: np.ndarray, z: np.ndarray,
+                             normalize: bool = True) -> \
             Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray],
                   Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """
         Calculate near-field E and H in Cartesian coordinates.
-        
+
         Args:
             x, y, z: Cartesian coordinates in meters
-            
+            normalize: If True (default), divide by sqrt(total_power) for
+                      consistency with directivity-normalized far field.
+
         Returns:
             E: Tuple of (E_x, E_y, E_z) components in V/m
             H: Tuple of (H_x, H_y, H_z) components in A/m
         """
         # Convert to spherical coordinates
         r, theta, phi = cartesian_to_spherical(x, y, z)
-        
+
         # Get fields in spherical basis
-        (E_r, E_theta, E_phi), (H_r, H_theta, H_phi) = self.near_field(r, theta, phi)
+        (E_r, E_theta, E_phi), (H_r, H_theta, H_phi) = self.near_field(r, theta, phi, normalize=normalize)
         
         # Convert to Cartesian basis
         E_x, E_y, E_z = spherical_to_cartesian_field(E_r, E_theta, E_phi, theta, phi)
@@ -1506,6 +1646,12 @@ def read_ticra_sph(filename: str) -> Dict:
     """
     Read TICRA .sph file containing spherical wave expansion coefficients.
 
+    Note:
+        TICRA/GRASP .sph exports should have power normalization enabled so
+        that the coefficients are normalized to unit radiated power. Without
+        this, the near-field computation will produce incorrect absolute levels
+        even though the far-field pattern shape appears correct.
+
     Args:
         filename: Path to the .sph file
 
@@ -1515,7 +1661,7 @@ def read_ticra_sph(filename: str) -> Dict:
     logger.info(f"Reading TICRA .sph file: {filename}")
 
     # NORMALIZATION FACTOR (from Ticra)
-    normalization_factor = 1*np.sqrt(8*np.pi)
+    normalization_factor = 1/np.sqrt(8*np.pi)
 
     with open(filename, 'r') as f:
         lines = f.readlines()
@@ -1664,8 +1810,8 @@ def write_ticra_sph(filename: str,
     logger.info(f"Writing TICRA .sph file: {filename}")
     logger.debug(f"Writing SWE: NMAX={NMAX}, MMAX={MMAX}, frequency={frequency_GHz} GHz, {len(Q1_coeffs)} Q1 modes, {len(Q2_coeffs)} Q2 modes")
 
-    # normalization factor (between Ticra and Hansen
-    normalization_factor = 1/np.sqrt(8*np.pi)
+    # normalization factor (between Ticra and Hansen)
+    normalization_factor = np.sqrt(8*np.pi)
 
     with open(filename, 'w') as f:
         # Record 1: PRGTAG

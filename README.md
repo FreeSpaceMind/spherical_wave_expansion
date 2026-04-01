@@ -18,14 +18,8 @@ A Python package for spherical wave expansion (SWE) analysis of electromagnetic 
 
 ## Installation
 
-### From PyPI (once published)
-```bash
-pip install spherical-wave-expansion
-```
-
 ### From source
 ```bash
-git clone https://github.com/yourusername/spherical-wave-expansion.git
 cd spherical-wave-expansion
 pip install -e .
 ```
@@ -240,23 +234,11 @@ The package reads and writes **TICRA .sph files**, which contain:
 2. IEEE Std 1720-2012: "Recommended Practice for Near-Field Antenna Measurements"
 3. TICRA documentation for .sph file format
 
-## Contributing
+## Related Packages
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+- **FarFieldSpherical**: Far-field pattern analysis library (uses this package for SWE operations)
+- **AntennaPatternViewer**: GUI application for visualizing antenna patterns
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Citation
-
-If you use this package in your research, please cite:
-
-```bibtex
-@software{spherical_wave_expansion,
-  author = {Your Name},
-  title = {Spherical Wave Expansion: A Python package for antenna pattern analysis},
-  year = {2025},
-  url = {https://github.com/yourusername/spherical-wave-expansion}
-}
-```
+MIT License
