@@ -1585,8 +1585,7 @@ class SphericalWaveExpansion:
         bessel_cache = precompute_spherical_bessel(nmax, kr)
 
         # Scaling prefactors for near-field E and H.
-        # The Q coefficients from the .sph file are read with normalization_factor=1/sqrt(8π),
-        # which absorbs the k*sqrt(Z0) factor present in Hansen's formulation.
+        # TICRA's internal convention is Q_internal = -conj(Q_file) with no extra scaling.
         # The effective prefactor consistent with the far-field K-function scaling is sqrt(4π).
         Z0 = 376.730313668
         E_prefactor = np.sqrt(4 * np.pi)
@@ -1778,9 +1777,6 @@ def read_ticra_sph(filename: str) -> List[Dict]:
     """
     logger.info(f"Reading TICRA .sph file: {filename}")
 
-    # NORMALIZATION FACTOR (from Ticra)
-    normalization_factor = 1/np.sqrt(8*np.pi)
-
     with open(filename, 'r') as f:
         lines = f.readlines()
 
@@ -1901,11 +1897,11 @@ def read_ticra_sph(filename: str) -> List[Dict]:
                 line_idx += 1
 
         # Convert from TICRA file convention to internal convention:
-        # Q_internal = -conj(Q_file) * normalization_factor
+        # Q_internal = -conj(Q_file)
         for key in Q1_coeffs:
-            Q1_coeffs[key] = -np.conj(Q1_coeffs[key]) * normalization_factor
+            Q1_coeffs[key] = -np.conj(Q1_coeffs[key])
         for key in Q2_coeffs:
-            Q2_coeffs[key] = -np.conj(Q2_coeffs[key]) * normalization_factor
+            Q2_coeffs[key] = -np.conj(Q2_coeffs[key])
 
         logger.info(f"Loaded block: {frequency} GHz, NMAX={NMAX}, MMAX={MMAX}, "
                     f"{len(Q1_coeffs)} Q1 modes, {len(Q2_coeffs)} Q2 modes")
@@ -1948,12 +1944,9 @@ def write_ticra_sph(filename: str,
         description: Description text written in every block header
 
     Internal coefficients are converted back to file convention on write:
-        Q_file = -conj(Q_internal) * sqrt(8*pi)
+        Q_file = -conj(Q_internal)
     """
     logger.info(f"Writing TICRA .sph file: {filename} ({len(freq_data_list)} frequency block(s))")
-
-    # Inverse of the 1/sqrt(8*pi) applied on read
-    normalization_factor = np.sqrt(8 * np.pi)
 
     with open(filename, 'w') as f:
         for block in freq_data_list:
@@ -2003,19 +1996,19 @@ def write_ticra_sph(filename: str,
 
                 for n in range(max(1, m_val), NMAX + 1):
                     if m_val == 0:
-                        # internal -> file: Q_file = -conj(Q_internal) * sqrt(8pi)
-                        Q1 = -np.conj(Q1_coeffs.get((n, 0), 0.0)) * normalization_factor
-                        Q2 = -np.conj(Q2_coeffs.get((n, 0), 0.0)) * normalization_factor
+                        # internal -> file: Q_file = -conj(Q_internal)
+                        Q1 = -np.conj(Q1_coeffs.get((n, 0), 0.0))
+                        Q2 = -np.conj(Q2_coeffs.get((n, 0), 0.0))
                         f.write(f"  {Q1.real:23.16E} {Q1.imag:23.16E} "
                                 f"{Q2.real:23.16E} {Q2.imag:23.16E}\n")
                     else:
                         # -m line
-                        Q1_neg = -np.conj(Q1_coeffs.get((n, -m_val), 0.0)) * normalization_factor
-                        Q2_neg = -np.conj(Q2_coeffs.get((n, -m_val), 0.0)) * normalization_factor
+                        Q1_neg = -np.conj(Q1_coeffs.get((n, -m_val), 0.0))
+                        Q2_neg = -np.conj(Q2_coeffs.get((n, -m_val), 0.0))
                         f.write(f"  {Q1_neg.real:23.16E} {Q1_neg.imag:23.16E} "
                                 f"{Q2_neg.real:23.16E} {Q2_neg.imag:23.16E}\n")
                         # +m line
-                        Q1_pos = -np.conj(Q1_coeffs.get((n, m_val), 0.0)) * normalization_factor
-                        Q2_pos = -np.conj(Q2_coeffs.get((n, m_val), 0.0)) * normalization_factor
+                        Q1_pos = -np.conj(Q1_coeffs.get((n, m_val), 0.0))
+                        Q2_pos = -np.conj(Q2_coeffs.get((n, m_val), 0.0))
                         f.write(f"  {Q1_pos.real:23.16E} {Q1_pos.imag:23.16E} "
                                 f"{Q2_pos.real:23.16E} {Q2_pos.imag:23.16E}\n")
