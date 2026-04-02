@@ -1,7 +1,7 @@
 """
 Shared fixtures and utilities for SWE test suite.
 
-Test data files (.sph, .cut, .grd) should be placed in tests/test_data/.
+Test data files (.sph, .cut, .grd) should be placed in tests/.
 Tests that require these files are skipped if the files are not present.
 """
 
@@ -9,8 +9,8 @@ import os
 import numpy as np
 import pytest
 
-# Path to test data directory
-TEST_DATA_DIR = os.path.join(os.path.dirname(__file__), "test_data")
+# Path to test data directory (files live directly in tests/)
+TEST_DATA_DIR = os.path.dirname(__file__)
 
 
 def get_test_file(filename):
@@ -20,13 +20,19 @@ def get_test_file(filename):
 
 
 # Discover available test data files
+# Discover available test data files
 SPH_FILE = get_test_file("example.sph")
 CUT_FILE = get_test_file("example.cut")
 GRD_FILE = get_test_file("example.grd")
 
-requires_sph = pytest.mark.skipif(SPH_FILE is None, reason="example.sph not found in test_data/")
-requires_cut = pytest.mark.skipif(CUT_FILE is None, reason="example.cut not found in test_data/")
-requires_grd = pytest.mark.skipif(GRD_FILE is None, reason="example.grd not found in test_data/")
+requires_sph = pytest.mark.skipif(SPH_FILE is None, reason="example.sph not found in tests/")
+requires_cut = pytest.mark.skipif(CUT_FILE is None, reason="example.cut not found in tests/")
+requires_grd = pytest.mark.skipif(GRD_FILE is None, reason="example.grd not found in tests/")
+
+# Shared constants for multi-frequency test data
+Z_DISTANCE = 0.25          # meters, z-distance for .grd planar scan
+N_PHI_PER_FREQ = 37        # phi cuts per frequency in .cut file
+FREQ_INDEX_8GHZ = 0        # index of 8 GHz in multi-freq .cut/.grd
 
 
 # ==============================================================================

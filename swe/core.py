@@ -1039,7 +1039,8 @@ class SphericalWaveExpansion:
                             high_mode_power_threshold: float = 0.00001,
                             azimuthal_power_threshold: float = 0.00001,
                             use_multiprocessing: bool = True,
-                            n_workers: int = None):
+                            n_workers: int = None,
+                            normalize: bool = True):
         """
         Adaptively calculate Q coefficients from far-field patterns using orthogonality integral.
         
@@ -1059,7 +1060,9 @@ class SphericalWaveExpansion:
             azimuthal_power_threshold: Min power per |m| to include (0.00005 = 0.005%)
             use_multiprocessing: Enable parallel computation
             n_workers: Number of parallel workers (None = auto-detect)
-        
+            normalize: If True (default), normalize coefficients so total_power=1.
+                      If False, preserve original scaling for absolute field comparison.
+
         Returns:
             SphericalWaveExpansion object with adaptively determined modes
         """
@@ -1320,7 +1323,8 @@ class SphericalWaveExpansion:
                     f"retained power={retained_fraction*100:.2f}%, {len(Q1_final)} modes"
                 )
                 swe = cls(Q1_final, Q2_final, frequency, NMAX_truncated, MMAX_truncated)
-                swe.normalize_coefficients()
+                if normalize:
+                    swe.normalize_coefficients()
                 return swe
             
             else:
@@ -1339,11 +1343,12 @@ class SphericalWaveExpansion:
             UserWarning
         )
         swe = cls(Q1_coeffs, Q2_coeffs, frequency, NMAX, MMAX_current)
-        swe.normalize_coefficients()
+        if normalize:
+            swe.normalize_coefficients()
         return swe
 
     @classmethod
-    def from_sph_file(cls, filename: str) -> 'SphericalWaveExpansion':
+    def from_sph_file(cls, filename: str, normalize: bool = True) -> 'SphericalWaveExpansion':
         """
         Create SWE object from TICRA .sph file.
 
@@ -1355,6 +1360,9 @@ class SphericalWaveExpansion:
 
         Args:
             filename: Path to .sph file
+            normalize: If True (default), normalize coefficients so total_power=1
+                      (directivity-referenced fields). If False, preserve original
+                      absolute scaling for comparison with GRASP reference data.
 
         Returns:
             SphericalWaveExpansion object
@@ -1373,10 +1381,11 @@ class SphericalWaveExpansion:
             MMAX=data['MMAX']
         )
 
-        # Normalize so total_power = 1, making the SWE convention-independent.
-        # This ensures TICRA, Hansen, and from_far_field coefficients all
-        # produce identical near/far fields after normalization.
-        swe.normalize_coefficients()
+        if normalize:
+            # Normalize so total_power = 1, making the SWE convention-independent.
+            # This ensures TICRA, Hansen, and from_far_field coefficients all
+            # produce identical near/far fields after normalization.
+            swe.normalize_coefficients()
 
         return swe
     
@@ -1642,141 +1651,161 @@ class SphericalWaveExpansion:
 # File I/O Functions
 # ==============================================================================
 
-def read_ticra_sph(filename: str) -> Dict:
+def read_ticra_sph(filename: str, freq_index: int = 0) -> Dict:
     """
     Read TICRA .sph file containing spherical wave expansion coefficients.
 
-    Note:
-        TICRA/GRASP .sph exports should have power normalization enabled so
-        that the coefficients are normalized to unit radiated power. Without
-        this, the near-field computation will produce incorrect absolute levels
-        even though the far-field pattern shape appears correct.
+    Supports multi-frequency .sph files; reads a single frequency block.
 
     Args:
         filename: Path to the .sph file
+        freq_index: 0-based frequency index to read (default: 0 = first frequency)
 
     Returns:
         Dictionary containing all data from .sph file
     """
-    logger.info(f"Reading TICRA .sph file: {filename}")
-
-    # NORMALIZATION FACTOR (from Ticra)
-    normalization_factor = 1/np.sqrt(8*np.pi)
+    logger.info(f"Reading TICRA .sph file: {filename}, freq_index={freq_index}")
 
     with open(filename, 'r') as f:
         lines = f.readlines()
-    
+
     line_idx = 0
-    
-    # Record 1: PRGTAG
-    prgtag = lines[line_idx].strip()
-    line_idx += 1
-    
-    frequency = None
-    if 'Freq [GHz]:' in prgtag:
-        freq_str = prgtag.split('Freq [GHz]:')[1].strip().split()[0]
-        frequency = float(freq_str)
-    
-    # Record 2: IDSTRG
-    idstrg = lines[line_idx].strip()
-    line_idx += 1
-    
-    # Record 3: NTHE, NPHI, NMAX, MMAX
-    control_data = lines[line_idx].strip().split()
-    NTHE = int(control_data[0])
-    NPHI = int(control_data[1])
-    NMAX = int(control_data[2])
-    MMAX = int(control_data[3])
-    line_idx += 1
-    
-    # Record 4: Rotation angles
-    rotation_line = lines[line_idx].strip()
-    line_idx += 1
-    if 'Rotation angles' in rotation_line:
-        angles_str = rotation_line.split('=')[1].strip().strip('()')
-        rotation_angles = tuple(float(x.strip()) for x in angles_str.split(','))
-    else:
-        rotation_angles = (0.0, 0.0, 0.0)
-    
-    # Records 5-8: Dummy data
-    line_idx += 4
-    
-    # Read coefficients
+
+    # Skip to the requested frequency block
+    for fi in range(freq_index + 1):
+        if fi > 0:
+            # Advance past the current frequency block's remaining data
+            # by scanning for the next PRGTAG line (contains "Freq [GHz]:")
+            found = False
+            while line_idx < len(lines):
+                if 'Freq [GHz]:' in lines[line_idx]:
+                    found = True
+                    break
+                line_idx += 1
+            if not found:
+                raise ValueError(
+                    f"Frequency index {freq_index} not found in {filename} "
+                    f"(only {fi} frequencies available)"
+                )
+
+        # Record 1: PRGTAG
+        prgtag = lines[line_idx].strip()
+        line_idx += 1
+
+        frequency = None
+        if 'Freq [GHz]:' in prgtag:
+            freq_str = prgtag.split('Freq [GHz]:')[1].strip().split()[0]
+            frequency = float(freq_str)
+
+        # Record 2: IDSTRG
+        idstrg = lines[line_idx].strip()
+        line_idx += 1
+
+        # Record 3: NTHE, NPHI, NMAX, MMAX
+        control_data = lines[line_idx].strip().split()
+        NTHE = int(control_data[0])
+        NPHI = int(control_data[1])
+        NMAX = int(control_data[2])
+        MMAX = int(control_data[3])
+        line_idx += 1
+
+        # Record 4: Rotation angles
+        rotation_line = lines[line_idx].strip()
+        line_idx += 1
+        if 'Rotation angles' in rotation_line:
+            angles_str = rotation_line.split('=')[1].strip().strip('()')
+            rotation_angles = tuple(float(x.strip()) for x in angles_str.split(','))
+        else:
+            rotation_angles = (0.0, 0.0, 0.0)
+
+        # Records 5-8: Dummy data (skip 4 lines)
+        line_idx += 4
+
+    # Read coefficients for the selected frequency block
     Q1_coeffs = {}
     Q2_coeffs = {}
     power = {}
-    
-    while line_idx < len(lines):
+    m_blocks_read = 0
+
+    while line_idx < len(lines) and m_blocks_read <= MMAX:
         line = lines[line_idx].strip()
         if not line:
             line_idx += 1
             continue
-            
+
         parts = line.split()
         if len(parts) >= 2:
             try:
                 m_index = int(parts[0])
                 powerm = float(parts[1])
-                power[abs(m_index)] = powerm
-                line_idx += 1
-                
-                abs_m = abs(m_index)
-                n_start = max(1, abs_m)
-                
-                if m_index == 0:
-                    for n in range(n_start, NMAX + 1):
-                        if line_idx >= len(lines):
-                            break
-                        coeff_line = lines[line_idx].strip()
-                        line_idx += 1
-                        
-                        coeff_parts = coeff_line.split()
-                        if len(coeff_parts) >= 4:
-                            Q1_coeffs[(n, 0)] = normalization_factor * (float(coeff_parts[0]) + 1j * float(coeff_parts[1]))
-                            Q2_coeffs[(n, 0)] = normalization_factor * (float(coeff_parts[2]) + 1j * float(coeff_parts[3]))
-                        else:
-                            line_idx -= 1
-                            break
-                else:
-                    for n in range(n_start, NMAX + 1):
-                        # -m coefficients
-                        if line_idx >= len(lines):
-                            break
-                        coeff_line = lines[line_idx].strip()
-                        line_idx += 1
-                        
-                        coeff_parts = coeff_line.split()
-                        if len(coeff_parts) >= 4:
-                            Q1_coeffs[(n, -abs_m)] = normalization_factor * (float(coeff_parts[0]) + 1j * float(coeff_parts[1]))
-                            Q2_coeffs[(n, -abs_m)] = normalization_factor * (float(coeff_parts[2]) + 1j * float(coeff_parts[3]))
-                        else:
-                            line_idx -= 1
-                            break
-                        
-                        # +m coefficients
-                        if line_idx >= len(lines):
-                            break
-                        coeff_line = lines[line_idx].strip()
-                        line_idx += 1
-                        
-                        coeff_parts = coeff_line.split()
-                        if len(coeff_parts) >= 4:
-                            Q1_coeffs[(n, abs_m)] = normalization_factor * (float(coeff_parts[0]) + 1j * float(coeff_parts[1]))
-                            Q2_coeffs[(n, abs_m)] = normalization_factor * (float(coeff_parts[2]) + 1j * float(coeff_parts[3]))
-                        else:
-                            line_idx -= 1
-                            break
-                            
             except (ValueError, IndexError):
+                # Non-numeric line — skip (could be stray text/dummy lines)
                 line_idx += 1
+                continue
+
+            # Validate this is a valid m-block for the current frequency
+            if abs(m_index) > MMAX:
+                break
+
+            power[abs(m_index)] = powerm
+            line_idx += 1
+            m_blocks_read += 1
+
+            abs_m = abs(m_index)
+            n_start = max(1, abs_m)
+
+            if m_index == 0:
+                for n in range(n_start, NMAX + 1):
+                    if line_idx >= len(lines):
+                        break
+                    coeff_line = lines[line_idx].strip()
+                    line_idx += 1
+
+                    coeff_parts = coeff_line.split()
+                    if len(coeff_parts) >= 4:
+                        Q1_coeffs[(n, 0)] = complex(float(coeff_parts[0]), float(coeff_parts[1]))
+                        Q2_coeffs[(n, 0)] = complex(float(coeff_parts[2]), float(coeff_parts[3]))
+                    else:
+                        line_idx -= 1
+                        break
+            else:
+                for n in range(n_start, NMAX + 1):
+                    # -m coefficients
+                    if line_idx >= len(lines):
+                        break
+                    coeff_line = lines[line_idx].strip()
+                    line_idx += 1
+
+                    coeff_parts = coeff_line.split()
+                    if len(coeff_parts) >= 4:
+                        Q1_coeffs[(n, -abs_m)] = complex(float(coeff_parts[0]), float(coeff_parts[1]))
+                        Q2_coeffs[(n, -abs_m)] = complex(float(coeff_parts[2]), float(coeff_parts[3]))
+                    else:
+                        line_idx -= 1
+                        break
+
+                    # +m coefficients
+                    if line_idx >= len(lines):
+                        break
+                    coeff_line = lines[line_idx].strip()
+                    line_idx += 1
+
+                    coeff_parts = coeff_line.split()
+                    if len(coeff_parts) >= 4:
+                        Q1_coeffs[(n, abs_m)] = complex(float(coeff_parts[0]), float(coeff_parts[1]))
+                        Q2_coeffs[(n, abs_m)] = complex(float(coeff_parts[2]), float(coeff_parts[3]))
+                    else:
+                        line_idx -= 1
+                        break
         else:
             line_idx += 1
-    
-    # conjugate coefficients to match Q_smn definition
+
+    # Convert from TICRA file convention to internal convention:
+    # Q_internal = -conj(Q_file)
     for key in Q1_coeffs:
-        Q1_coeffs[key] = np.conj(Q1_coeffs[key])
+        Q1_coeffs[key] = -np.conj(Q1_coeffs[key])
     for key in Q2_coeffs:
-        Q2_coeffs[key] = np.conj(Q2_coeffs[key])
+        Q2_coeffs[key] = -np.conj(Q2_coeffs[key])
 
     logger.info(f"Loaded SWE: NMAX={NMAX}, MMAX={MMAX}, frequency={frequency} GHz, {len(Q1_coeffs)} Q1 modes, {len(Q2_coeffs)} Q2 modes")
     logger.debug(f"Rotation angles: {rotation_angles}")
@@ -1804,14 +1833,11 @@ def write_ticra_sph(filename: str,
     """
     Write spherical wave coefficients to TICRA .sph file format.
 
-    Input coefficients should be in TICRA working convention.
-    They will be conjugated before writing to match the .sph file format.
+    Internal coefficients are converted back to file convention:
+    Q_file = -conj(Q_internal)
     """
     logger.info(f"Writing TICRA .sph file: {filename}")
     logger.debug(f"Writing SWE: NMAX={NMAX}, MMAX={MMAX}, frequency={frequency_GHz} GHz, {len(Q1_coeffs)} Q1 modes, {len(Q2_coeffs)} Q2 modes")
-
-    # normalization factor (between Ticra and Hansen)
-    normalization_factor = np.sqrt(8*np.pi)
 
     with open(filename, 'w') as f:
         # Record 1: PRGTAG
@@ -1826,12 +1852,11 @@ def write_ticra_sph(filename: str,
         # Record 4: Rotation angles
         f.write("Rotation angles = (  0.00000,  0.00000,  0.00000)\n")
         
-        # Records 5-8: Dummy data
-        f.write("Dummy text string\n")
+        # Records 5-8: Dummy data (4 lines matching TICRA format)
         f.write("  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00\n")
         f.write("  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00\n")
-        f.write("Dummy text string\n")
-        f.write("Dummy text string\n")
+        f.write("SWEP_DUMMY_FILE_NAME\n")
+        f.write("SWEP_DUMMY_FILE_NAME\n")
         
         # Write coefficients for each |m|
         for m_val in range(0, MMAX + 1):
@@ -1857,23 +1882,23 @@ def write_ticra_sph(filename: str,
             # Write coefficients for each n
             for n in range(max(1, m_val), NMAX + 1):
                 if m_val == 0:
-                    # Conjugate and scale before writing (reverse read operation)
-                    Q1 = np.conj(Q1_coeffs.get((n, 0), 0.0))*normalization_factor
-                    Q2 = np.conj(Q2_coeffs.get((n, 0), 0.0))*normalization_factor
-                    
+                    # Convert internal -> file: Q_file = -conj(Q_internal)
+                    Q1 = -np.conj(Q1_coeffs.get((n, 0), 0.0))
+                    Q2 = -np.conj(Q2_coeffs.get((n, 0), 0.0))
+
                     f.write(f"  {Q1.real:23.16E} {Q1.imag:23.16E} "
                            f"{Q2.real:23.16E} {Q2.imag:23.16E}\n")
                 else:
-                    # -m line (conjugate before writing)
-                    Q1_neg = np.conj(Q1_coeffs.get((n, -m_val), 0.0))*normalization_factor
-                    Q2_neg = np.conj(Q2_coeffs.get((n, -m_val), 0.0))*normalization_factor
-                    
+                    # -m line
+                    Q1_neg = -np.conj(Q1_coeffs.get((n, -m_val), 0.0))
+                    Q2_neg = -np.conj(Q2_coeffs.get((n, -m_val), 0.0))
+
                     f.write(f"  {Q1_neg.real:23.16E} {Q1_neg.imag:23.16E} "
                            f"{Q2_neg.real:23.16E} {Q2_neg.imag:23.16E}\n")
-                    
-                    # +m line (conjugate before writing)
-                    Q1_pos = np.conj(Q1_coeffs.get((n, m_val), 0.0))*normalization_factor
-                    Q2_pos = np.conj(Q2_coeffs.get((n, m_val), 0.0))*normalization_factor
-                    
+
+                    # +m line
+                    Q1_pos = -np.conj(Q1_coeffs.get((n, m_val), 0.0))
+                    Q2_pos = -np.conj(Q2_coeffs.get((n, m_val), 0.0))
+
                     f.write(f"  {Q1_pos.real:23.16E} {Q1_pos.imag:23.16E} "
                            f"{Q2_pos.real:23.16E} {Q2_pos.imag:23.16E}\n")
