@@ -1,16 +1,16 @@
 [build-system]
-requires = ["setuptools>=45", "wheel"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "swe"
+name = "spherical-wave-expansion"
 version = "0.1.0"
-description = "Spherical wave expansion analysis for electromagnetic fields"
+description = "Spherical wave expansion analysis of electromagnetic fields (Hansen/TICRA convention)"
+readme = "README.md"
 authors = [{name = "Justin Long", email = "justinwlong1@gmail.com"}]
 requires-python = ">=3.9"
-license = {text = "MIT"}
-
-keywords = ["spherical", "wave", "expansion", "antenna", "electromagnetic", "near-field"]
+license = {file = "LICENSE"}
+keywords = ["spherical", "wave", "expansion", "antenna", "electromagnetic", "near-field", "TICRA", "GRASP"]
 
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -21,7 +21,9 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Physics",
 ]
 
 dependencies = [
@@ -31,16 +33,24 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=6.0",
+    "pytest>=7.0",
     "pytest-cov",
-    "black",
-    "flake8",
-    "matplotlib>=3.3.0",
+    "matplotlib>=3.5.0",
 ]
 
-[tool.setuptools]
-packages = ["swe"]
+[project.urls]
+Homepage = "https://github.com/FreeSpaceMind/spherical_wave_expansion"
+Repository = "https://github.com/FreeSpaceMind/spherical_wave_expansion"
+Issues = "https://github.com/FreeSpaceMind/spherical_wave_expansion/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["swe*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
 
 [tool.black]
 line-length = 100
-target-version = ['py39']
+target-version = ["py39"]
