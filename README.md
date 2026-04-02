@@ -184,7 +184,7 @@ The package includes a validation suite that verifies absolute-level field agree
 
 1. **`.sph` -> far field -> `.cut`** (`test_sph_to_farfield.py`): Load coefficients from .sph, compute far-field pattern, convert to Ludwig-3, compare with .cut reference at absolute V/m levels. Current accuracy: scaling ratio ~0.994, phase offset ~0.2 deg.
 
-2. **`.sph` -> near field -> `.grd`** (`test_sph_to_nearfield.py`): Load coefficients from .sph, compute near field on the planar grid at z=0.25 m, convert to Ludwig-3, compare with .grd reference. Modes are truncated to n < kr_min to avoid spherical Bessel function overflow.
+2. **`.sph` -> near field -> `.grd`** (`test_sph_to_nearfield.py`): Load coefficients from .sph, compute near field on the planar grid at z=0.25 m, convert to Ludwig-3, compare with .grd reference. Modes are truncated to n < kr_min to avoid spherical Bessel function overflow. Current accuracy: scaling ratio ~1.00, phase offset ~0.5 deg.
 
 3. **`.cut` -> SWE extraction -> `.cut`/`.grd`** (`test_cut_to_sph.py`): Extract Q coefficients from .cut far-field data using `from_far_field()`, then verify the extracted SWE reproduces both the original .cut pattern and the .grd near field.
 

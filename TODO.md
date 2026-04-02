@@ -2,13 +2,6 @@
 
 ## High Priority
 
-### Fix near-field E_prefactor convention
-The near-field computation has a ~915x scaling mismatch with TICRA GRASP reference data.
-The `E_prefactor = k * sqrt(Z0)` in the `near_field()` method does not match GRASP's convention
-after the coefficient transform was changed from `conj(Q_file / sqrt(8*pi))` to `-conj(Q_file)`.
-The far-field uses a different prefactor path and works correctly (scaling ~0.994).
-Investigation needed to determine the correct near-field prefactor for the current coefficient convention.
-
 ### Full multi-frequency support
 Currently only one frequency is processed at a time (via `freq_index` parameter).
 - Read all 9 frequencies from .sph file into a single object or frequency-indexed structure

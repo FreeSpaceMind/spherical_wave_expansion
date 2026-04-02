@@ -230,12 +230,23 @@ This is computed from the Bessel recurrence without numerical differentiation.
 
 The complete near-field expressions use the following overall scaling:
 
-$$\mathbf{E}(r,\theta,\phi) = k\sqrt{\eta_0} \sum_{s,m,n} Q_{smn}\,\mathbf{F}^{E}_{smn}(r,\theta,\phi)$$
+$$\mathbf{E}(r,\theta,\phi) = \sqrt{4\pi} \sum_{s,m,n} Q_{smn}\,\mathbf{F}^{E}_{smn}(r,\theta,\phi)$$
 
-$$\mathbf{H}(r,\theta,\phi) = \frac{jk}{\sqrt{\eta_0}} \sum_{s,m,n} Q_{smn}\,\mathbf{F}^{H}_{smn}(r,\theta,\phi)$$
+$$\mathbf{H}(r,\theta,\phi) = \frac{j\sqrt{4\pi}}{\eta_0} \sum_{s,m,n} Q_{smn}\,\mathbf{F}^{H}_{smn}(r,\theta,\phi)$$
 
 where $\mathbf{F}^{E}_{smn}$ and $\mathbf{F}^{H}_{smn}$ are the near-field
 pattern functions defined below.
+
+> **Implementation note**: Hansen's textbook expresses the prefactor as
+> $k\sqrt{\eta_0}$, but that form applies to coefficients with the raw
+> Hansen normalisation. The `.sph` file I/O in this package applies a
+> $1/\sqrt{8\pi}$ factor when reading coefficients (absorbing the
+> $k\sqrt{\eta_0}$ term into the stored $Q$ values). The effective
+> prefactor for the stored coefficients therefore reduces to $\sqrt{4\pi}$
+> for $\mathbf{E}$ and $j\sqrt{4\pi}/\eta_0$ for $\mathbf{H}$, which
+> is what the code implements. The far-field K-function normalisation
+> uses the same convention, ensuring consistency between far-field and
+> near-field outputs.
 
 ### 5.3 TM Mode ($s = 2$) Electric Field Pattern
 

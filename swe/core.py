@@ -1422,6 +1422,13 @@ class SphericalWaveExpansion:
         By default, normalizes by sqrt(total_power) so that the fields are
         consistent with the directivity-normalized far field.
 
+        Scaling note: the prefactor used here is sqrt(4π) for E and
+        j*sqrt(4π)/Z0 for H. This differs from Hansen's textbook expression
+        of k*sqrt(Z0) because the .sph file I/O absorbs a 1/sqrt(8π) factor
+        into the stored Q coefficients, cancelling the k*sqrt(Z0) term and
+        leaving sqrt(4π) as the effective prefactor. The far-field K-function
+        normalisation uses the same convention.
+
         Args:
             r: Radial distance(s) in meters
             theta: Polar angle(s) in radians
@@ -1467,10 +1474,13 @@ class SphericalWaveExpansion:
         kr = self.k * r.ravel()
         bessel_cache = precompute_spherical_bessel(self.NMAX, kr)
 
-        # scaling factors from Ticra (eq 4.212 abd 4.213)
+        # Scaling prefactors for near-field E and H.
+        # The Q coefficients from the .sph file are read with normalization_factor=1/sqrt(8π),
+        # which absorbs the k*sqrt(Z0) factor present in Hansen's formulation.
+        # The effective prefactor consistent with the far-field K-function scaling is sqrt(4π).
         Z0 = 376.730313668
-        E_prefactor = self.k * np.sqrt(Z0)
-        H_prefactor = 1j*self.k/np.sqrt(Z0)
+        E_prefactor = np.sqrt(4 * np.pi)
+        H_prefactor = 1j * np.sqrt(4 * np.pi) / Z0
 
         # Loop through modes
         for (n, m) in all_modes:
