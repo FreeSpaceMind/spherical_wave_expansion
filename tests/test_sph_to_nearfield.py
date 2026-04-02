@@ -3,6 +3,7 @@ Test: Load .sph -> compute near field on planar grid -> compare with Ticra .grd 
 
 Validates absolute near-field levels (V/m) between the SWE package and Ticra GRASP,
 using Ludwig-3 (Eco/Ecx) polarization at z=0.25m planar scan.
+Loops over all frequencies present in the .sph/.grd files.
 """
 
 import numpy as np
@@ -13,7 +14,7 @@ from swe.ticra_io import read_grasp_grd
 from swe.ludwig3 import spherical_to_ludwig3
 from tests.conftest import (
     SPH_FILE, GRD_FILE, requires_sph, requires_grd,
-    compute_comparison_metrics, Z_DISTANCE, FREQ_INDEX_8GHZ
+    compute_comparison_metrics, Z_DISTANCE,
 )
 
 
@@ -23,102 +24,104 @@ class TestSphToNearField:
 
     @pytest.fixture(autouse=True)
     def setup(self):
-        """Load reference data with absolute scaling preserved."""
+        """
+        Load reference data for all frequencies and build per-frequency
+        mode-truncated SWE objects.
+
+        Modes with n >= kr_min are dropped to prevent Bessel function overflow;
+        the safe limit is computed per-frequency since k differs.
+        """
         swe_full = SphericalWaveExpansion.from_sph_file(SPH_FILE, normalize=False)
-        self.grd_data = read_grasp_grd(GRD_FILE)
-        self.field = self.grd_data['fields'][FREQ_INDEX_8GHZ]
+        grd_data = read_grasp_grd(GRD_FILE)
 
-        # Use the first frequency (8 GHz) — matches FREQ_INDEX_8GHZ in the .grd
-        self.freq = swe_full.frequencies[FREQ_INDEX_8GHZ]
-
-        # Truncate modes for near-field safety: n must be < kr_min to avoid
-        # overflow in spherical Bessel functions. kr_min corresponds to the
-        # closest grid point (smallest r).
-        r_min = Z_DISTANCE  # on-axis point has smallest r
-        kr_min = swe_full.k(self.freq) * r_min
-        nmax_safe = int(kr_min) - 5  # conservative margin
-        nmax_safe = max(nmax_safe, swe_full.MMAX(self.freq))
-
-        q1_all = swe_full.Q1_coeffs(self.freq)
-        q2_all = swe_full.Q2_coeffs(self.freq)
-        Q1_trunc = {(n, m): v for (n, m), v in q1_all.items() if n <= nmax_safe}
-        Q2_trunc = {(n, m): v for (n, m), v in q2_all.items() if n <= nmax_safe}
-
-        self.swe = SphericalWaveExpansion(
-            Q1_coeffs={self.freq: Q1_trunc},
-            Q2_coeffs={self.freq: Q2_trunc},
-            NMAX={self.freq: nmax_safe},
-            MMAX={self.freq: swe_full.MMAX(self.freq)},
+        n_freqs = len(swe_full.frequencies)
+        assert len(grd_data['fields']) >= n_freqs, (
+            f".grd has {len(grd_data['fields'])} field sets but .sph has {n_freqs} freqs"
         )
-        print(f"\n  Truncated NMAX: {swe_full.NMAX(self.freq)} -> {nmax_safe} "
-              f"(kr_min={kr_min:.1f})")
 
-    def _get_grid(self):
-        """Build the planar grid at z=Z_DISTANCE from .grd extents."""
-        x = np.linspace(self.field['grid_min_x'], self.field['grid_max_x'],
-                        self.field['nx'])
-        y = np.linspace(self.field['grid_min_y'], self.field['grid_max_y'],
-                        self.field['ny'])
+        # For each frequency build a (truncated_swe, grd_field) pair
+        self.freq_field_pairs = []
+        for i, freq in enumerate(swe_full.frequencies):
+            field = grd_data['fields'][i]
+
+            r_min = Z_DISTANCE
+            kr_min = swe_full.k(freq) * r_min
+            nmax_safe = max(int(kr_min) - 5, swe_full.MMAX(freq))
+
+            q1_trunc = {k: v for k, v in swe_full.Q1_coeffs(freq).items()
+                        if k[0] <= nmax_safe}
+            q2_trunc = {k: v for k, v in swe_full.Q2_coeffs(freq).items()
+                        if k[0] <= nmax_safe}
+
+            swe_trunc = SphericalWaveExpansion(
+                Q1_coeffs={freq: q1_trunc},
+                Q2_coeffs={freq: q2_trunc},
+                NMAX={freq: nmax_safe},
+                MMAX={freq: swe_full.MMAX(freq)},
+            )
+            self.freq_field_pairs.append((freq, swe_trunc, field))
+            print(f"  {freq/1e9:.4f} GHz — NMAX {swe_full.NMAX(freq)} -> {nmax_safe} "
+                  f"(kr_min={kr_min:.1f})")
+
+        # Keep grd metadata for the structural test
+        self.grd_data = grd_data
+
+    def _build_grid(self, field):
+        """Build the planar grid at Z_DISTANCE from .grd extents."""
+        x = np.linspace(field['grid_min_x'], field['grid_max_x'], field['nx'])
+        y = np.linspace(field['grid_min_y'], field['grid_max_y'], field['ny'])
         X, Y = np.meshgrid(x, y)
-        Z = np.full_like(X, Z_DISTANCE)
-        return X, Y, Z
+        return X, Y, np.full_like(X, Z_DISTANCE)
 
     def test_grd_file_loads(self):
-        """Verify .grd file loads with valid structure."""
-        assert self.grd_data['nset'] > 0, "Should have at least one field set"
-        assert len(self.grd_data['fields']) > 0, "Should have field data"
-
+        """Verify .grd file structure."""
+        assert self.grd_data['nset'] > 0
+        assert len(self.grd_data['fields']) > 0
         print(f"\nLoaded .grd: nset={self.grd_data['nset']}, "
               f"icomp={self.grd_data['icomp']}, ncomp={self.grd_data['ncomp']}, "
               f"igrid={self.grd_data['igrid']}")
-        print(f"  Grid: [{self.field['grid_min_x']:.4f}, {self.field['grid_min_y']:.4f}] -> "
-              f"[{self.field['grid_max_x']:.4f}, {self.field['grid_max_y']:.4f}]")
-        print(f"  Size: {self.field['nx']} x {self.field['ny']}")
+        field = self.grd_data['fields'][0]
+        print(f"  Grid (set 0): [{field['grid_min_x']:.4f}, {field['grid_min_y']:.4f}] -> "
+              f"[{field['grid_max_x']:.4f}, {field['grid_max_y']:.4f}], "
+              f"size={field['nx']}x{field['ny']}")
 
     def test_near_field_absolute_vs_grd(self):
         """
-        Compare absolute near-field with .grd reference at z=0.25m.
+        Compare absolute near-field against .grd at z=0.25m for all frequencies.
 
-        Computes near field in spherical coordinates, converts to Ludwig-3,
-        and compares with .grd data (icomp=3: Eco, Ecx).
+        Converts computed E_theta/E_phi to Ludwig-3 (Eco, Ecx) and compares
+        with .grd data (icomp=3: component 0=Eco, 1=Ecx).
         """
-        X, Y, Z = self._get_grid()
+        for freq, swe, field in self.freq_field_pairs:
+            X, Y, Z = self._build_grid(field)
+            r, theta, phi = cartesian_to_spherical(X.ravel(), Y.ravel(), Z.ravel())
 
-        r, theta, phi = cartesian_to_spherical(X.ravel(), Y.ravel(), Z.ravel())
+            (_, E_theta, E_phi), _ = swe.near_field(
+                r, theta, phi, frequency=freq, normalize=False
+            )
 
-        print(f"\n  Computing near field at {len(r)} points, z={Z_DISTANCE}m...")
-        print(f"  SWE: NMAX={self.swe.NMAX(self.freq)}, MMAX={self.swe.MMAX(self.freq)}, "
-              f"freq={self.freq/1e9:.4f} GHz")
+            Eco = spherical_to_ludwig3(E_theta, E_phi, phi)[0].reshape(X.shape)
+            Ecx = spherical_to_ludwig3(E_theta, E_phi, phi)[1].reshape(X.shape)
 
-        (E_r, E_theta, E_phi), _ = self.swe.near_field(
-            r, theta, phi, frequency=self.freq, normalize=False
-        )
-
-        Eco, Ecx = spherical_to_ludwig3(E_theta, E_phi, phi)
-        Eco = Eco.reshape(X.shape)
-        Ecx = Ecx.reshape(X.shape)
-
-        # Reference data from .grd (icomp=3: component 0=Eco, component 1=Ecx)
-        ref_Eco = self.field['data'][:, :, 0]
-        ref_Ecx = self.field['data'][:, :, 1]
-
-        metrics_co = compute_comparison_metrics(
-            Eco, ref_Eco, label="Near-field Eco: SWE vs .grd (absolute)"
-        )
-        metrics_cx = compute_comparison_metrics(
-            Ecx, ref_Ecx, label="Near-field Ecx: SWE vs .grd (absolute)"
-        )
-
-        print(f"\n  Eco scaling ratio: {metrics_co['scaling_ratio']:.6f} (expect ~1.0)")
-        print(f"  Ecx scaling ratio: {metrics_cx['scaling_ratio']:.6f} (expect ~1.0)")
-        print(f"  Eco normalized RMS: {metrics_co['normalized_rms_after_scaling']:.6e}")
-        print(f"  Ecx normalized RMS: {metrics_cx['normalized_rms_after_scaling']:.6e}")
+            met_co = compute_comparison_metrics(
+                Eco, field['data'][:, :, 0],
+                label=f"Near-field Eco {freq/1e9:.4f} GHz: SWE vs .grd"
+            )
+            met_cx = compute_comparison_metrics(
+                Ecx, field['data'][:, :, 1],
+                label=f"Near-field Ecx {freq/1e9:.4f} GHz: SWE vs .grd"
+            )
+            print(f"  {freq/1e9:.4f} GHz — "
+                  f"Eco scale={met_co['scaling_ratio']:.4f}, "
+                  f"Ecx scale={met_cx['scaling_ratio']:.4f}, "
+                  f"Eco nRMS={met_co['normalized_rms_after_scaling']:.2e}")
 
     def test_near_field_not_zero(self):
-        """Sanity check: near field should not be identically zero."""
-        (E_r, E_theta, E_phi), _ = self.swe.near_field(
-            np.array([1.0]), np.array([np.pi / 4]), np.array([0.0]),
-            frequency=self.freq, normalize=False
-        )
-        total = np.abs(E_r) + np.abs(E_theta) + np.abs(E_phi)
-        assert total[0] > 0, "Near field is identically zero at test point"
+        """Sanity check: near field is non-zero at a test point for every frequency."""
+        for freq, swe, _ in self.freq_field_pairs:
+            (E_r, E_theta, E_phi), _ = swe.near_field(
+                np.array([1.0]), np.array([np.pi / 4]), np.array([0.0]),
+                frequency=freq, normalize=False
+            )
+            total = np.abs(E_r) + np.abs(E_theta) + np.abs(E_phi)
+            assert total[0] > 0, f"Near field is zero at {freq/1e9:.4f} GHz"
