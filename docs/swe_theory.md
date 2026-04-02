@@ -238,15 +238,14 @@ where $\mathbf{F}^{E}_{smn}$ and $\mathbf{F}^{H}_{smn}$ are the near-field
 pattern functions defined below.
 
 > **Implementation note**: Hansen's textbook expresses the prefactor as
-> $k\sqrt{\eta_0}$, but that form applies to coefficients with the raw
-> Hansen normalisation. The `.sph` file I/O in this package applies a
-> $1/\sqrt{8\pi}$ factor when reading coefficients (absorbing the
-> $k\sqrt{\eta_0}$ term into the stored $Q$ values). The effective
-> prefactor for the stored coefficients therefore reduces to $\sqrt{4\pi}$
-> for $\mathbf{E}$ and $j\sqrt{4\pi}/\eta_0$ for $\mathbf{H}$, which
-> is what the code implements. The far-field K-function normalisation
-> uses the same convention, ensuring consistency between far-field and
-> near-field outputs.
+> $k\sqrt{\eta_0}$, but that form applies to a particular normalization of
+> the Q coefficients. This package uses the TICRA file convention, in which
+> the internal coefficients are related to the file values by
+> $Q_\text{internal} = -\overline{Q_\text{file}}$ with no additional
+> scaling. The effective prefactor for these coefficients is $\sqrt{4\pi}$
+> for $\mathbf{E}$ and $j\sqrt{4\pi}/\eta_0$ for $\mathbf{H}$.
+> The far-field K-function normalisation uses the same convention,
+> ensuring consistency between far-field and near-field outputs.
 
 ### 5.3 TM Mode ($s = 2$) Electric Field Pattern
 
@@ -430,18 +429,20 @@ For each $|m|$ from $0$ to $M_{\max}$:
      - Second line: coefficients for $+m$:
        $\operatorname{Re}(Q_{1,+m,n}),\; \operatorname{Im}(Q_{1,+m,n}),\; \operatorname{Re}(Q_{2,+m,n}),\; \operatorname{Im}(Q_{2,+m,n})$
 
-### 8.3 Normalization Convention
+### 8.3 Coefficient Convention
 
-TICRA uses a different normalization from the internal Hansen convention. A
-scaling factor of $\sqrt{8\pi}$ is applied during I/O:
+TICRA stores coefficients with a sign and conjugation that differs from the
+convention used internally. The conversion applied during I/O is:
 
-- **Reading**: multiply stored coefficients by $\sqrt{8\pi}$ to convert to
-  Hansen normalization.
-- **Writing**: divide internal coefficients by $\sqrt{8\pi}$ before storing.
+- **Reading**: $Q_\text{internal} = -\overline{Q_\text{file}}$
+  (negate and conjugate the stored value).
+- **Writing**: $Q_\text{file} = -\overline{Q_\text{internal}}$
+  (the exact inverse operation).
 
-This factor arises from the difference between TICRA's power normalization
-(integrated power = $|Q|^2 / 8\pi$) and the Hansen convention (integrated
-power = $|Q|^2$).
+No additional scale factor is applied. This sign/conjugation convention
+matches the TICRA time-dependence ($e^{j\omega t}$) and ensures that the
+pattern functions produce the correct far-field and near-field amplitudes
+when combined with the $\sqrt{4\pi}$ prefactor (Section 5.2).
 
 ---
 
