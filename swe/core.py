@@ -188,113 +188,138 @@ _legendre_cache = LegendreCoefficientCache()
 
 def compute_legendre_recurrence(n_max: int, m: int, cos_theta: np.ndarray) -> np.ndarray:
     """
-    Compute associated Legendre functions P_n^m(cos θ) for all n from m to n_max
-    using recurrence relations. Much faster than calling lpmv repeatedly.
-    
-    Args:
-        n_max: Maximum degree
-        m: Order (can be negative)
-        cos_theta: cos(θ) values, shape (N,)
-    
+    Compute NORMALIZED associated Legendre functions P̄_n^m(cos θ) for all n from
+    |m| to n_max using a fully normalized recurrence.
+
+    Normalization (Hansen convention):
+        P̄_n^m = sqrt((2n+1)/2 * (n-|m|)! / (n+|m|)!) * P_n^m
+
+    The recurrence operates entirely on normalized values, preventing float64
+    overflow at any degree/order (including abs_m > ~143 where the un-normalized
+    P_m^m seed would otherwise exceed 1.8e308).
+
+    Seed P̄_m^m is computed in log-space:
+        log|P̄_m^m| = 0.5*(log(2m+1) - log(2) - lgamma(2m+1))
+                    + lgamma(m+0.5) + m*log(2) - 0.5*log(π)
+                    + m*log(sin θ)
+
+    Normalized recurrence (n > m+1):
+        P̄_n^m = A_nm * cos(θ) * P̄_{n-1}^m - B_nm * P̄_{n-2}^m
+        A_nm = sqrt((4n²-1) / (n²-m²))
+        B_nm = sqrt((2n+1)(n-1-m)(n-1+m) / ((2n-3)(n²-m²)))
+
     Returns:
-        Array of shape (n_max - m + 1, N) containing P_m^m, P_{m+1}^m, ..., P_{n_max}^m
+        Array of shape (n_max - |m| + 1, N) containing P̄_{|m|}^m, ..., P̄_{n_max}^m
+        (already Hansen-normalized; callers must NOT multiply by norm_factor again)
     """
     abs_m = abs(m)
     cos_theta = np.atleast_1d(cos_theta)
     N = len(cos_theta)
-    
-    # Avoid singularities
+
     cos_theta = np.clip(cos_theta, -1.0, 1.0)
     sin_theta = np.sqrt(1 - cos_theta**2)
-    
-    # Number of n values we need
+
     n_count = n_max - abs_m + 1
     P = np.zeros((n_count, N))
-    
+
     if abs_m > n_max:
         return P
-    
-    # Starting value: P_m^m using the formula
-    # P_m^m = (-1)^m * (2m-1)!! * sin^m(θ)
+
+    # -----------------------------------------------------------------
+    # Normalized seed P̄_m^m in log-space to prevent float64 overflow.
+    # log C = 0.5*(log(2m+1) - log(2) - lgamma(2m+1))
+    #        + lgamma(m + 0.5) + m*log(2) - 0.5*log(π)
+    # P̄_m^m = (-1)^m * C * sin^m(θ)   (C > 0 by construction)
+    # -----------------------------------------------------------------
     if abs_m == 0:
-        P[0, :] = 1.0
+        P[0, :] = math.sqrt(0.5)   # P̄_0^0 = sqrt(1/2)
     else:
-        # Double factorial: (2m-1)!! = 1*3*5*...*(2m-1)
-        double_fac = 1.0
-        for i in range(1, 2*abs_m, 2):
-            double_fac *= i
-        P[0, :] = double_fac * (sin_theta ** abs_m)
+        log_C = (0.5 * (math.log(2 * abs_m + 1) - math.log(2) - math.lgamma(2 * abs_m + 1))
+                 + math.lgamma(abs_m + 0.5) + abs_m * math.log(2) - 0.5 * math.log(math.pi))
+        with np.errstate(divide='ignore'):
+            log_sin = np.where(sin_theta > 0.0, np.log(sin_theta), -np.inf)
+        log_seed = log_C + abs_m * log_sin
+        # Clamp to avoid both overflow (>709) and extreme underflow — values
+        # beyond these bounds round to +inf or 0 in float64 anyway.
+        P[0, :] = np.where(np.isfinite(log_seed),
+                           np.exp(np.clip(log_seed, -708.0, 708.0)), 0.0)
         if abs_m % 2 == 1:
             P[0, :] *= -1
-    
+
     if n_count == 1:
         return P
-    
-    # Next value: P_{m+1}^m using specific recurrence
-    # P_{m+1}^m = (2m+1) * cos(θ) * P_m^m
-    if abs_m + 1 <= n_max:
-        P[1, :] = (2 * abs_m + 1) * cos_theta * P[0, :]
-    
-    # General recurrence for n >= m+2:
-    # (n-m) P_n^m = (2n-1) cos(θ) P_{n-1}^m - (n+m-1) P_{n-2}^m
+
+    # -----------------------------------------------------------------
+    # First step: P̄_{m+1}^m = sqrt(2m+3) * cos(θ) * P̄_m^m
+    # (derived from A_{m+1,m} = sqrt((4(m+1)²-1)/((m+1)²-m²)) = sqrt(2m+3))
+    # -----------------------------------------------------------------
+    P[1, :] = math.sqrt(2 * abs_m + 3) * cos_theta * P[0, :]
+
+    # -----------------------------------------------------------------
+    # General normalized recurrence for n >= abs_m + 2:
+    #   P̄_n^m = A_nm * cos(θ) * P̄_{n-1}^m - B_nm * P̄_{n-2}^m
+    # -----------------------------------------------------------------
     for i in range(2, n_count):
         n = abs_m + i
-        coeff1 = (2 * n - 1) / (n - abs_m)
-        coeff2 = (n + abs_m - 1) / (n - abs_m)
-        P[i, :] = coeff1 * cos_theta * P[i-1, :] - coeff2 * P[i-2, :]
-    
+        n2 = n * n
+        m2 = abs_m * abs_m
+        n2m2 = n2 - m2                          # n² - m²
+        A = math.sqrt((4 * n2 - 1) / n2m2)
+        B = math.sqrt((2 * n + 1) * (n - 1 - abs_m) * (n - 1 + abs_m)
+                      / ((2 * n - 3) * n2m2))
+        P[i, :] = A * cos_theta * P[i - 1, :] - B * P[i - 2, :]
+
     return P
 
 
 def compute_legendre_derivative_recurrence(n_max: int, m: int, cos_theta: np.ndarray,
                                            P: np.ndarray = None) -> np.ndarray:
     """
-    Compute derivatives dP_n^m/dθ using recurrence relations.
-    
-    The derivative can be computed from:
-    sin(θ) dP_n^m/dθ = n*cos(θ)*P_n^m - (n+m)*P_{n-1}^m
-    
-    Or for better numerical stability:
-    dP_n^m/dθ = (n*cos(θ)*P_n^m - (n+m)*P_{n-1}^m) / sin(θ)
-    
+    Compute derivatives dP̄_n^m/dθ for the NORMALIZED Legendre functions returned
+    by compute_legendre_recurrence.
+
+    Uses the normalized derivative formula:
+        sin(θ) dP̄_n^m/dθ = n*cos(θ)*P̄_n^m - sqrt((n²-m²)(2n+1)/(2n-1)) * P̄_{n-1}^m
+
+    For n = |m| (seed): P̄_{m-1}^m ≡ 0, so:
+        dP̄_m^m/dθ = |m| * cos(θ)/sin(θ) * P̄_m^m
+
     Args:
         n_max: Maximum degree
         m: Order
         cos_theta: cos(θ) values
-        P: Pre-computed P values (optional, will compute if not provided)
-    
+        P: Pre-computed normalized P̄ values from compute_legendre_recurrence
+           (computed if not provided)
+
     Returns:
-        Array of shape (n_max - |m| + 1, N) containing derivatives
+        Array of shape (n_max - |m| + 1, N) containing dP̄_n^m/dθ
     """
     abs_m = abs(m)
     cos_theta = np.atleast_1d(cos_theta)
     N = len(cos_theta)
-    
+
     cos_theta = np.clip(cos_theta, -1.0, 1.0)
     sin_theta = np.sqrt(1 - cos_theta**2)
-    
-    # Compute P if not provided
+
     if P is None:
         P = compute_legendre_recurrence(n_max, m, cos_theta)
-    
+
     n_count = n_max - abs_m + 1
     dP = np.zeros((n_count, N))
-    
-    # For n = m, special case:
-    # dP_m^m/dθ = m * cos(θ)/sin(θ) * P_m^m
-    # But we need P_{m-1}^m which is 0, so:
-    # sin(θ) dP_m^m/dθ = m*cos(θ)*P_m^m - 0
+
+    safe_sin = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
+
+    # Seed: dP̄_m^m/dθ = abs_m * cos(θ)/sin(θ) * P̄_m^m
     if n_count > 0:
-        # Avoid division by zero at poles
-        safe_sin = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
         dP[0, :] = abs_m * cos_theta * P[0, :] / safe_sin
-    
-    # For n > m, use the recurrence with P_{n-1}^m
+
+    # General: sin(θ)*dP̄_n^m/dθ = n*cos(θ)*P̄_n^m - D_nm * P̄_{n-1}^m
+    # where D_nm = sqrt((n²-m²)(2n+1)/(2n-1))
     for i in range(1, n_count):
         n = abs_m + i
-        safe_sin = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
-        dP[i, :] = (n * cos_theta * P[i, :] - (n + abs_m) * P[i-1, :]) / safe_sin
-    
+        D = math.sqrt((n * n - abs_m * abs_m) * (2 * n + 1) / (2 * n - 1))
+        dP[i, :] = (n * cos_theta * P[i, :] - D * P[i - 1, :]) / safe_sin
+
     return dP
 
 
@@ -318,23 +343,12 @@ def normalized_associated_legendre(n: int, m: int,
     
     abs_m = abs(m)
     
-    # Compute P_n^m for this n and all lower n values using recurrence
-    # We need P_{n-1}^m for the derivative, so compute up to n
+    # compute_legendre_recurrence returns already-normalized P̄_n^m values.
+    # We need up to n so the derivative recurrence has P̄_{n-1}^m available.
     P_all = compute_legendre_recurrence(n, abs(m), cos_theta)
-    
-    # Extract P_n^m (it's the last one in the array)
-    P_n_m = P_all[-1, :]
-    
-    # Compute derivative
     dP_all = compute_legendre_derivative_recurrence(n, abs(m), cos_theta, P_all)
-    dP_n_m_dtheta = dP_all[-1, :]
-    
-    # Apply Hansen normalization
-    norm_factor = _legendre_cache.normalization_factor(n, m)
-    P_norm = norm_factor * P_n_m
-    dP_norm = norm_factor * dP_n_m_dtheta
-    
-    return P_norm, dP_norm
+
+    return P_all[-1, :], dP_all[-1, :]
 
 
 def compute_pole_limits(n: int, m: int, pole: str = 'north') -> Tuple[float, float]:
@@ -438,23 +452,20 @@ def compute_all_modes_legendre(n_max: int, m_max: int,
         P_all = compute_legendre_recurrence(n_max, m, cos_theta)
         dP_all = compute_legendre_derivative_recurrence(n_max, m, cos_theta, P_all)
         
-        # Store normalized results for each n
+        # compute_legendre_recurrence now returns already-normalized P̄_n^m values;
+        # no additional norm_factor multiplication is needed.
         for i, n in enumerate(range(abs_m, n_max + 1)):
             if n < 1:  # Skip n=0 for spherical wave expansion
                 continue
-            
-            norm_factor = _legendre_cache.normalization_factor(n, m)
-            P_norm = norm_factor * P_all[i, :]
-            dP_norm = norm_factor * dP_all[i, :]
-            
-            results[(n, m)] = (P_norm, dP_norm)
+            results[(n, m)] = (P_all[i, :], dP_all[i, :])
     
     return results
 
 def far_field_pattern_functions(n: int, m: int,
                                          theta: np.ndarray,
                                          phi: np.ndarray,
-                                         legendre_cache: Dict = None):
+                                         legendre_cache: Dict = None,
+                                         phase_cache: Dict = None):
     """
     Optimized version that can use pre-computed Legendre functions.
 
@@ -468,6 +479,8 @@ def far_field_pattern_functions(n: int, m: int,
         theta: Polar angles
         phi: Azimuthal angles
         legendre_cache: Optional pre-computed dict from compute_all_modes_legendre
+        phase_cache: Optional dict mapping m -> exp(-1j*m*phi) (avoids recomputing
+                     the same phase for every n at a fixed m value)
 
     Returns:
         (K1_theta, K1_phi), (K2_theta, K2_phi)
@@ -500,7 +513,10 @@ def far_field_pattern_functions(n: int, m: int,
         sign_factor = (-m / abs(m)) ** m
 
     # Ticra sign convention: negative phase progression
-    phase = np.exp(-1j * m * phi)
+    if phase_cache is not None and m in phase_cache:
+        phase = phase_cache[m]
+    else:
+        phase = np.exp(-1j * m * phi)
     i_factor_1 = (1j) ** (n + 1)
     i_factor_2 = (1j) ** (n)
 
@@ -516,8 +532,44 @@ def far_field_pattern_functions(n: int, m: int,
     return (K1_theta, K1_phi), (K2_theta, K2_phi)
 
 
+def _precompute_bessel_numpy(nmax: int, kr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Numpy upward recurrence for spherical Bessel functions (no Numba required).
+
+    Uses the same recurrence as the Numba version:
+        f_{n+1}(x) = (2n+1)/x * f_n(x) - f_{n-1}(x)
+
+    This is stable for y_n (Neumann, growing) and for j_n when n < kr.
+    For n >> kr the j_n recurrence loses relative precision, but this is
+    acceptable in practice because those modes carry negligible power.
+
+    Each recurrence step is a single vectorised numpy operation over all
+    kr values, replacing the 2*(nmax+1) individual scipy calls.
+    """
+    kr = np.where(kr < 1e-30, 1e-30, kr)  # guard against division by zero
+
+    j_all = np.empty((nmax + 1, len(kr)))
+    y_all = np.empty((nmax + 1, len(kr)))
+
+    # Analytic initial values
+    j_all[0] = np.sin(kr) / kr
+    y_all[0] = -np.cos(kr) / kr
+
+    if nmax >= 1:
+        j_all[1] = np.sin(kr) / kr**2 - np.cos(kr) / kr
+        y_all[1] = -np.cos(kr) / kr**2 - np.sin(kr) / kr
+
+    # Upward recurrence: f_{n+1} = (2n+1)/x * f_n - f_{n-1}
+    for n in range(1, nmax):
+        factor = (2 * n + 1) / kr
+        j_all[n + 1] = factor * j_all[n] - j_all[n - 1]
+        y_all[n + 1] = factor * y_all[n] - y_all[n - 1]
+
+    return j_all, y_all
+
+
 def _precompute_bessel_scipy(nmax: int, kr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Scipy-based Bessel pre-computation (fallback when Numba not available)."""
+    """Scipy-based Bessel pre-computation (kept as reference/fallback)."""
     N = len(kr)
     j_all = np.zeros((nmax + 1, N))
     y_all = np.zeros((nmax + 1, N))
@@ -594,7 +646,7 @@ def precompute_spherical_bessel(nmax: int, kr: np.ndarray,
     if use_numba and HAS_NUMBA:
         return _precompute_bessel_numba(nmax, kr)
     else:
-        return _precompute_bessel_scipy(nmax, kr)
+        return _precompute_bessel_numpy(nmax, kr)
 
 
 def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
@@ -1044,7 +1096,7 @@ class SphericalWaveExpansion:
         nmax = self._nmax[frequency]
         mmax = self._mmax[frequency]
 
-        # Calculate power per mode and sort by n
+        # Calculate power per mode
         mode_powers = []
         for (n, m) in all_modes:
             Q1 = q1.get((n, m), 0)
@@ -1054,7 +1106,9 @@ class SphericalWaveExpansion:
 
         total_power = sum(p for _, p in mode_powers)
 
-        # Find effective NMAX based on power threshold
+        # Find effective NMAX based on cumulative n-shell power threshold,
+        # then additionally skip any individual modes with negligible power
+        # (e.g. zero-coefficient m values within an otherwise active n-shell).
         if power_threshold < 1.0 and total_power > 0:
             n_power = {}
             for (n, m), p in mode_powers:
@@ -1068,12 +1122,16 @@ class SphericalWaveExpansion:
                     effective_nmax = n
                     break
 
-            filtered_modes = [(nm, p) for nm, p in mode_powers if nm[0] <= effective_nmax]
+            # Per-mode cutoff: skip modes whose power is negligible relative to total
+            mode_cutoff = 1e-8 * total_power
+            filtered_modes = [(nm, p) for nm, p in mode_powers
+                              if nm[0] <= effective_nmax and p > mode_cutoff]
             if len(filtered_modes) < len(mode_powers):
-                logger.debug(f"Power filtering: using NMAX={effective_nmax} "
-                             f"({len(filtered_modes)}/{len(mode_powers)} modes, "
-                             f"{100*power_threshold:.2f}% power)")
+                logger.debug(f"Power filtering: using NMAX={effective_nmax}, "
+                             f"{len(filtered_modes)}/{len(mode_powers)} modes kept "
+                             f"({100*power_threshold:.2f}% power, per-mode cutoff 1e-8)")
         else:
+            mode_cutoff = 0.0
             filtered_modes = mode_powers
             effective_nmax = nmax
 
@@ -1086,12 +1144,17 @@ class SphericalWaveExpansion:
         effective_mmax = min(mmax, effective_nmax)
         legendre_cache = compute_all_modes_legendre(effective_nmax, effective_mmax, theta)
 
+        # Precompute exp(-1j*m*phi) for each unique m in filtered_modes.
+        # Many n values share the same m, so this avoids redundant complex exponentials.
+        unique_m = {nm[1] for nm, _ in filtered_modes}
+        phase_cache = {m_val: np.exp(-1j * m_val * phi) for m_val in unique_m}
+
         for (n, m), _ in filtered_modes:
             if (n, m) not in legendre_cache:
                 continue
 
             (K1_theta, K1_phi), (K2_theta, K2_phi) = \
-                far_field_pattern_functions(n, m, theta, phi, legendre_cache)
+                far_field_pattern_functions(n, m, theta, phi, legendre_cache, phase_cache)
 
             if (n, m) in q1:
                 E_theta += q1[(n, m)] * K1_theta
@@ -1209,10 +1272,53 @@ class SphericalWaveExpansion:
 
             logger.info(f"Iteration {iteration + 1}: Computing coefficients for NMAX={NMAX}, MMAX={MMAX_current}")
 
+            # ------------------------------------------------------------------
+            # Azimuthal pre-screening: compute m=0 and m=±1 modes first.
+            # If they already account for ≥ power_threshold of extracted power,
+            # cap MMAX_current=1 and skip the remaining |m| values entirely.
+            # This avoids computing thousands of empty modes for rotationally
+            # symmetric or near-symmetric antennas.
+            # ------------------------------------------------------------------
+            if use_adaptive_mmax and MMAX_current > 1:
+                prescreened_mmax = min(1, MMAX_current)
+                leg_pre = compute_all_modes_legendre(NMAX, prescreened_mmax, THETA[:, 0])
+                modes_pre = [(n, m) for n in range(1, NMAX + 1)
+                             for m in range(-min(n, prescreened_mmax), min(n, prescreened_mmax) + 1)]
+                args_pre = [(modes_pre, THETA, PHI, E_THETA, E_PHI, sin_theta,
+                             theta_unique, phi_unique, norm_factor,
+                             {nm: leg_pre[nm] for nm in modes_pre if nm in leg_pre})]
+                pre_results = compute_mode_coefficients_batch(args_pre[0])
+                pre_total = sum(pw for _, _, _, pw in pre_results)
+                all_m01_power = pre_total
+
+                # Estimate full total power by sampling a few higher |m| modes
+                # (m=2,3) to see if they carry significant energy
+                if MMAX_current >= 2:
+                    leg_m2 = compute_all_modes_legendre(min(NMAX, 10), 2, THETA[:, 0])
+                    modes_m2 = [(n, m) for n in range(1, min(NMAX, 10) + 1)
+                                for m in [-2, 2] if abs(m) <= n]
+                    modes_m2 = [nm for nm in modes_m2 if nm in leg_m2]
+                    if modes_m2:
+                        args_m2 = [(modes_m2, THETA, PHI, E_THETA, E_PHI, sin_theta,
+                                    theta_unique, phi_unique, norm_factor,
+                                    {nm: leg_m2[nm] for nm in modes_m2})]
+                        m2_results = compute_mode_coefficients_batch(args_m2[0])
+                        m2_power = sum(pw for _, _, _, pw in m2_results)
+                    else:
+                        m2_power = 0.0
+                else:
+                    m2_power = 0.0
+
+                # If |m|≥2 modes contain < 0.1% of the |m|≤1 power, cap MMAX
+                if all_m01_power > 0 and m2_power / all_m01_power < 0.001:
+                    MMAX_current = 1
+                    logger.info(f"Azimuthal pre-screening: |m|≥2 power is {m2_power/all_m01_power*100:.4f}% "
+                                f"of |m|≤1 power — capping MMAX={MMAX_current}")
+
             # Pre-compute Legendre functions for all modes
             logger.debug("Computing Legendre functions...")
             legendre_cache = compute_all_modes_legendre(NMAX, MMAX_current, THETA[:, 0])
-            
+
             # Build mode list
             modes = []
             for n in range(1, NMAX + 1):
@@ -1558,13 +1664,36 @@ class SphericalWaveExpansion:
             logger.debug("No modes present, returning zero fields")
             return (E_r, E_theta, E_phi), (H_r, H_theta, H_phi)
 
-        legendre_cache = compute_all_modes_legendre(nmax, mmax, theta)
+        # Filter modes by cumulative power threshold (mirrors far_field logic)
+        total_power = sum(abs(q1.get(k, 0))**2 + abs(q2.get(k, 0))**2 for k in all_modes)
+        if total_power > 0:
+            n_power = {}
+            for (n_k, m_k) in all_modes:
+                n_power[n_k] = n_power.get(n_k, 0) + abs(q1.get((n_k, m_k), 0))**2 + abs(q2.get((n_k, m_k), 0))**2
+            cumulative = 0
+            effective_nmax = nmax
+            for n_k in sorted(n_power.keys()):
+                cumulative += n_power[n_k]
+                if cumulative >= 0.999 * total_power:
+                    effective_nmax = n_k
+                    break
+            effective_mmax = min(mmax, effective_nmax)
+            active_modes = {(n_k, m_k) for (n_k, m_k) in all_modes if n_k <= effective_nmax}
+            if len(active_modes) < len(all_modes):
+                logger.debug(f"Near-field power filtering: using NMAX={effective_nmax} "
+                             f"({len(active_modes)}/{len(all_modes)} modes, 99.9% power)")
+        else:
+            active_modes = all_modes
+            effective_nmax = nmax
+            effective_mmax = mmax
 
-        # Pre-compute ALL spherical Bessel functions for n=0 to NMAX
+        legendre_cache = compute_all_modes_legendre(effective_nmax, effective_mmax, theta)
+
+        # Pre-compute ALL spherical Bessel functions for n=0 to effective_nmax
         # (Bessel functions depend on (n, kr) only, not on m)
         k = self.k(frequency)
         kr = k * r.ravel()
-        bessel_cache = precompute_spherical_bessel(nmax, kr)
+        bessel_cache = precompute_spherical_bessel(effective_nmax, kr)
 
         # Scaling prefactors for near-field E and H.
         # TICRA's internal convention is Q_internal = -conj(Q_file) with no extra scaling.
@@ -1573,7 +1702,7 @@ class SphericalWaveExpansion:
         E_prefactor = np.sqrt(4 * np.pi)
         H_prefactor = 1j * np.sqrt(4 * np.pi) / Z0
 
-        for (n, m) in all_modes:
+        for (n, m) in active_modes:
             F1_E, F2_E, F1_H, F2_H = near_field_pattern_functions(
                 n, m, r, theta, phi, k, legendre_cache, bessel_cache
             )
