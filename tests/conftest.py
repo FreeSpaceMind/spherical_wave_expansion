@@ -32,7 +32,8 @@ requires_grd = pytest.mark.skipif(GRD_FILE is None, reason="example.grd not foun
 # Shared constants for multi-frequency test data
 Z_DISTANCE = 0.25          # meters, z-distance for .grd planar scan
 N_PHI_PER_FREQ = 37        # phi cuts per frequency in .cut file
-FREQ_INDEX_8GHZ = 0        # index of 8 GHz in multi-freq .cut/.grd
+FREQ_INDEX_8GHZ = 0        # index of 8 GHz in multi-freq .cut/.grd (0-based)
+FREQ_8GHZ = 8.0e9          # 8 GHz in Hz — first frequency block in example files
 
 
 # ==============================================================================

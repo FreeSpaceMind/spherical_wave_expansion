@@ -2,12 +2,10 @@
 
 ## High Priority
 
-### Full multi-frequency support
-Currently only one frequency is processed at a time (via `freq_index` parameter).
-- Read all 9 frequencies from .sph file into a single object or frequency-indexed structure
-- Support multi-frequency .cut comparison (333 cuts = 37 phi x 9 frequencies)
-- Support multi-frequency .grd comparison (9 field sets)
-- Add frequency sweep/interpolation utilities
+### Add frequency sweep/interpolation utilities
+Multi-frequency support is now implemented (SphericalWaveExpansion stores all
+frequencies in a single object, keyed by frequency in Hz). A useful follow-on
+would be interpolation across loaded frequencies for fine frequency resolution.
 
 ## Medium Priority
 

@@ -28,23 +28,30 @@ class TestSphToNearField:
         self.grd_data = read_grasp_grd(GRD_FILE)
         self.field = self.grd_data['fields'][FREQ_INDEX_8GHZ]
 
+        # Use the first frequency (8 GHz) — matches FREQ_INDEX_8GHZ in the .grd
+        self.freq = swe_full.frequencies[FREQ_INDEX_8GHZ]
+
         # Truncate modes for near-field safety: n must be < kr_min to avoid
         # overflow in spherical Bessel functions. kr_min corresponds to the
         # closest grid point (smallest r).
-        x_max = max(abs(self.field['grid_min_x']), abs(self.field['grid_max_x']))
-        y_max = max(abs(self.field['grid_min_y']), abs(self.field['grid_max_y']))
         r_min = Z_DISTANCE  # on-axis point has smallest r
-        kr_min = swe_full.k * r_min
+        kr_min = swe_full.k(self.freq) * r_min
         nmax_safe = int(kr_min) - 5  # conservative margin
-        nmax_safe = max(nmax_safe, swe_full.MMAX)
+        nmax_safe = max(nmax_safe, swe_full.MMAX(self.freq))
 
-        Q1_trunc = {(n, m): v for (n, m), v in swe_full.Q1_coeffs.items() if n <= nmax_safe}
-        Q2_trunc = {(n, m): v for (n, m), v in swe_full.Q2_coeffs.items() if n <= nmax_safe}
+        q1_all = swe_full.Q1_coeffs(self.freq)
+        q2_all = swe_full.Q2_coeffs(self.freq)
+        Q1_trunc = {(n, m): v for (n, m), v in q1_all.items() if n <= nmax_safe}
+        Q2_trunc = {(n, m): v for (n, m), v in q2_all.items() if n <= nmax_safe}
+
         self.swe = SphericalWaveExpansion(
-            Q1_trunc, Q2_trunc, swe_full.frequency,
-            NMAX=nmax_safe, MMAX=swe_full.MMAX
+            Q1_coeffs={self.freq: Q1_trunc},
+            Q2_coeffs={self.freq: Q2_trunc},
+            NMAX={self.freq: nmax_safe},
+            MMAX={self.freq: swe_full.MMAX(self.freq)},
         )
-        print(f"\n  Truncated NMAX: {swe_full.NMAX} -> {nmax_safe} (kr_min={kr_min:.1f})")
+        print(f"\n  Truncated NMAX: {swe_full.NMAX(self.freq)} -> {nmax_safe} "
+              f"(kr_min={kr_min:.1f})")
 
     def _get_grid(self):
         """Build the planar grid at z=Z_DISTANCE from .grd extents."""
@@ -77,19 +84,16 @@ class TestSphToNearField:
         """
         X, Y, Z = self._get_grid()
 
-        # Convert grid to spherical coordinates
         r, theta, phi = cartesian_to_spherical(X.ravel(), Y.ravel(), Z.ravel())
 
         print(f"\n  Computing near field at {len(r)} points, z={Z_DISTANCE}m...")
-        print(f"  SWE: NMAX={self.swe.NMAX}, MMAX={self.swe.MMAX}, "
-              f"freq={self.swe.frequency/1e9:.4f} GHz")
+        print(f"  SWE: NMAX={self.swe.NMAX(self.freq)}, MMAX={self.swe.MMAX(self.freq)}, "
+              f"freq={self.freq/1e9:.4f} GHz")
 
-        # Compute near field in spherical coordinates (absolute, unnormalized)
         (E_r, E_theta, E_phi), _ = self.swe.near_field(
-            r, theta, phi, normalize=False
+            r, theta, phi, frequency=self.freq, normalize=False
         )
 
-        # Convert to Ludwig-3
         Eco, Ecx = spherical_to_ludwig3(E_theta, E_phi, phi)
         Eco = Eco.reshape(X.shape)
         Ecx = Ecx.reshape(X.shape)
@@ -112,11 +116,9 @@ class TestSphToNearField:
 
     def test_near_field_not_zero(self):
         """Sanity check: near field should not be identically zero."""
-        r, theta, phi = 1.0, np.pi / 4, 0.0
-        if self.swe.frequency is not None:
-            (E_r, E_theta, E_phi), _ = self.swe.near_field(
-                np.array([r]), np.array([theta]), np.array([phi]),
-                normalize=False
-            )
-            total = np.abs(E_r) + np.abs(E_theta) + np.abs(E_phi)
-            assert total[0] > 0, "Near field is identically zero at test point"
+        (E_r, E_theta, E_phi), _ = self.swe.near_field(
+            np.array([1.0]), np.array([np.pi / 4]), np.array([0.0]),
+            frequency=self.freq, normalize=False
+        )
+        total = np.abs(E_r) + np.abs(E_theta) + np.abs(E_phi)
+        assert total[0] > 0, "Near field is identically zero at test point"

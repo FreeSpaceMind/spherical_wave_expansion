@@ -46,7 +46,7 @@ import math
 import numpy as np
 from scipy.special import lpmv, spherical_jn, spherical_yn
 from scipy.optimize import lsq_linear
-from typing import Dict, Tuple, Optional, Union
+from typing import Dict, List, Tuple, Optional, Union
 import warnings
 from multiprocessing import Pool
 import os
@@ -808,115 +808,200 @@ def compute_mode_coefficients_batch_trapz(args):
 
 class SphericalWaveExpansion:
     """
-    Spherical Wave Expansion representation of electromagnetic fields.
-    
-    Attributes:
-        Q1_coeffs: Dictionary of Q₁ coefficients with keys (n, m)
-        Q2_coeffs: Dictionary of Q₂ coefficients with keys (n, m)
-        frequency: Frequency in Hz
-        k: Wavenumber in rad/m
-        NMAX: Maximum degree
-        MMAX: Maximum order
+    Multi-frequency Spherical Wave Expansion representation of electromagnetic fields.
+
+    Stores Q₁ and Q₂ coefficients for one or more frequencies.  All compute
+    methods (far_field, near_field, …) require an explicit ``frequency``
+    argument so that the caller selects which frequency block to evaluate.
+
+    Typical usage::
+
+        swe = SphericalWaveExpansion.from_sph_file("antenna.sph")
+        for f in swe.frequencies:
+            Et, Ep = swe.far_field(theta, phi, frequency=f)
+
+    Attributes (per-frequency, accessed via methods):
+        frequencies : sorted list of loaded frequencies in Hz
+        Q1_coeffs(f): Dict[(n, m) -> complex] for frequency f
+        Q2_coeffs(f): Dict[(n, m) -> complex] for frequency f
+        NMAX(f)     : maximum degree for frequency f
+        MMAX(f)     : maximum order  for frequency f
+        k(f)        : wavenumber (rad/m) for frequency f
+        wavelength(f): wavelength (m) for frequency f
+        total_power(f): Σ(|Q1|²+|Q2|²) for frequency f
     """
-    
-    def __init__(self, 
-                 Q1_coeffs: Optional[Dict[Tuple[int, int], complex]] = None,
-                 Q2_coeffs: Optional[Dict[Tuple[int, int], complex]] = None,
-                 frequency: Optional[float] = None,
-                 NMAX: Optional[int] = None,
-                 MMAX: Optional[int] = None):
+
+    _C = 299792458.0  # speed of light (m/s)
+
+    def __init__(self,
+                 Q1_coeffs: Optional[Dict[float, Dict[Tuple[int, int], complex]]] = None,
+                 Q2_coeffs: Optional[Dict[float, Dict[Tuple[int, int], complex]]] = None,
+                 NMAX: Optional[Dict[float, int]] = None,
+                 MMAX: Optional[Dict[float, int]] = None):
         """
-        Initialize SWE object.
-        
+        Initialize a multi-frequency SWE object.
+
         Args:
-            Q1_coeffs: Q₁ coefficients dictionary
-            Q2_coeffs: Q₂ coefficients dictionary
-            frequency: Frequency in Hz
-            NMAX: Maximum degree (auto-detected if None)
-            MMAX: Maximum order (auto-detected if None)
+            Q1_coeffs: ``{freq_Hz: {(n, m): complex}}`` mapping for Q₁ modes.
+            Q2_coeffs: ``{freq_Hz: {(n, m): complex}}`` mapping for Q₂ modes.
+            NMAX: ``{freq_Hz: int}`` maximum degree per frequency.
+                  Auto-detected from coefficient keys when omitted.
+            MMAX: ``{freq_Hz: int}`` maximum order per frequency.
+                  Auto-detected from coefficient keys when omitted.
         """
-        self.Q1_coeffs = Q1_coeffs if Q1_coeffs is not None else {}
-        self.Q2_coeffs = Q2_coeffs if Q2_coeffs is not None else {}
-        self._frequency = frequency
+        self._Q1: Dict[float, Dict[Tuple[int, int], complex]] = (
+            Q1_coeffs if Q1_coeffs is not None else {}
+        )
+        self._Q2: Dict[float, Dict[Tuple[int, int], complex]] = (
+            Q2_coeffs if Q2_coeffs is not None else {}
+        )
 
-        # Auto-detect NMAX and MMAX if not provided
-        if NMAX is None or MMAX is None:
-            all_keys = list(self.Q1_coeffs.keys()) + list(self.Q2_coeffs.keys())
-            if all_keys:
-                self.NMAX = max(n for n, m in all_keys)
-                self.MMAX = max(abs(m) for n, m in all_keys)
-                logger.debug(f"Auto-detected NMAX={self.NMAX}, MMAX={self.MMAX} from {len(all_keys)} mode keys")
+        # Ensure every frequency present in Q1 also exists in Q2 and vice versa
+        all_freqs = set(self._Q1.keys()) | set(self._Q2.keys())
+        for f in all_freqs:
+            self._Q1.setdefault(f, {})
+            self._Q2.setdefault(f, {})
+
+        # Build per-frequency NMAX / MMAX
+        self._nmax: Dict[float, int] = {}
+        self._mmax: Dict[float, int] = {}
+        for f in all_freqs:
+            all_keys = list(self._Q1[f].keys()) + list(self._Q2[f].keys())
+            if NMAX is not None and f in NMAX:
+                self._nmax[f] = NMAX[f]
+            elif all_keys:
+                self._nmax[f] = max(n for n, m in all_keys)
             else:
-                self.NMAX = NMAX if NMAX is not None else 0
-                self.MMAX = MMAX if MMAX is not None else 0
-        else:
-            self.NMAX = NMAX
-            self.MMAX = MMAX
+                self._nmax[f] = 0
 
-        n_modes = len(self.Q1_coeffs) + len(self.Q2_coeffs)
-        if n_modes > 0:
-            logger.debug(f"SphericalWaveExpansion initialized: NMAX={self.NMAX}, MMAX={self.MMAX}, {len(self.Q1_coeffs)} Q1 modes, {len(self.Q2_coeffs)} Q2 modes")
-    
-    @property
-    def frequency(self) -> Optional[float]:
-        """Frequency in Hz."""
-        return self._frequency
-    
-    @frequency.setter
-    def frequency(self, freq: float):
-        """Set frequency in Hz."""
-        self._frequency = freq
-    
-    @property
-    def k(self) -> Optional[float]:
-        """Wavenumber in rad/m."""
-        if self._frequency is None:
-            return None
-        return 2 * np.pi * self._frequency / 299792458.0
-    
-    @property
-    def wavelength(self) -> Optional[float]:
-        """Wavelength in meters."""
-        if self._frequency is None:
-            return None
-        return 299792458.0 / self._frequency
+            if MMAX is not None and f in MMAX:
+                self._mmax[f] = MMAX[f]
+            elif all_keys:
+                self._mmax[f] = max(abs(m) for n, m in all_keys)
+            else:
+                self._mmax[f] = 0
+
+        if all_freqs:
+            for f in sorted(all_freqs):
+                logger.debug(
+                    f"SphericalWaveExpansion: {f/1e9:.4f} GHz — "
+                    f"NMAX={self._nmax[f]}, MMAX={self._mmax[f]}, "
+                    f"{len(self._Q1[f])} Q1 modes, {len(self._Q2[f])} Q2 modes"
+                )
+
+    # ------------------------------------------------------------------
+    # Per-frequency accessors
+    # ------------------------------------------------------------------
 
     @property
-    def total_power(self) -> float:
-        """Total power in the SWE coefficients: Σ(|Q1|² + |Q2|²).
+    def frequencies(self) -> List[float]:
+        """Sorted list of loaded frequencies in Hz."""
+        return sorted(self._Q1.keys())
 
-        Used for directivity normalization. When coefficients are normalized
-        (via normalize_coefficients()), total_power = 1.0 and the far field
-        with normalize=True gives |E|² = directivity.
+    def _validate_freq(self, freq: float) -> None:
+        """Raise KeyError with a helpful message if *freq* is not loaded."""
+        if freq not in self._Q1:
+            avail = [f"{f/1e9:.4f}" for f in sorted(self._Q1.keys())]
+            raise KeyError(
+                f"Frequency {freq/1e9:.4f} GHz not found. "
+                f"Available: [{', '.join(avail)}] GHz"
+            )
+
+    def Q1_coeffs(self, freq: float) -> Dict[Tuple[int, int], complex]:
+        """Return Q₁ coefficient dict for *freq* (Hz)."""
+        self._validate_freq(freq)
+        return self._Q1[freq]
+
+    def Q2_coeffs(self, freq: float) -> Dict[Tuple[int, int], complex]:
+        """Return Q₂ coefficient dict for *freq* (Hz)."""
+        self._validate_freq(freq)
+        return self._Q2[freq]
+
+    def NMAX(self, freq: float) -> int:
+        """Maximum degree for *freq* (Hz)."""
+        self._validate_freq(freq)
+        return self._nmax[freq]
+
+    def MMAX(self, freq: float) -> int:
+        """Maximum order for *freq* (Hz)."""
+        self._validate_freq(freq)
+        return self._mmax[freq]
+
+    def k(self, freq: float) -> float:
+        """Wavenumber in rad/m for *freq* (Hz)."""
+        return 2 * np.pi * freq / self._C
+
+    def wavelength(self, freq: float) -> float:
+        """Wavelength in metres for *freq* (Hz)."""
+        return self._C / freq
+
+    def total_power(self, freq: float) -> float:
+        """Total power Σ(|Q1|²+|Q2|²) for *freq* (Hz).
+
+        When coefficients are normalized (normalize_coefficients()),
+        total_power == 1.0 and far_field/near_field with normalize=True
+        give directivity-referenced fields.
         """
-        power = 0.0
-        for Q in self.Q1_coeffs.values():
-            power += abs(Q) ** 2
-        for Q in self.Q2_coeffs.values():
-            power += abs(Q) ** 2
+        self._validate_freq(freq)
+        power = sum(abs(Q)**2 for Q in self._Q1[freq].values())
+        power += sum(abs(Q)**2 for Q in self._Q2[freq].values())
         return power
 
-    def normalize_coefficients(self):
-        """Normalize Q coefficients so that total_power = 1.
+    # ------------------------------------------------------------------
+    # Coefficient normalization
+    # ------------------------------------------------------------------
+
+    def normalize_coefficients(self, freq: Optional[float] = None) -> None:
+        """Normalize Q coefficients so that total_power == 1.
 
         After normalization, far_field(normalize=True) and
         near_field(normalize=True) produce directivity-referenced fields
-        regardless of the original coefficient convention (TICRA, Hansen, etc.).
+        regardless of the original coefficient convention.
 
-        This makes the SWE object convention-independent for downstream use.
+        Args:
+            freq: Frequency (Hz) to normalize.  When *None* (default), all
+                  stored frequencies are normalized.
         """
-        tp = self.total_power
-        if tp <= 0:
-            logger.warning("Cannot normalize: total_power is zero")
-            return
-        norm = np.sqrt(tp)
-        logger.debug(f"Normalizing coefficients: total_power={tp:.6f}, dividing by {norm:.6f}")
-        for key in self.Q1_coeffs:
-            self.Q1_coeffs[key] /= norm
-        for key in self.Q2_coeffs:
-            self.Q2_coeffs[key] /= norm
+        freqs = [freq] if freq is not None else list(self._Q1.keys())
+        for f in freqs:
+            tp = self.total_power(f)
+            if tp <= 0:
+                logger.warning(f"Cannot normalize {f/1e9:.4f} GHz: total_power is zero")
+                continue
+            norm = np.sqrt(tp)
+            logger.debug(f"Normalizing {f/1e9:.4f} GHz: total_power={tp:.6f}, norm={norm:.6f}")
+            for key in self._Q1[f]:
+                self._Q1[f][key] /= norm
+            for key in self._Q2[f]:
+                self._Q2[f][key] /= norm
+
+    # ------------------------------------------------------------------
+    # Multi-frequency merge helper
+    # ------------------------------------------------------------------
+
+    def add_frequency(self, other: 'SphericalWaveExpansion') -> None:
+        """Merge all frequency blocks from *other* into this object.
+
+        Args:
+            other: Another SphericalWaveExpansion whose frequencies will be
+                   added to this one.
+
+        Raises:
+            ValueError: If any frequency in *other* already exists here.
+        """
+        conflicts = set(other._Q1.keys()) & set(self._Q1.keys())
+        if conflicts:
+            cstr = ', '.join(f"{f/1e9:.4f} GHz" for f in sorted(conflicts))
+            raise ValueError(f"Frequencies already present: {cstr}")
+        for f in other.frequencies:
+            self._Q1[f] = dict(other._Q1[f])
+            self._Q2[f] = dict(other._Q2[f])
+            self._nmax[f] = other._nmax[f]
+            self._mmax[f] = other._mmax[f]
+        logger.debug(f"add_frequency: added {len(other.frequencies)} block(s)")
 
     def far_field(self, theta: np.ndarray, phi: np.ndarray,
+                  frequency: float,
                   power_threshold: float = 0.999,
                   normalize: bool = True) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -929,6 +1014,7 @@ class SphericalWaveExpansion:
         Args:
             theta: Polar angle(s) in radians
             phi: Azimuthal angle(s) in radians
+            frequency: Frequency in Hz (must be a loaded frequency)
             power_threshold: Only include modes containing this fraction of total power.
                            Default 0.999 (99.9%) filters out noise in high-n modes
                            that can cause boresight artifacts. Set to 1.0 to include all modes.
@@ -939,8 +1025,7 @@ class SphericalWaveExpansion:
             E_theta: Theta component of electric field
             E_phi: Phi component of electric field
         """
-        if self.k is None:
-            raise ValueError("Frequency must be set before computing far field")
+        self._validate_freq(frequency)
 
         theta = np.atleast_1d(theta)
         phi = np.atleast_1d(phi)
@@ -948,8 +1033,11 @@ class SphericalWaveExpansion:
         if theta.shape != phi.shape:
             theta, phi = np.broadcast_arrays(theta, phi)
 
+        q1 = self._Q1[frequency]
+        q2 = self._Q2[frequency]
+
         # Compute mode powers and filter by cumulative power threshold
-        all_modes = set(self.Q1_coeffs.keys()) | set(self.Q2_coeffs.keys())
+        all_modes = set(q1.keys()) | set(q2.keys())
 
         if not all_modes:
             logger.debug("No modes present, returning zero field")
@@ -957,11 +1045,14 @@ class SphericalWaveExpansion:
             E_phi = np.zeros_like(phi, dtype=complex)
             return E_theta, E_phi
 
+        nmax = self._nmax[frequency]
+        mmax = self._mmax[frequency]
+
         # Calculate power per mode and sort by n
         mode_powers = []
         for (n, m) in all_modes:
-            Q1 = self.Q1_coeffs.get((n, m), 0)
-            Q2 = self.Q2_coeffs.get((n, m), 0)
+            Q1 = q1.get((n, m), 0)
+            Q2 = q2.get((n, m), 0)
             power = abs(Q1)**2 + abs(Q2)**2
             mode_powers.append(((n, m), power))
 
@@ -969,37 +1060,36 @@ class SphericalWaveExpansion:
 
         # Find effective NMAX based on power threshold
         if power_threshold < 1.0 and total_power > 0:
-            # Sum power by n and find cutoff
             n_power = {}
             for (n, m), p in mode_powers:
                 n_power[n] = n_power.get(n, 0) + p
 
             cumulative = 0
-            effective_nmax = self.NMAX
+            effective_nmax = nmax
             for n in sorted(n_power.keys()):
                 cumulative += n_power[n]
                 if cumulative >= power_threshold * total_power:
                     effective_nmax = n
                     break
 
-            # Filter modes
             filtered_modes = [(nm, p) for nm, p in mode_powers if nm[0] <= effective_nmax]
             if len(filtered_modes) < len(mode_powers):
-                logger.debug(f"Power filtering: using NMAX={effective_nmax} ({len(filtered_modes)}/{len(mode_powers)} modes, {100*power_threshold:.2f}% power)")
+                logger.debug(f"Power filtering: using NMAX={effective_nmax} "
+                             f"({len(filtered_modes)}/{len(mode_powers)} modes, "
+                             f"{100*power_threshold:.2f}% power)")
         else:
             filtered_modes = mode_powers
-            effective_nmax = self.NMAX
+            effective_nmax = nmax
 
-        logger.debug(f"Computing far field at {len(theta.flatten())} points, effective NMAX={effective_nmax}")
+        logger.debug(f"Computing far field at {len(theta.flatten())} points, "
+                     f"effective NMAX={effective_nmax}")
 
         E_theta = np.zeros_like(theta, dtype=complex)
         E_phi = np.zeros_like(phi, dtype=complex)
 
-        # PRE-COMPUTE ALL LEGENDRE FUNCTIONS AT ONCE
-        effective_mmax = min(self.MMAX, effective_nmax)
+        effective_mmax = min(mmax, effective_nmax)
         legendre_cache = compute_all_modes_legendre(effective_nmax, effective_mmax, theta)
 
-        # Now loop through filtered modes
         for (n, m), _ in filtered_modes:
             if (n, m) not in legendre_cache:
                 continue
@@ -1007,15 +1097,13 @@ class SphericalWaveExpansion:
             (K1_theta, K1_phi), (K2_theta, K2_phi) = \
                 far_field_pattern_functions(n, m, theta, phi, legendre_cache)
 
-            if (n, m) in self.Q1_coeffs:
-                Q1 = self.Q1_coeffs[(n, m)]
-                E_theta += Q1 * K1_theta
-                E_phi += Q1 * K1_phi
+            if (n, m) in q1:
+                E_theta += q1[(n, m)] * K1_theta
+                E_phi += q1[(n, m)] * K1_phi
 
-            if (n, m) in self.Q2_coeffs:
-                Q2 = self.Q2_coeffs[(n, m)]
-                E_theta += Q2 * K2_theta
-                E_phi += Q2 * K2_phi
+            if (n, m) in q2:
+                E_theta += q2[(n, m)] * K2_theta
+                E_phi += q2[(n, m)] * K2_phi
 
         # Normalize so |E|² = directivity (matching TICRA .cut/.ffd convention)
         if normalize and total_power > 0:
@@ -1322,11 +1410,16 @@ class SphericalWaveExpansion:
                     f"SWE extraction complete: NMAX={NMAX_truncated}, MMAX={MMAX_truncated}, "
                     f"retained power={retained_fraction*100:.2f}%, {len(Q1_final)} modes"
                 )
-                swe = cls(Q1_final, Q2_final, frequency, NMAX_truncated, MMAX_truncated)
+                swe = cls(
+                    {frequency: Q1_final},
+                    {frequency: Q2_final},
+                    NMAX={frequency: NMAX_truncated},
+                    MMAX={frequency: MMAX_truncated},
+                )
                 if normalize:
                     swe.normalize_coefficients()
                 return swe
-            
+
             else:
                 # Need more modes
                 logger.debug(f"High mode power fraction {high_mode_fraction*100:.2f}% exceeds threshold, increasing NMAX from {NMAX} to {NMAX + 50}")
@@ -1342,7 +1435,12 @@ class SphericalWaveExpansion:
             "Results may be inaccurate.",
             UserWarning
         )
-        swe = cls(Q1_coeffs, Q2_coeffs, frequency, NMAX, MMAX_current)
+        swe = cls(
+            {frequency: Q1_coeffs},
+            {frequency: Q2_coeffs},
+            NMAX={frequency: NMAX},
+            MMAX={frequency: MMAX_current},
+        )
         if normalize:
             swe.normalize_coefficients()
         return swe
@@ -1350,7 +1448,9 @@ class SphericalWaveExpansion:
     @classmethod
     def from_sph_file(cls, filename: str, normalize: bool = True) -> 'SphericalWaveExpansion':
         """
-        Create SWE object from TICRA .sph file.
+        Create a multi-frequency SWE object from a TICRA .sph file.
+
+        All frequency blocks present in the file are loaded.
 
         Note:
             When exporting .sph files from TICRA/GRASP, enable power normalization
@@ -1361,61 +1461,66 @@ class SphericalWaveExpansion:
         Args:
             filename: Path to .sph file
             normalize: If True (default), normalize coefficients so total_power=1
-                      (directivity-referenced fields). If False, preserve original
-                      absolute scaling for comparison with GRASP reference data.
+                      per frequency (directivity-referenced fields). If False,
+                      preserve absolute scaling for comparison with GRASP data.
 
         Returns:
-            SphericalWaveExpansion object
+            SphericalWaveExpansion object with all frequencies loaded.
         """
         logger.info(f"Creating SphericalWaveExpansion from file: {filename}")
-        data = read_ticra_sph(filename)
+        blocks = read_ticra_sph(filename)
 
-        # Convert frequency from GHz to Hz
-        frequency = data['frequency'] * 1e9 if data['frequency'] is not None else None
+        Q1_all: Dict[float, Dict[Tuple[int, int], complex]] = {}
+        Q2_all: Dict[float, Dict[Tuple[int, int], complex]] = {}
+        nmax_all: Dict[float, int] = {}
+        mmax_all: Dict[float, int] = {}
 
-        swe = cls(
-            Q1_coeffs=data['Q1_coeffs'],
-            Q2_coeffs=data['Q2_coeffs'],
-            frequency=frequency,
-            NMAX=data['NMAX'],
-            MMAX=data['MMAX']
-        )
+        for block in blocks:
+            freq_hz = block['frequency'] * 1e9 if block['frequency'] is not None else 0.0
+            Q1_all[freq_hz] = block['Q1_coeffs']
+            Q2_all[freq_hz] = block['Q2_coeffs']
+            nmax_all[freq_hz] = block['NMAX']
+            mmax_all[freq_hz] = block['MMAX']
+
+        swe = cls(Q1_coeffs=Q1_all, Q2_coeffs=Q2_all,
+                  NMAX=nmax_all, MMAX=mmax_all)
 
         if normalize:
-            # Normalize so total_power = 1, making the SWE convention-independent.
-            # This ensures TICRA, Hansen, and from_far_field coefficients all
-            # produce identical near/far fields after normalization.
             swe.normalize_coefficients()
 
         return swe
-    
+
     def to_sph_file(self, filename: str,
-                   NTHE: int = 181, NPHI: int = 361,
-                   description: str = "Generated by SWE module"):
+                    NTHE: int = 181, NPHI: int = 361,
+                    description: str = "Generated by SWE module"):
         """
-        Write SWE object to TICRA .sph file.
+        Write all frequency blocks in this SWE object to a TICRA .sph file.
 
         Args:
             filename: Output file path
-            NTHE: Number of theta samples (for header)
-            NPHI: Number of phi samples (for header)
-            description: Description text
+            NTHE: Number of theta samples written in every block header
+            NPHI: Number of phi samples written in every block header
+            description: Description text written in every block header
         """
         logger.info(f"Writing SphericalWaveExpansion to file: {filename}")
-        write_ticra_sph(
-            filename,
-            self.Q1_coeffs,
-            self.Q2_coeffs,
-            self.frequency / 1e9 if self.frequency is not None else 1.0,
-            NTHE, NPHI,
-            self.NMAX, self.MMAX,
-            description
-        )
+        freq_data_list = []
+        for freq in self.frequencies:
+            freq_data_list.append({
+                'Q1_coeffs': self._Q1[freq],
+                'Q2_coeffs': self._Q2[freq],
+                'frequency_GHz': freq / 1e9,
+                'NMAX': self._nmax[freq],
+                'MMAX': self._mmax[freq],
+                'NTHE': NTHE,
+                'NPHI': NPHI,
+            })
+        write_ticra_sph(filename, freq_data_list, description)
     
     def near_field(self, r: np.ndarray, theta: np.ndarray, phi: np.ndarray,
+                   frequency: float,
                    normalize: bool = True) -> \
             Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray],
-                Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+                  Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """
         Calculate near-field E and H components.
 
@@ -1433,6 +1538,7 @@ class SphericalWaveExpansion:
             r: Radial distance(s) in meters
             theta: Polar angle(s) in radians
             phi: Azimuthal angle(s) in radians
+            frequency: Frequency in Hz (must be a loaded frequency)
             normalize: If True (default), divide by sqrt(total_power) for
                       consistency with directivity-normalized far field.
 
@@ -1440,8 +1546,7 @@ class SphericalWaveExpansion:
             E: Tuple of (E_r, E_theta, E_phi) in V/m
             H: Tuple of (H_r, H_theta, H_phi) in A/m
         """
-        if self.k is None:
-            raise ValueError("Frequency must be set before computing near field")
+        self._validate_freq(frequency)
 
         r = np.atleast_1d(r)
         theta = np.atleast_1d(theta)
@@ -1450,9 +1555,14 @@ class SphericalWaveExpansion:
         if not (r.shape == theta.shape == phi.shape):
             r, theta, phi = np.broadcast_arrays(r, theta, phi)
 
-        logger.debug(f"Computing near field at {len(r.flatten())} points, NMAX={self.NMAX}, MMAX={self.MMAX}")
+        nmax = self._nmax[frequency]
+        mmax = self._mmax[frequency]
+        q1 = self._Q1[frequency]
+        q2 = self._Q2[frequency]
 
-        # Initialize output arrays
+        logger.debug(f"Computing near field at {len(r.flatten())} points, "
+                     f"NMAX={nmax}, MMAX={mmax}")
+
         E_r = np.zeros_like(r, dtype=complex)
         E_theta = np.zeros_like(theta, dtype=complex)
         E_phi = np.zeros_like(phi, dtype=complex)
@@ -1460,19 +1570,19 @@ class SphericalWaveExpansion:
         H_theta = np.zeros_like(theta, dtype=complex)
         H_phi = np.zeros_like(phi, dtype=complex)
 
-        all_modes = set(self.Q1_coeffs.keys()) | set(self.Q2_coeffs.keys())
+        all_modes = set(q1.keys()) | set(q2.keys())
 
         if not all_modes:
             logger.debug("No modes present, returning zero fields")
             return (E_r, E_theta, E_phi), (H_r, H_theta, H_phi)
 
-        # Pre-compute Legendre functions
-        legendre_cache = compute_all_modes_legendre(self.NMAX, self.MMAX, theta)
+        legendre_cache = compute_all_modes_legendre(nmax, mmax, theta)
 
         # Pre-compute ALL spherical Bessel functions for n=0 to NMAX
-        # This eliminates redundant scipy calls since Bessel functions depend on (n, kr), not m
-        kr = self.k * r.ravel()
-        bessel_cache = precompute_spherical_bessel(self.NMAX, kr)
+        # (Bessel functions depend on (n, kr) only, not on m)
+        k = self.k(frequency)
+        kr = k * r.ravel()
+        bessel_cache = precompute_spherical_bessel(nmax, kr)
 
         # Scaling prefactors for near-field E and H.
         # The Q coefficients from the .sph file are read with normalization_factor=1/sqrt(8π),
@@ -1482,38 +1592,31 @@ class SphericalWaveExpansion:
         E_prefactor = np.sqrt(4 * np.pi)
         H_prefactor = 1j * np.sqrt(4 * np.pi) / Z0
 
-        # Loop through modes
         for (n, m) in all_modes:
-            # Get near-field pattern functions for this mode
             F1_E, F2_E, F1_H, F2_H = near_field_pattern_functions(
-                n, m, r, theta, phi, self.k, legendre_cache, bessel_cache
+                n, m, r, theta, phi, k, legendre_cache, bessel_cache
             )
-            
-            # Q1 contribution (TE to r modes)
-            if (n, m) in self.Q1_coeffs:
-                Q1 = self.Q1_coeffs[(n, m)]
+
+            if (n, m) in q1:
+                Q1 = q1[(n, m)]
                 E_r += E_prefactor * Q1 * F1_E[0]
                 E_theta += E_prefactor * Q1 * F1_E[1]
                 E_phi += E_prefactor * Q1 * F1_E[2]
-                
                 H_r += H_prefactor * Q1 * F1_H[0]
                 H_theta += H_prefactor * Q1 * F1_H[1]
                 H_phi += H_prefactor * Q1 * F1_H[2]
-            
-            # Q2 contribution (TM to r modes)
-            if (n, m) in self.Q2_coeffs:
-                Q2 = self.Q2_coeffs[(n, m)]
+
+            if (n, m) in q2:
+                Q2 = q2[(n, m)]
                 E_r += E_prefactor * Q2 * F2_E[0]
                 E_theta += E_prefactor * Q2 * F2_E[1]
                 E_phi += E_prefactor * Q2 * F2_E[2]
-
                 H_r += H_prefactor * Q2 * F2_H[0]
                 H_theta += H_prefactor * Q2 * F2_H[1]
                 H_phi += H_prefactor * Q2 * F2_H[2]
 
-        # Normalize consistently with directivity-normalized far field
         if normalize:
-            tp = self.total_power
+            tp = self.total_power(frequency)
             if tp > 0:
                 norm = np.sqrt(tp)
                 E_r /= norm
@@ -1526,6 +1629,7 @@ class SphericalWaveExpansion:
         return (E_r, E_theta, E_phi), (H_r, H_theta, H_phi)
 
     def near_field_cartesian(self, x: np.ndarray, y: np.ndarray, z: np.ndarray,
+                             frequency: float,
                              normalize: bool = True) -> \
             Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray],
                   Tuple[np.ndarray, np.ndarray, np.ndarray]]:
@@ -1534,6 +1638,7 @@ class SphericalWaveExpansion:
 
         Args:
             x, y, z: Cartesian coordinates in meters
+            frequency: Frequency in Hz (must be a loaded frequency)
             normalize: If True (default), divide by sqrt(total_power) for
                       consistency with directivity-normalized far field.
 
@@ -1541,35 +1646,31 @@ class SphericalWaveExpansion:
             E: Tuple of (E_x, E_y, E_z) components in V/m
             H: Tuple of (H_x, H_y, H_z) components in A/m
         """
-        # Convert to spherical coordinates
         r, theta, phi = cartesian_to_spherical(x, y, z)
-
-        # Get fields in spherical basis
-        (E_r, E_theta, E_phi), (H_r, H_theta, H_phi) = self.near_field(r, theta, phi, normalize=normalize)
-        
-        # Convert to Cartesian basis
+        (E_r, E_theta, E_phi), (H_r, H_theta, H_phi) = self.near_field(
+            r, theta, phi, frequency=frequency, normalize=normalize
+        )
         E_x, E_y, E_z = spherical_to_cartesian_field(E_r, E_theta, E_phi, theta, phi)
         H_x, H_y, H_z = spherical_to_cartesian_field(H_r, H_theta, H_phi, theta, phi)
-        
         return (E_x, E_y, E_z), (H_x, H_y, H_z)
     
     def currents_on_surface(self, rr: np.ndarray, unr: np.ndarray, dSr: np.ndarray,
-                                swe_origin: np.ndarray = None,
-                                swe_rotation: Optional[Tuple[float, float, float]] = None) -> \
+                            frequency: float,
+                            swe_origin: np.ndarray = None,
+                            swe_rotation: Optional[Tuple[float, float, float]] = None) -> \
             Tuple[np.ndarray, np.ndarray]:
         """
-        Calculate equivalent surface currents on an arbitrary reflector surface from SWE source.
+        Calculate equivalent surface currents on an arbitrary reflector surface.
 
-        Two modes are supported:
-        - Surface Equivalence Theorem (default): J = n × H, M = -n × E
-        - Physical Optics (physical_optics=True): J = 2(n × H), M = 0 for PEC reflectors
+        Uses the Surface Equivalence Theorem: J = n × H, M = -n × E.
 
         Args:
             rr: Nr x 3 array of reflector surface points (Cartesian, meters)
             unr: Nr x 3 array of surface normal vectors (outward)
             dSr: Nr array of surface element areas (m²)
-            swe_origin: 3-element array, SWE coordinate origin in reflector frame (meters)
-                        Default is [0, 0, 0]
+            frequency: Frequency in Hz (must be a loaded frequency)
+            swe_origin: 3-element array, SWE coordinate origin in reflector frame.
+                        Default is [0, 0, 0].
             swe_rotation: (alpha, beta, gamma) Euler angles (radians, ZYZ convention)
                         rotating SWE frame to reflector frame. Default is no rotation.
 
@@ -1577,39 +1678,36 @@ class SphericalWaveExpansion:
             Jrr: Nr x 3 array of equivalent electric currents (A)
             Mrr: Nr x 3 array of equivalent magnetic currents (V)
         """
+        self._validate_freq(frequency)
         Nr = len(rr)
         logger.debug(f"Computing surface currents on {Nr} surface points")
-        
-        # Default origin at coordinate system origin
+
         if swe_origin is None:
             swe_origin = np.array([0., 0., 0.])
-        
-        # Transform reflector points to SWE coordinate system
+
         rr_swe = rr - swe_origin[np.newaxis, :]
-        
+
         if swe_rotation is not None:
-            # Apply inverse rotation (reflector -> SWE frame)
             rr_swe = self._apply_inverse_rotation(rr_swe, swe_rotation)
             unr_swe = self._apply_inverse_rotation(unr, swe_rotation)
         else:
             unr_swe = unr.copy()
-        
-        # Calculate near field at surface
+
         x, y, z = rr_swe[:, 0], rr_swe[:, 1], rr_swe[:, 2]
-        (Ex, Ey, Ez), (Hx, Hy, Hz) = self.near_field_cartesian(x, y, z)
-        
+        (Ex, Ey, Ez), (Hx, Hy, Hz) = self.near_field_cartesian(
+            x, y, z, frequency=frequency
+        )
+
         E_total = np.column_stack([Ex, Ey, Ez])
         H_total = np.column_stack([Hx, Hy, Hz])
 
-        # Transform E and H back to reflector frame if rotated
         if swe_rotation is not None:
             E_total = self._apply_rotation(E_total, swe_rotation)
             H_total = self._apply_rotation(H_total, swe_rotation)
-        
-        # Calculate surface currents
+
         Jrr = np.cross(unr_swe, H_total, axis=-1) * dSr[:, np.newaxis]
         Mrr = -np.cross(unr_swe, E_total, axis=-1) * dSr[:, np.newaxis]
-        
+
         return Jrr, Mrr
 
     def _apply_rotation(self, vectors: np.ndarray, angles: Tuple[float, float, float]) -> np.ndarray:
@@ -1661,42 +1759,40 @@ class SphericalWaveExpansion:
 # File I/O Functions
 # ==============================================================================
 
-def read_ticra_sph(filename: str, freq_index: int = 0) -> Dict:
+def read_ticra_sph(filename: str) -> List[Dict]:
     """
     Read TICRA .sph file containing spherical wave expansion coefficients.
 
-    Supports multi-frequency .sph files; reads a single frequency block.
+    Reads all frequency blocks present in the file.
 
     Args:
         filename: Path to the .sph file
-        freq_index: 0-based frequency index to read (default: 0 = first frequency)
 
     Returns:
-        Dictionary containing all data from .sph file
+        List of dicts, one per frequency block, each containing:
+          'frequency' (GHz), 'NMAX', 'MMAX', 'NTHE', 'NPHI',
+          'rotation_angles', 'Q1_coeffs', 'Q2_coeffs', 'power'
+
+    Raises:
+        ValueError: If no frequency blocks are found in the file.
     """
-    logger.info(f"Reading TICRA .sph file: {filename}, freq_index={freq_index}")
+    logger.info(f"Reading TICRA .sph file: {filename}")
+
+    # NORMALIZATION FACTOR (from Ticra)
+    normalization_factor = 1/np.sqrt(8*np.pi)
 
     with open(filename, 'r') as f:
         lines = f.readlines()
 
+    results = []
     line_idx = 0
 
-    # Skip to the requested frequency block
-    for fi in range(freq_index + 1):
-        if fi > 0:
-            # Advance past the current frequency block's remaining data
-            # by scanning for the next PRGTAG line (contains "Freq [GHz]:")
-            found = False
-            while line_idx < len(lines):
-                if 'Freq [GHz]:' in lines[line_idx]:
-                    found = True
-                    break
-                line_idx += 1
-            if not found:
-                raise ValueError(
-                    f"Frequency index {freq_index} not found in {filename} "
-                    f"(only {fi} frequencies available)"
-                )
+    while line_idx < len(lines):
+        # Scan forward to the next PRGTAG line
+        while line_idx < len(lines) and 'Freq [GHz]:' not in lines[line_idx]:
+            line_idx += 1
+        if line_idx >= len(lines):
+            break
 
         # Record 1: PRGTAG
         prgtag = lines[line_idx].strip()
@@ -1708,8 +1804,7 @@ def read_ticra_sph(filename: str, freq_index: int = 0) -> Dict:
             frequency = float(freq_str)
 
         # Record 2: IDSTRG
-        idstrg = lines[line_idx].strip()
-        line_idx += 1
+        line_idx += 1  # skip description line
 
         # Record 3: NTHE, NPHI, NMAX, MMAX
         control_data = lines[line_idx].strip().split()
@@ -1731,184 +1826,196 @@ def read_ticra_sph(filename: str, freq_index: int = 0) -> Dict:
         # Records 5-8: Dummy data (skip 4 lines)
         line_idx += 4
 
-    # Read coefficients for the selected frequency block
-    Q1_coeffs = {}
-    Q2_coeffs = {}
-    power = {}
-    m_blocks_read = 0
+        # Read coefficients for this frequency block
+        Q1_coeffs: Dict[Tuple[int, int], complex] = {}
+        Q2_coeffs: Dict[Tuple[int, int], complex] = {}
+        power: Dict[int, float] = {}
+        m_blocks_read = 0
 
-    while line_idx < len(lines) and m_blocks_read <= MMAX:
-        line = lines[line_idx].strip()
-        if not line:
-            line_idx += 1
-            continue
-
-        parts = line.split()
-        if len(parts) >= 2:
-            try:
-                m_index = int(parts[0])
-                powerm = float(parts[1])
-            except (ValueError, IndexError):
-                # Non-numeric line — skip (could be stray text/dummy lines)
+        while line_idx < len(lines) and m_blocks_read <= MMAX:
+            line = lines[line_idx].strip()
+            if not line:
                 line_idx += 1
                 continue
 
-            # Validate this is a valid m-block for the current frequency
-            if abs(m_index) > MMAX:
-                break
-
-            power[abs(m_index)] = powerm
-            line_idx += 1
-            m_blocks_read += 1
-
-            abs_m = abs(m_index)
-            n_start = max(1, abs_m)
-
-            if m_index == 0:
-                for n in range(n_start, NMAX + 1):
-                    if line_idx >= len(lines):
-                        break
-                    coeff_line = lines[line_idx].strip()
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    m_index = int(parts[0])
+                    powerm = float(parts[1])
+                except (ValueError, IndexError):
                     line_idx += 1
+                    continue
 
-                    coeff_parts = coeff_line.split()
-                    if len(coeff_parts) >= 4:
-                        Q1_coeffs[(n, 0)] = complex(float(coeff_parts[0]), float(coeff_parts[1]))
-                        Q2_coeffs[(n, 0)] = complex(float(coeff_parts[2]), float(coeff_parts[3]))
-                    else:
-                        line_idx -= 1
-                        break
+                if abs(m_index) > MMAX:
+                    break
+
+                power[abs(m_index)] = powerm
+                line_idx += 1
+                m_blocks_read += 1
+
+                abs_m = abs(m_index)
+                n_start = max(1, abs_m)
+
+                if m_index == 0:
+                    for n in range(n_start, NMAX + 1):
+                        if line_idx >= len(lines):
+                            break
+                        coeff_line = lines[line_idx].strip()
+                        line_idx += 1
+                        coeff_parts = coeff_line.split()
+                        if len(coeff_parts) >= 4:
+                            Q1_coeffs[(n, 0)] = complex(float(coeff_parts[0]), float(coeff_parts[1]))
+                            Q2_coeffs[(n, 0)] = complex(float(coeff_parts[2]), float(coeff_parts[3]))
+                        else:
+                            line_idx -= 1
+                            break
+                else:
+                    for n in range(n_start, NMAX + 1):
+                        # -m coefficients
+                        if line_idx >= len(lines):
+                            break
+                        coeff_line = lines[line_idx].strip()
+                        line_idx += 1
+                        coeff_parts = coeff_line.split()
+                        if len(coeff_parts) >= 4:
+                            Q1_coeffs[(n, -abs_m)] = complex(float(coeff_parts[0]), float(coeff_parts[1]))
+                            Q2_coeffs[(n, -abs_m)] = complex(float(coeff_parts[2]), float(coeff_parts[3]))
+                        else:
+                            line_idx -= 1
+                            break
+
+                        # +m coefficients
+                        if line_idx >= len(lines):
+                            break
+                        coeff_line = lines[line_idx].strip()
+                        line_idx += 1
+                        coeff_parts = coeff_line.split()
+                        if len(coeff_parts) >= 4:
+                            Q1_coeffs[(n, abs_m)] = complex(float(coeff_parts[0]), float(coeff_parts[1]))
+                            Q2_coeffs[(n, abs_m)] = complex(float(coeff_parts[2]), float(coeff_parts[3]))
+                        else:
+                            line_idx -= 1
+                            break
             else:
-                for n in range(n_start, NMAX + 1):
-                    # -m coefficients
-                    if line_idx >= len(lines):
-                        break
-                    coeff_line = lines[line_idx].strip()
-                    line_idx += 1
+                line_idx += 1
 
-                    coeff_parts = coeff_line.split()
-                    if len(coeff_parts) >= 4:
-                        Q1_coeffs[(n, -abs_m)] = complex(float(coeff_parts[0]), float(coeff_parts[1]))
-                        Q2_coeffs[(n, -abs_m)] = complex(float(coeff_parts[2]), float(coeff_parts[3]))
-                    else:
-                        line_idx -= 1
-                        break
+        # Convert from TICRA file convention to internal convention:
+        # Q_internal = -conj(Q_file) * normalization_factor
+        for key in Q1_coeffs:
+            Q1_coeffs[key] = -np.conj(Q1_coeffs[key]) * normalization_factor
+        for key in Q2_coeffs:
+            Q2_coeffs[key] = -np.conj(Q2_coeffs[key]) * normalization_factor
 
-                    # +m coefficients
-                    if line_idx >= len(lines):
-                        break
-                    coeff_line = lines[line_idx].strip()
-                    line_idx += 1
+        logger.info(f"Loaded block: {frequency} GHz, NMAX={NMAX}, MMAX={MMAX}, "
+                    f"{len(Q1_coeffs)} Q1 modes, {len(Q2_coeffs)} Q2 modes")
 
-                    coeff_parts = coeff_line.split()
-                    if len(coeff_parts) >= 4:
-                        Q1_coeffs[(n, abs_m)] = complex(float(coeff_parts[0]), float(coeff_parts[1]))
-                        Q2_coeffs[(n, abs_m)] = complex(float(coeff_parts[2]), float(coeff_parts[3]))
-                    else:
-                        line_idx -= 1
-                        break
-        else:
-            line_idx += 1
+        results.append({
+            'frequency': frequency,
+            'NTHE': NTHE,
+            'NPHI': NPHI,
+            'NMAX': NMAX,
+            'MMAX': MMAX,
+            'rotation_angles': rotation_angles,
+            'Q1_coeffs': Q1_coeffs,
+            'Q2_coeffs': Q2_coeffs,
+            'power': power,
+        })
 
-    # Convert from TICRA file convention to internal convention:
-    # Q_internal = -conj(Q_file)
-    for key in Q1_coeffs:
-        Q1_coeffs[key] = -np.conj(Q1_coeffs[key])
-    for key in Q2_coeffs:
-        Q2_coeffs[key] = -np.conj(Q2_coeffs[key])
+    if not results:
+        raise ValueError(f"No frequency blocks found in {filename}")
 
-    logger.info(f"Loaded SWE: NMAX={NMAX}, MMAX={MMAX}, frequency={frequency} GHz, {len(Q1_coeffs)} Q1 modes, {len(Q2_coeffs)} Q2 modes")
-    logger.debug(f"Rotation angles: {rotation_angles}")
-
-    return {
-        'frequency': frequency,
-        'NTHE': NTHE,
-        'NPHI': NPHI,
-        'NMAX': NMAX,
-        'MMAX': MMAX,
-        'rotation_angles': rotation_angles,
-        'Q1_coeffs': Q1_coeffs,
-        'Q2_coeffs': Q2_coeffs,
-        'power': power
-    }
+    logger.info(f"Read {len(results)} frequency block(s) from {filename}")
+    return results
 
 
 def write_ticra_sph(filename: str,
-                    Q1_coeffs: Dict[Tuple[int, int], complex],
-                    Q2_coeffs: Dict[Tuple[int, int], complex],
-                    frequency_GHz: float,
-                    NTHE: int, NPHI: int,
-                    NMAX: int, MMAX: int,
+                    freq_data_list: List[Dict],
                     description: str = "Generated by SWE module"):
     """
     Write spherical wave coefficients to TICRA .sph file format.
 
-    Internal coefficients are converted back to file convention:
-    Q_file = -conj(Q_internal)
+    Args:
+        filename: Output file path
+        freq_data_list: List of per-frequency dicts, each containing:
+            'Q1_coeffs'    : Dict[(n, m) -> complex]  (internal convention)
+            'Q2_coeffs'    : Dict[(n, m) -> complex]
+            'frequency_GHz': float
+            'NMAX'         : int
+            'MMAX'         : int
+            'NTHE'         : int  (optional, default 181)
+            'NPHI'         : int  (optional, default 361)
+        description: Description text written in every block header
+
+    Internal coefficients are converted back to file convention on write:
+        Q_file = -conj(Q_internal) * sqrt(8*pi)
     """
-    logger.info(f"Writing TICRA .sph file: {filename}")
-    logger.debug(f"Writing SWE: NMAX={NMAX}, MMAX={MMAX}, frequency={frequency_GHz} GHz, {len(Q1_coeffs)} Q1 modes, {len(Q2_coeffs)} Q2 modes")
+    logger.info(f"Writing TICRA .sph file: {filename} ({len(freq_data_list)} frequency block(s))")
+
+    # Inverse of the 1/sqrt(8*pi) applied on read
+    normalization_factor = np.sqrt(8 * np.pi)
 
     with open(filename, 'w') as f:
-        # Record 1: PRGTAG
-        f.write(f"TICRA-SWE Freq [GHz]: {frequency_GHz:.6f}\n")
-        
-        # Record 2: IDSTRG
-        f.write(f"{description}\n")
-        
-        # Record 3: NTHE, NPHI, NMAX, MMAX
-        f.write(f"{NTHE:5d}{NPHI:5d}{NMAX:5d}{MMAX:5d}\n")
-        
-        # Record 4: Rotation angles
-        f.write("Rotation angles = (  0.00000,  0.00000,  0.00000)\n")
-        
-        # Records 5-8: Dummy data (4 lines matching TICRA format)
-        f.write("  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00\n")
-        f.write("  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00\n")
-        f.write("SWEP_DUMMY_FILE_NAME\n")
-        f.write("SWEP_DUMMY_FILE_NAME\n")
-        
-        # Write coefficients for each |m|
-        for m_val in range(0, MMAX + 1):
-            # Calculate power for this m
-            power = 0.0
-            for n in range(max(1, m_val), NMAX + 1):
-                if m_val == 0:
-                    Q1 = Q1_coeffs.get((n, 0), 0.0)
-                    Q2 = Q2_coeffs.get((n, 0), 0.0)
-                    power += abs(Q1)**2 + abs(Q2)**2
-                else:
-                    Q1_pos = Q1_coeffs.get((n, m_val), 0.0)
-                    Q2_pos = Q2_coeffs.get((n, m_val), 0.0)
-                    Q1_neg = Q1_coeffs.get((n, -m_val), 0.0)
-                    Q2_neg = Q2_coeffs.get((n, -m_val), 0.0)
-                    power += abs(Q1_pos)**2 + abs(Q2_pos)**2 + abs(Q1_neg)**2 + abs(Q2_neg)**2
-            
-            power = power / 2.0
-            
-            # Write m header
-            f.write(f"{m_val:5d}  {power:23.16E}\n")
-            
-            # Write coefficients for each n
-            for n in range(max(1, m_val), NMAX + 1):
-                if m_val == 0:
-                    # Convert internal -> file: Q_file = -conj(Q_internal)
-                    Q1 = -np.conj(Q1_coeffs.get((n, 0), 0.0))
-                    Q2 = -np.conj(Q2_coeffs.get((n, 0), 0.0))
+        for block in freq_data_list:
+            Q1_coeffs = block['Q1_coeffs']
+            Q2_coeffs = block['Q2_coeffs']
+            frequency_GHz = block['frequency_GHz']
+            NMAX = block['NMAX']
+            MMAX = block['MMAX']
+            NTHE = block.get('NTHE', 181)
+            NPHI = block.get('NPHI', 361)
 
-                    f.write(f"  {Q1.real:23.16E} {Q1.imag:23.16E} "
-                           f"{Q2.real:23.16E} {Q2.imag:23.16E}\n")
-                else:
-                    # -m line
-                    Q1_neg = -np.conj(Q1_coeffs.get((n, -m_val), 0.0))
-                    Q2_neg = -np.conj(Q2_coeffs.get((n, -m_val), 0.0))
+            logger.debug(f"Writing block: {frequency_GHz:.6f} GHz, NMAX={NMAX}, MMAX={MMAX}, "
+                         f"{len(Q1_coeffs)} Q1 modes, {len(Q2_coeffs)} Q2 modes")
 
-                    f.write(f"  {Q1_neg.real:23.16E} {Q1_neg.imag:23.16E} "
-                           f"{Q2_neg.real:23.16E} {Q2_neg.imag:23.16E}\n")
+            # Record 1: PRGTAG
+            f.write(f"TICRA-SWE Freq [GHz]: {frequency_GHz:.6f}\n")
+            # Record 2: IDSTRG
+            f.write(f"{description}\n")
+            # Record 3: NTHE, NPHI, NMAX, MMAX
+            f.write(f"{NTHE:5d}{NPHI:5d}{NMAX:5d}{MMAX:5d}\n")
+            # Record 4: Rotation angles
+            f.write("Rotation angles = (  0.00000,  0.00000,  0.00000)\n")
+            # Records 5-8: Dummy data (4 lines matching TICRA format)
+            f.write("  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00\n")
+            f.write("  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00  0.00000000000000E+00\n")
+            f.write("SWEP_DUMMY_FILE_NAME\n")
+            f.write("SWEP_DUMMY_FILE_NAME\n")
 
-                    # +m line
-                    Q1_pos = -np.conj(Q1_coeffs.get((n, m_val), 0.0))
-                    Q2_pos = -np.conj(Q2_coeffs.get((n, m_val), 0.0))
+            # Write coefficients for each |m|
+            for m_val in range(0, MMAX + 1):
+                # Calculate power for this m (in internal units)
+                power = 0.0
+                for n in range(max(1, m_val), NMAX + 1):
+                    if m_val == 0:
+                        Q1 = Q1_coeffs.get((n, 0), 0.0)
+                        Q2 = Q2_coeffs.get((n, 0), 0.0)
+                        power += abs(Q1)**2 + abs(Q2)**2
+                    else:
+                        Q1_pos = Q1_coeffs.get((n, m_val), 0.0)
+                        Q2_pos = Q2_coeffs.get((n, m_val), 0.0)
+                        Q1_neg = Q1_coeffs.get((n, -m_val), 0.0)
+                        Q2_neg = Q2_coeffs.get((n, -m_val), 0.0)
+                        power += abs(Q1_pos)**2 + abs(Q2_pos)**2 + abs(Q1_neg)**2 + abs(Q2_neg)**2
+                power = power / 2.0
 
-                    f.write(f"  {Q1_pos.real:23.16E} {Q1_pos.imag:23.16E} "
-                           f"{Q2_pos.real:23.16E} {Q2_pos.imag:23.16E}\n")
+                f.write(f"{m_val:5d}  {power:23.16E}\n")
+
+                for n in range(max(1, m_val), NMAX + 1):
+                    if m_val == 0:
+                        # internal -> file: Q_file = -conj(Q_internal) * sqrt(8pi)
+                        Q1 = -np.conj(Q1_coeffs.get((n, 0), 0.0)) * normalization_factor
+                        Q2 = -np.conj(Q2_coeffs.get((n, 0), 0.0)) * normalization_factor
+                        f.write(f"  {Q1.real:23.16E} {Q1.imag:23.16E} "
+                                f"{Q2.real:23.16E} {Q2.imag:23.16E}\n")
+                    else:
+                        # -m line
+                        Q1_neg = -np.conj(Q1_coeffs.get((n, -m_val), 0.0)) * normalization_factor
+                        Q2_neg = -np.conj(Q2_coeffs.get((n, -m_val), 0.0)) * normalization_factor
+                        f.write(f"  {Q1_neg.real:23.16E} {Q1_neg.imag:23.16E} "
+                                f"{Q2_neg.real:23.16E} {Q2_neg.imag:23.16E}\n")
+                        # +m line
+                        Q1_pos = -np.conj(Q1_coeffs.get((n, m_val), 0.0)) * normalization_factor
+                        Q2_pos = -np.conj(Q2_coeffs.get((n, m_val), 0.0)) * normalization_factor
+                        f.write(f"  {Q1_pos.real:23.16E} {Q1_pos.imag:23.16E} "
+                                f"{Q2_pos.real:23.16E} {Q2_pos.imag:23.16E}\n")

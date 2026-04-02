@@ -33,7 +33,6 @@ def _build_full_sphere_grid(cuts):
         theta, phi, E_theta, E_phi as 1D arrays on a regular grid,
         sorted by (phi, theta) for from_far_field compatibility.
     """
-    # Collect remapped data from all cuts
     grid_points = {}  # (theta_round, phi_round) -> (E_theta, E_phi)
 
     for cut in cuts:
@@ -46,12 +45,10 @@ def _build_full_sphere_grid(cuts):
         E_theta, E_phi = ludwig3_to_spherical(Eco, Ecx, phi_rad)
 
         for k in range(len(theta_rad)):
-            # Round to avoid floating point key issues
             th_key = round(np.rad2deg(theta_rad[k]), 4)
             ph_key = round(np.rad2deg(phi_rad[k]) % 360, 4)
             grid_points[(th_key, ph_key)] = (E_theta[k], E_phi[k])
 
-    # Sort into regular grid
     all_theta_deg = sorted(set(k[0] for k in grid_points.keys()))
     all_phi_deg = sorted(set(k[1] for k in grid_points.keys()))
 
@@ -86,6 +83,7 @@ class TestCutToSph:
     def setup(self):
         """Load reference data."""
         self.swe_ref = SphericalWaveExpansion.from_sph_file(SPH_FILE, normalize=False)
+        self.freq = self.swe_ref.frequencies[FREQ_INDEX_8GHZ]
         all_cuts = read_grasp_cut(CUT_FILE)
         self.cut_data = extract_cut_frequency_set(
             all_cuts, FREQ_INDEX_8GHZ, N_PHI_PER_FREQ
@@ -96,56 +94,63 @@ class TestCutToSph:
         theta, phi, E_theta, E_phi = _build_full_sphere_grid(self.cut_data['cuts'])
 
         print(f"\n  Extracting SWE from {len(theta)} field points...")
-        print(f"  Reference: NMAX={self.swe_ref.NMAX}, MMAX={self.swe_ref.MMAX}")
+        print(f"  Reference: NMAX={self.swe_ref.NMAX(self.freq)}, "
+              f"MMAX={self.swe_ref.MMAX(self.freq)}")
 
         swe_extracted = SphericalWaveExpansion.from_far_field(
             theta, phi, E_theta, E_phi,
-            frequency=self.swe_ref.frequency,
-            NMAX_initial=self.swe_ref.NMAX,
-            MMAX_initial=self.swe_ref.MMAX,
+            frequency=self.freq,
+            NMAX_initial=self.swe_ref.NMAX(self.freq),
+            MMAX_initial=self.swe_ref.MMAX(self.freq),
             use_multiprocessing=False,
             normalize=False,
         )
 
-        print(f"  Extracted: NMAX={swe_extracted.NMAX}, MMAX={swe_extracted.MMAX}")
-        print(f"  Q1 modes: {len(swe_extracted.Q1_coeffs)}")
-        print(f"  Q2 modes: {len(swe_extracted.Q2_coeffs)}")
+        freq_ext = swe_extracted.frequencies[0]
+        print(f"  Extracted: NMAX={swe_extracted.NMAX(freq_ext)}, "
+              f"MMAX={swe_extracted.MMAX(freq_ext)}")
+        print(f"  Q1 modes: {len(swe_extracted.Q1_coeffs(freq_ext))}")
+        print(f"  Q2 modes: {len(swe_extracted.Q2_coeffs(freq_ext))}")
 
-        # Compare Q coefficients
-        common_q1 = set(swe_extracted.Q1_coeffs.keys()) & set(self.swe_ref.Q1_coeffs.keys())
-        common_q2 = set(swe_extracted.Q2_coeffs.keys()) & set(self.swe_ref.Q2_coeffs.keys())
+        ref_q1 = self.swe_ref.Q1_coeffs(self.freq)
+        ref_q2 = self.swe_ref.Q2_coeffs(self.freq)
+        ext_q1 = swe_extracted.Q1_coeffs(freq_ext)
+        ext_q2 = swe_extracted.Q2_coeffs(freq_ext)
+
+        common_q1 = set(ext_q1.keys()) & set(ref_q1.keys())
+        common_q2 = set(ext_q2.keys()) & set(ref_q2.keys())
         print(f"  Common Q1 modes: {len(common_q1)}")
         print(f"  Common Q2 modes: {len(common_q2)}")
 
         if common_q1:
-            comp_q1 = np.array([swe_extracted.Q1_coeffs[k] for k in sorted(common_q1)])
-            ref_q1 = np.array([self.swe_ref.Q1_coeffs[k] for k in sorted(common_q1)])
-            compute_comparison_metrics(comp_q1, ref_q1, label="Q1 coefficients")
-
+            compute_comparison_metrics(
+                np.array([ext_q1[k] for k in sorted(common_q1)]),
+                np.array([ref_q1[k] for k in sorted(common_q1)]),
+                label="Q1 coefficients"
+            )
         if common_q2:
-            comp_q2 = np.array([swe_extracted.Q2_coeffs[k] for k in sorted(common_q2)])
-            ref_q2 = np.array([self.swe_ref.Q2_coeffs[k] for k in sorted(common_q2)])
-            compute_comparison_metrics(comp_q2, ref_q2, label="Q2 coefficients")
+            compute_comparison_metrics(
+                np.array([ext_q2[k] for k in sorted(common_q2)]),
+                np.array([ref_q2[k] for k in sorted(common_q2)]),
+                label="Q2 coefficients"
+            )
 
     def test_cut_roundtrip_farfield(self):
         """
         Load .cut -> extract SWE -> recompute far field -> compare with original .cut.
-
-        The reconstructed far field from extracted Q's should match the input .cut
-        in Ludwig-3 (Eco/Ecx) at absolute levels.
         """
         theta, phi, E_theta, E_phi = _build_full_sphere_grid(self.cut_data['cuts'])
 
         swe_extracted = SphericalWaveExpansion.from_far_field(
             theta, phi, E_theta, E_phi,
-            frequency=self.swe_ref.frequency,
-            NMAX_initial=self.swe_ref.NMAX,
-            MMAX_initial=self.swe_ref.MMAX,
+            frequency=self.freq,
+            NMAX_initial=self.swe_ref.NMAX(self.freq),
+            MMAX_initial=self.swe_ref.MMAX(self.freq),
             use_multiprocessing=False,
             normalize=False,
         )
+        freq_ext = swe_extracted.frequencies[0]
 
-        # Compare per-cut in Ludwig-3
         print(f"\n{'='*70}")
         print(f"Roundtrip: .cut -> SWE -> far_field -> Ludwig-3 vs original .cut")
         print(f"{'='*70}")
@@ -155,14 +160,13 @@ class TestCutToSph:
             theta_deg = cut['v_ini'] + np.arange(cut['v_num']) * cut['v_inc']
             theta_rad, phi_rad = remap_negative_theta(theta_deg, phi_deg)
 
-            E_th, E_ph = swe_extracted.far_field(theta_rad, phi_rad, normalize=False)
+            E_th, E_ph = swe_extracted.far_field(
+                theta_rad, phi_rad, frequency=freq_ext, normalize=False
+            )
             Eco, Ecx = spherical_to_ludwig3(E_th, E_ph, phi_rad)
 
-            Eco_ref = cut['data'][:, 0]
-            Ecx_ref = cut['data'][:, 1]
-
             compute_comparison_metrics(
-                Eco, Eco_ref,
+                Eco, cut['data'][:, 0],
                 label=f"Roundtrip cut {i} (phi={phi_deg}deg) Eco"
             )
 
@@ -177,6 +181,7 @@ class TestCutSweReproducesGrd:
     def setup(self):
         """Load data and extract SWE from .cut."""
         self.swe_ref = SphericalWaveExpansion.from_sph_file(SPH_FILE, normalize=False)
+        self.freq = self.swe_ref.frequencies[FREQ_INDEX_8GHZ]
         all_cuts = read_grasp_cut(CUT_FILE)
         cut_data = extract_cut_frequency_set(
             all_cuts, FREQ_INDEX_8GHZ, N_PHI_PER_FREQ
@@ -186,12 +191,13 @@ class TestCutSweReproducesGrd:
         theta, phi, E_theta, E_phi = _build_full_sphere_grid(cut_data['cuts'])
         self.swe_extracted = SphericalWaveExpansion.from_far_field(
             theta, phi, E_theta, E_phi,
-            frequency=self.swe_ref.frequency,
-            NMAX_initial=self.swe_ref.NMAX,
-            MMAX_initial=self.swe_ref.MMAX,
+            frequency=self.freq,
+            NMAX_initial=self.swe_ref.NMAX(self.freq),
+            MMAX_initial=self.swe_ref.MMAX(self.freq),
             use_multiprocessing=False,
             normalize=False,
         )
+        self.freq_ext = self.swe_extracted.frequencies[0]
 
     def test_extracted_swe_reproduces_grd(self):
         """Compute near field from extracted SWE, compare with .grd at z=0.25m."""
@@ -205,7 +211,7 @@ class TestCutSweReproducesGrd:
 
         print(f"\n  Computing near field at {len(r)} points, z={Z_DISTANCE}m...")
         (E_r, E_theta, E_phi), _ = self.swe_extracted.near_field(
-            r, theta, phi, normalize=False
+            r, theta, phi, frequency=self.freq_ext, normalize=False
         )
 
         Eco, Ecx = spherical_to_ludwig3(E_theta, E_phi, phi)

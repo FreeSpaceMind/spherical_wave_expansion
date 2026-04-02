@@ -15,7 +15,7 @@ from swe.ludwig3 import (
 )
 from tests.conftest import (
     SPH_FILE, CUT_FILE, requires_sph, requires_cut,
-    compute_comparison_metrics, N_PHI_PER_FREQ, FREQ_INDEX_8GHZ
+    compute_comparison_metrics, N_PHI_PER_FREQ, FREQ_INDEX_8GHZ, FREQ_8GHZ
 )
 
 
@@ -27,6 +27,7 @@ class TestSphToFarField:
     def setup(self):
         """Load reference data with absolute scaling preserved."""
         self.swe = SphericalWaveExpansion.from_sph_file(SPH_FILE, normalize=False)
+        self.freq = self.swe.frequencies[FREQ_INDEX_8GHZ]
         all_cuts = read_grasp_cut(CUT_FILE)
         self.cut_data = extract_cut_frequency_set(
             all_cuts, FREQ_INDEX_8GHZ, N_PHI_PER_FREQ
@@ -43,7 +44,9 @@ class TestSphToFarField:
 
         theta_rad, phi_rad = remap_negative_theta(theta_deg, phi_deg)
 
-        E_theta, E_phi = self.swe.far_field(theta_rad, phi_rad, normalize=False)
+        E_theta, E_phi = self.swe.far_field(
+            theta_rad, phi_rad, frequency=self.freq, normalize=False
+        )
 
         Eco, Ecx = spherical_to_ludwig3(E_theta, E_phi, phi_rad)
 
@@ -56,7 +59,7 @@ class TestSphToFarField:
         """Verify far_field returns arrays with correct shapes."""
         theta = np.linspace(0, np.pi, 181)
         phi = np.zeros_like(theta)
-        E_theta, E_phi = self.swe.far_field(theta, phi, normalize=False)
+        E_theta, E_phi = self.swe.far_field(theta, phi, frequency=self.freq, normalize=False)
         assert E_theta.shape == theta.shape
         assert E_phi.shape == phi.shape
 
@@ -86,7 +89,6 @@ class TestSphToFarField:
             all_Ecx, all_Ecx_ref, label="Ecx: SWE vs .cut (absolute)"
         )
 
-        # Scaling ratio should be near 1.0 for absolute agreement
         print(f"\n  Eco scaling ratio: {metrics_co['scaling_ratio']:.6f} (expect ~1.0)")
         print(f"  Ecx scaling ratio: {metrics_cx['scaling_ratio']:.6f} (expect ~1.0)")
 
@@ -99,11 +101,11 @@ class TestSphToFarField:
         for i, cut in enumerate(self.cut_data['cuts']):
             Eco, Ecx, Eco_ref, Ecx_ref = self._compute_cut_comparison(cut)
 
-            met_co = compute_comparison_metrics(
+            compute_comparison_metrics(
                 Eco, Eco_ref,
                 label=f"Cut {i} (phi={cut['constant']}deg) Eco"
             )
-            met_cx = compute_comparison_metrics(
+            compute_comparison_metrics(
                 Ecx, Ecx_ref,
                 label=f"Cut {i} (phi={cut['constant']}deg) Ecx"
             )
@@ -113,7 +115,7 @@ class TestSphToFarField:
         theta = np.linspace(0, np.pi, 181)
         phi = np.zeros_like(theta)
 
-        E_theta, E_phi = self.swe.far_field(theta, phi, normalize=False)
+        E_theta, E_phi = self.swe.far_field(theta, phi, frequency=self.freq, normalize=False)
 
         assert np.max(np.abs(E_theta)) > 0 or np.max(np.abs(E_phi)) > 0, \
             "Far field is identically zero"
