@@ -10,11 +10,7 @@ Key Features:
 - Calculate far-field patterns from Q coefficients
 - Calculate near-field E and H components at arbitrary points
 - Calculate equivalent surface currents on specified surfaces
-- Extract Q coefficients from measurements:
-  * Far-field patterns
-  * Spherical near-field measurements
-  * Planar near-field measurements  
-  * Cylindrical near-field measurements
+- Extract Q coefficients from far-field patterns (from_far_field)
 
 Physical Conventions:
 - Time dependence: exp(jωt) (matches Ticra)
@@ -23,7 +19,7 @@ Physical Conventions:
 - Electric field E: V/m
 - Magnetic field H: A/m
 - Impedance η₀ = 376.73 Ω (free space)
-- Outgoing spherical waves: h_n^(3)(kr) = j_n(kr) - i·y_n(kr)
+- Outgoing spherical waves: h_n^(2)(kr) = j_n(kr) - i·y_n(kr)
 
 Coordinate System:
 - r: radial distance (m)
@@ -511,8 +507,6 @@ def far_field_pattern_functions(n: int, m: int,
     sin_theta = np.sin(theta_safe)
     mP_over_sin = m * P_norm / sin_theta
 
-    # signs are tricky here, had to compare near field form of Ticra and Hansen to
-    # derive far field forms for Ticra
     K1_theta = prefactor * sign_factor * phase * i_factor_1 * (-1j * mP_over_sin)
     K1_phi = prefactor * sign_factor * phase * i_factor_1 * (-dP_norm_dtheta)
     
@@ -640,7 +634,7 @@ def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
             j_n_m1 = j_all[n - 1]
             y_n_m1 = y_all[n - 1]
     else:
-        # Fallback to scipy calls (backward compatibility)
+        # No pre-computed cache: call scipy directly
         j_n = spherical_jn(n, kr)
         y_n = spherical_yn(n, kr)
         if n == 0:
@@ -800,8 +794,10 @@ def compute_mode_coefficients_batch_trapz(args):
         
         mode_power = (abs(Q1)**2 + abs(Q2)**2) / 2.0
         results.append(((n, m), Q1, Q2, mode_power))
-    
+
     return results
+
+
 # ==============================================================================
 # Main SWE Class
 # ==============================================================================
@@ -1121,7 +1117,7 @@ class SphericalWaveExpansion:
                             E_phi: np.ndarray,
                             frequency: float,
                             r0: float = None,
-                            NMAX_initial: int = 100,  # Start larger
+                            NMAX_initial: int = 100,
                             MMAX_initial: int = 50,
                             power_threshold: float = 0.999,
                             high_mode_power_threshold: float = 0.00001,
@@ -1141,7 +1137,7 @@ class SphericalWaveExpansion:
             E_phi: Phi component of electric field
             frequency: Frequency in Hz
             r0: Radius of minimum sphere enclosing sources (meters)
-            NMAX_initial: Starting NMAX (default: 50)
+            NMAX_initial: Starting NMAX (default: 100)
             MMAX_initial: Starting MMAX (if None, grows with NMAX)
             power_threshold: Retain modes with this fraction of power (0.999 = 99.9%)
             high_mode_power_threshold: Max power in top 10% n-modes (0.001 = 0.51)
@@ -1190,7 +1186,6 @@ class SphericalWaveExpansion:
 
         logger.info(f"Starting SWE coefficient extraction: NMAX_initial={NMAX_initial}, frequency={frequency/1e9:.4f} GHz")
         
-        # MMAX_initial = None means let it grow with NMAX
         use_adaptive_mmax = (MMAX_initial is None)
         if MMAX_initial is None:
             MMAX_initial = NMAX_initial
@@ -1314,11 +1309,6 @@ class SphericalWaveExpansion:
             # Check convergence
             if high_mode_fraction < high_mode_power_threshold:
                 logger.info(f"Convergence achieved: high modes contain {high_mode_fraction*100:.2f}% < {high_mode_power_threshold*100:.0f}%")
-                # Calculate power per |m| for azimuthal truncation
-                power_per_m = np.zeros(MMAX_current + 1)
-                for (n, m), mode_power in mode_powers:
-                    power_per_m[abs(m)] += mode_power
-                
                 # Calculate power per |m| for azimuthal truncation
                 power_per_m = np.zeros(MMAX_current + 1)
                 for (n, m), mode_power in mode_powers:
@@ -1452,12 +1442,6 @@ class SphericalWaveExpansion:
 
         All frequency blocks present in the file are loaded.
 
-        Note:
-            When exporting .sph files from TICRA/GRASP, enable power normalization
-            in the export settings so that the coefficients are normalized to unit
-            radiated power. Unnormalized TICRA exports can produce incorrect
-            near-field magnitudes in PO analysis.
-
         Args:
             filename: Path to .sph file
             normalize: If True (default), normalize coefficients so total_power=1
@@ -1527,12 +1511,10 @@ class SphericalWaveExpansion:
         By default, normalizes by sqrt(total_power) so that the fields are
         consistent with the directivity-normalized far field.
 
-        Scaling note: the prefactor used here is sqrt(4π) for E and
-        j*sqrt(4π)/Z0 for H. This differs from Hansen's textbook expression
-        of k*sqrt(Z0) because the .sph file I/O absorbs a 1/sqrt(8π) factor
-        into the stored Q coefficients, cancelling the k*sqrt(Z0) term and
-        leaving sqrt(4π) as the effective prefactor. The far-field K-function
-        normalisation uses the same convention.
+        Scaling note: the prefactors used are sqrt(4π) for E and j*sqrt(4π)/Z0
+        for H, consistent with the far-field K-function normalisation. TICRA's
+        internal convention stores Q_internal = -conj(Q_file) with no additional
+        scaling factor.
 
         Args:
             r: Radial distance(s) in meters

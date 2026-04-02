@@ -20,7 +20,6 @@ def get_test_file(filename):
 
 
 # Discover available test data files
-# Discover available test data files
 SPH_FILE = get_test_file("example.sph")
 CUT_FILE = get_test_file("example.cut")
 GRD_FILE = get_test_file("example.grd")
