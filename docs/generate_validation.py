@@ -358,9 +358,10 @@ for freq_i, freq in enumerate(freqs):
 
     # Recompute or use stored result
     swe_tr, _ = _truncated_swe(swe, freq)
-    r_sl   = np.sqrt(x_slice**2 / 1e4 + Z_DISTANCE**2)
-    theta_sl = np.arctan2(np.abs(x_slice) / 100, Z_DISTANCE)
-    theta_sl = np.where(x_slice < 0, np.pi - theta_sl, theta_sl)
+    x_m    = x_slice / 100          # cm → m
+    r_sl   = np.sqrt(x_m**2 + Z_DISTANCE**2)
+    # theta = angle from +z axis; symmetric in x, only phi flips sign
+    theta_sl = np.arctan2(np.abs(x_m), Z_DISTANCE)
     phi_sl   = np.where(x_slice >= 0, 0.0, np.pi)
 
     (_, Et_sl, Ep_sl), _ = swe_tr.near_field(r_sl, theta_sl, phi_sl,
@@ -396,9 +397,150 @@ plt.close(fig4)
 print(f"  Saved: {out4}")
 
 
-# ---- Figure 5: Scaling ratio summary (bar chart) ----
-fig5, axes5 = plt.subplots(1, 2, figsize=(13, 5), sharey=False)
-fig5.suptitle("Validation Accuracy Summary: SWE vs TICRA GRASP\nAll 9 frequencies",
+# ===========================================================================
+# 3.  COEFFICIENT EXTRACTION VALIDATION (from_far_field round-trip)
+# ===========================================================================
+print("\nComputing coefficient extraction validation …")
+
+# Use 8.0 GHz.  Compute synthetic far-field on a regular grid from the
+# reference SWE, then extract Q coefficients with from_far_field and compare
+# against the originals.  This tests the round-trip:  Q → far-field → Q.
+freq_ext = freqs[0]
+
+# Build a 181×361 far-field grid
+theta_1d = np.linspace(0, np.pi, 181)
+phi_1d   = np.linspace(0, 2 * np.pi, 361)
+TH, PH   = np.meshgrid(theta_1d, phi_1d, indexing="ij")
+
+print(f"  Forward: computing far-field on {TH.size} pts at {freq_ext/1e9:.4f} GHz …")
+Et_syn, Ep_syn = swe.far_field(TH.ravel(), PH.ravel(),
+                               frequency=freq_ext, normalize=False)
+
+print(f"  Inverse: running from_far_field (NMAX_initial=30) …")
+swe_ext = SphericalWaveExpansion.from_far_field(
+    TH.ravel(), PH.ravel(), Et_syn, Ep_syn,
+    frequency=freq_ext,
+    NMAX_initial=30,
+    MMAX_initial=None,      # adaptive
+    normalize=False,
+    use_multiprocessing=False,
+)
+
+# Compare extracted vs reference Q coefficients
+q1_ref = swe.Q1_coeffs(freq_ext)
+q2_ref = swe.Q2_coeffs(freq_ext)
+q1_ext = swe_ext.Q1_coeffs(freq_ext)
+q2_ext = swe_ext.Q2_coeffs(freq_ext)
+
+nmax_ref = swe.NMAX(freq_ext)
+nmax_ext = swe_ext.NMAX(freq_ext)
+print(f"  Reference NMAX={nmax_ref}, extracted NMAX={nmax_ext}")
+
+# Gather shared modes (modes present in both)
+shared_modes = sorted(set(q1_ref.keys()) & set(q1_ext.keys()))
+
+q1_ref_arr = np.array([q1_ref[k] for k in shared_modes])
+q1_ext_arr = np.array([q1_ext[k] for k in shared_modes])
+q2_ref_arr = np.array([q2_ref[k] for k in shared_modes])
+q2_ext_arr = np.array([q2_ext.get(k, 0) for k in shared_modes])
+
+# Normalize each set by its own sqrt(total_power) before comparing shapes.
+# This removes the .sph absolute-unit convention vs extraction-unit difference,
+# and focuses the comparison on whether the mode spectrum shape is correct.
+tp_ref = swe.total_power(freq_ext)
+tp_ext = swe_ext.total_power(freq_ext)
+q1_ref_n = q1_ref_arr / np.sqrt(tp_ref)
+q2_ref_n = q2_ref_arr / np.sqrt(tp_ref)
+q1_ext_n = q1_ext_arr / np.sqrt(tp_ext)
+q2_ext_n = q2_ext_arr / np.sqrt(tp_ext)
+
+# Scale and nRMS on normalized coefficients
+s1, _, n1 = _scaling_metrics(q1_ext_n, q1_ref_n)
+s2, _, n2 = _scaling_metrics(q2_ext_n, q2_ref_n)
+print(f"  Q1 (normalized): scale={s1:.6f}, nRMS={n1:.2e}")
+print(f"  Q2 (normalized): scale={s2:.6f}, nRMS={n2:.2e}")
+
+# Power by n — reference vs extracted
+def _power_by_n(q1d, q2d, nmax):
+    pbn = np.zeros(nmax + 1)
+    for (n, m), v in q1d.items():
+        if n <= nmax:
+            pbn[n] += abs(v)**2
+    for (n, m), v in q2d.items():
+        if n <= nmax:
+            pbn[n] += abs(v)**2
+    return pbn
+
+n_plot = min(nmax_ref, 25)   # show reference up to n=25 for context
+pbn_ref = _power_by_n(q1_ref, q2_ref, n_plot)
+pbn_ext = _power_by_n(q1_ext, q2_ext, n_plot)
+
+# ---- Figure 5: Coefficient extraction validation ----
+fig5, axes5 = plt.subplots(1, 3, figsize=(16, 5))
+fig5.suptitle(f"Coefficient Extraction Validation at {freq_ext/1e9:.4f} GHz\n"
+              "from_far_field round-trip: Q → far-field → Q", fontsize=12)
+
+# Panel A: |Q1| scatter — extracted vs reference (only significant modes)
+ax = axes5[0]
+mask_sig = np.abs(q1_ref_arr) > np.max(np.abs(q1_ref_arr)) * 1e-3
+ax.scatter(np.abs(q1_ref_arr[mask_sig]), np.abs(q1_ext_arr[mask_sig]),
+           s=12, alpha=0.6, color="steelblue", label=f"Q1 ({mask_sig.sum()} modes)")
+mask_sig2 = np.abs(q2_ref_arr) > np.max(np.abs(q2_ref_arr)) * 1e-3
+ax.scatter(np.abs(q2_ref_arr[mask_sig2]), np.abs(q2_ext_arr[mask_sig2]),
+           s=12, alpha=0.6, color="tomato", marker="^", label=f"Q2 ({mask_sig2.sum()} modes)")
+xlim = max(np.max(np.abs(q1_ref_arr[mask_sig])), np.max(np.abs(q2_ref_arr[mask_sig2])))
+ax.plot([0, xlim], [0, xlim], "k--", lw=0.8, label="y = x")
+ax.set_xlabel("|Q| reference (.sph)")
+ax.set_ylabel("|Q| extracted (from_far_field)")
+ax.set_title(f"Q magnitude scatter\nQ1 scale={s1:.5f}, nRMS={n1:.2e}")
+ax.legend(fontsize=8)
+ax.grid(True, alpha=0.4)
+
+# Panel B: Mode power by n
+# Reference shown up to n=25; extraction shown up to nmax_ext.
+# Modes above nmax_ext are not in the extracted set (extraction stopped there).
+ax = axes5[1]
+ns_ref = np.arange(1, n_plot + 1)
+ns_ext = np.arange(1, nmax_ext + 1)
+ax.semilogy(ns_ref, pbn_ref[1:n_plot+1], "k-o", ms=5, lw=1.5, label="Reference (.sph)")
+ax.semilogy(ns_ext, pbn_ext[1:nmax_ext+1], "r--s", ms=4, lw=1.2,
+            label=f"Extracted (NMAX={nmax_ext})")
+ax.axvline(nmax_ext, color="red", lw=0.8, ls=":", alpha=0.7, label=f"Extraction limit (n={nmax_ext})")
+ax.set_xlabel("Degree n")
+ax.set_ylabel("Mode power (|Q1|² + |Q2|²)")
+ax.set_title("Power by degree n\n(extraction stops at noise floor)")
+ax.legend(fontsize=8)
+ax.grid(True, alpha=0.4)
+ax.set_xlim(0, n_plot + 1)
+
+# Panel C: Per-mode |Q1| vs n for all significant modes
+ax = axes5[2]
+n_vals  = np.array([k[0] for k in shared_modes])
+m_vals  = np.array([k[1] for k in shared_modes])
+sig_any = (np.abs(q1_ref_arr) > np.max(np.abs(q1_ref_arr)) * 1e-4)
+sc = ax.scatter(n_vals[sig_any], np.abs(q1_ref_arr[sig_any]),
+                c=np.abs(m_vals[sig_any]), cmap="plasma",
+                s=15, alpha=0.7, label="Reference |Q1|")
+ax.scatter(n_vals[sig_any], np.abs(q1_ext_arr[sig_any]),
+           marker="x", s=15, alpha=0.7, color="red", label="Extracted |Q1|")
+plt.colorbar(sc, ax=ax, label="|m|")
+ax.set_xlabel("Degree n")
+ax.set_ylabel("|Q1|")
+ax.set_title("Q1 magnitude vs n (colour = |m|)")
+ax.set_yscale("log")
+ax.legend(fontsize=8)
+ax.grid(True, alpha=0.4)
+
+fig5.tight_layout()
+out5 = os.path.join(FIGS_DIR, "validation_coeff_extraction.png")
+fig5.savefig(out5, dpi=150, bbox_inches="tight")
+plt.close(fig5)
+print(f"  Saved: {out5}")
+
+
+# ---- Figure 6: Scaling ratio summary (bar chart) ----
+fig6, axes6 = plt.subplots(1, 2, figsize=(13, 5), sharey=False)
+fig6.suptitle("Validation Accuracy Summary: SWE vs TICRA GRASP\nAll 9 frequencies",
               fontsize=12)
 
 x  = np.arange(n_freqs)
@@ -406,8 +548,8 @@ bw = 0.35
 freq_labels = [f"{f:.4f}" for f in freq_GHz]
 
 for ax, field_type, metrics_dict in [
-    (axes5[0], "Far-field", ff_metrics),
-    (axes5[1], "Near-field (z=0.25 m)", nf_metrics),
+    (axes6[0], "Far-field", ff_metrics),
+    (axes6[1], "Near-field (z=0.25 m)", nf_metrics),
 ]:
     ratios_co = [metrics_dict[f]["Eco"][0] for f in freqs]
     ratios_cx = [metrics_dict[f]["Ecx"][0] for f in freqs]
@@ -425,15 +567,15 @@ for ax, field_type, metrics_dict in [
     ax.set_ylim(0.9, 1.1)
     ax.grid(axis="y", alpha=0.4)
 
-fig5.tight_layout()
-out5 = os.path.join(FIGS_DIR, "validation_scaling_summary.png")
-fig5.savefig(out5, dpi=150, bbox_inches="tight")
-plt.close(fig5)
-print(f"  Saved: {out5}")
+fig6.tight_layout()
+out6 = os.path.join(FIGS_DIR, "validation_scaling_summary.png")
+fig6.savefig(out6, dpi=150, bbox_inches="tight")
+plt.close(fig6)
+print(f"  Saved: {out6}")
 
 
 # ===========================================================================
-# 3.  Print Markdown summary table
+# 4.  Print Markdown summary table
 # ===========================================================================
 print("\n\n" + "=" * 78)
 print("VALIDATION SUMMARY — SWE vs TICRA GRASP")
@@ -461,10 +603,18 @@ for freq in freqs:
     print(f"{freq/1e9:12.4f} | {rc:10.6f} | {pc:10.4f} | {nc:10.2e} | "
           f"{rx:10.6f} | {nx_:10.2e}   (NMAX_safe={ns})")
 
+print("\n### Coefficient Extraction Round-Trip at 8.0000 GHz (from_far_field)\n")
+print(f"  Reference NMAX={nmax_ref}, extracted NMAX={nmax_ext}")
+print(f"  {'':12} | {'Scale ratio':>12} | {'nRMS':>12}")
+print(f"  {'-'*42}")
+print(f"  {'Q1':12} | {s1:12.6f} | {n1:12.2e}")
+print(f"  {'Q2':12} | {s2:12.6f} | {n2:12.2e}")
+
 print("\n" + "=" * 78)
 print(f"\nFigures saved to: {FIGS_DIR}")
-print("  validation_farfield_eplane.png  — E-plane cuts, all 9 frequencies")
-print("  validation_farfield_cuts.png    — phi=0/45/90 cuts at 8.0 GHz")
-print("  validation_nearfield_2d.png     — 2D amplitude maps at 8.0 GHz")
-print("  validation_nearfield_slice.png  — Horizontal slice, all 9 frequencies")
-print("  validation_scaling_summary.png  — Scaling ratio bar chart summary")
+print("  validation_farfield_eplane.png   — E-plane cuts, all 9 frequencies")
+print("  validation_farfield_cuts.png     — phi=0/45/90 cuts at 8.0 GHz")
+print("  validation_nearfield_2d.png      — 2D amplitude maps at 8.0 GHz")
+print("  validation_nearfield_slice.png   — Horizontal slice, all 9 frequencies (fixed)")
+print("  validation_coeff_extraction.png  — Q coefficient round-trip validation")
+print("  validation_scaling_summary.png   — Scaling ratio bar chart summary")

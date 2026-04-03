@@ -659,18 +659,21 @@ def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
     """
     abs_m = abs(m)
     
-    # Apply pole avoidance
+    # Apply pole avoidance — epsilon must match compute_all_modes_legendre (1e-6)
+    # so that P_norm from cache and sin_theta are evaluated at the same clamped θ.
+    # A larger epsilon here would make mP_over_sin = jm·P_norm/sin_theta wrong
+    # at the exact pole (θ=0) by a factor of epsilon_here/epsilon_cache.
     theta_safe = np.copy(theta)
-    epsilon = 1e-3
+    epsilon = 1e-6
     theta_safe = np.where(theta < epsilon, epsilon, theta_safe)
     theta_safe = np.where(theta > (np.pi - epsilon), np.pi - epsilon, theta_safe)
-    
+
     # Get Legendre functions
     if legendre_cache is not None and (n, m) in legendre_cache:
         P_norm, dP_norm = legendre_cache[(n, m)]
     else:
         P_norm, dP_norm = normalized_associated_legendre(n, m, theta_safe)
-    
+
     # Radial functions - Hankel function of second kind
     kr = k * r
 
@@ -740,6 +743,63 @@ def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
     return (F1_E_r, F1_E_theta, F1_E_phi), (F2_E_r, F2_E_theta, F2_E_phi), \
            (F1_H_r, F1_H_theta, F1_H_phi), (F2_H_r, F2_H_theta, F2_H_phi)
 
+
+def _cc_theta_weights(theta_unique: np.ndarray) -> np.ndarray:
+    """Effective theta quadrature weights for Clenshaw-Curtis integration.
+
+    The existing integration code computes:
+
+        Q ∝ sum_j w_j * phi_integral_j
+
+    where phi_integral_j already contains the sin(theta_j) Jacobian factor.
+    The weights returned here satisfy:
+
+        sum_j w_j * [g(theta_j) * sin(theta_j)]
+            ≈ integral_0^pi g(theta) sin(theta) dtheta
+
+    i.e.,  w_j = w_CC_j / sin(theta_j)   (with w_j=0 at poles where sin=0).
+
+    For a uniform grid theta_j = j*pi/(N-1) (CGL nodes in x=cos(theta)), w_CC
+    is computed via the Waldvogel/Trefethen FFT algorithm.  For non-uniform
+    grids, plain trapezoidal step-sizes are returned instead.
+    """
+    N = len(theta_unique)
+    if N < 2:
+        return np.ones(N)
+
+    n = N - 1  # number of intervals
+
+    # Check that this is a uniform grid
+    expected = np.linspace(theta_unique[0], theta_unique[-1], N)
+    if not np.allclose(theta_unique, expected, rtol=1e-6):
+        # Non-uniform grid: return trapezoidal step sizes
+        dt = np.zeros(N)
+        dt[0] = (theta_unique[1] - theta_unique[0]) / 2
+        dt[-1] = (theta_unique[-1] - theta_unique[-2]) / 2
+        dt[1:-1] = (theta_unique[2:] - theta_unique[:-2]) / 2
+        return dt
+
+    # Waldvogel algorithm for CC weights on CGL nodes (Trefethen clencurt.m).
+    # w_CC satisfies: sum_j w_CC[j] * f(x_j) ≈ integral_{-1}^{1} f(x) dx
+    # which equals integral_0^pi f(cos θ) sin(θ) dθ  (x = cos θ).
+    # numpy ifft normalises by len(c_mirror)=2n; multiply by 2 to restore [-1,1] scale.
+    c = np.zeros(n + 1)
+    c[0::2] = 2.0 / (1.0 - np.arange(0, n + 1, 2, dtype=float) ** 2)
+    c_mirror = np.r_[c, c[-2:0:-1]]      # length 2n = (n+1)+(n-1)
+    w_cc = np.real(np.fft.ifft(c_mirror))[:n + 1] * 2  # factor 2: ifft 1/(2n) vs needed 1/n
+    w_cc[0] /= 2.0   # endpoint nodes appear twice in mirror
+    w_cc[-1] /= 2.0
+
+    # Convert to effective weights for integrands that already carry sin(theta).
+    # w_eff[j] = w_CC[j] / sin(theta_j), except at poles (sin=0) where the
+    # integrand vanishes anyway so w_eff=0.
+    sin_t = np.sin(theta_unique)
+    w_eff = np.zeros(N)
+    ok = sin_t > 1e-10
+    w_eff[ok] = w_cc[ok] / sin_t[ok]
+    return w_eff
+
+
 def compute_mode_coefficients_batch(args):
     """Compute Q coefficients for a batch of modes - with FFT optimization for phi integration."""
     modes_batch, THETA, PHI, E_THETA, E_PHI, sin_theta, theta_unique, phi_unique, norm_factor, legendre_data = args
@@ -755,7 +815,8 @@ def compute_mode_coefficients_batch(args):
     # FFT-optimized method for uniform phi grids
     results = []
     N_phi = len(phi_unique)
-    
+    w_theta = _cc_theta_weights(theta_unique)
+
     for n, m in modes_batch:
         # Unpack Legendre data
         P_norm, dP_norm = legendre_data[(n, m)]
@@ -800,9 +861,9 @@ def compute_mode_coefficients_batch(args):
         phi_integral_1 = np.fft.fft(integrand_1_with_phase, axis=1)[:, 0] * (2 * np.pi / N_phi)
         phi_integral_2 = np.fft.fft(integrand_2_with_phase, axis=1)[:, 0] * (2 * np.pi / N_phi)
         
-        # Now integrate over theta
-        Q1 = np.trapz(phi_integral_1, theta_unique, axis=0) * norm_factor
-        Q2 = np.trapz(phi_integral_2, theta_unique, axis=0) * norm_factor
+        # Now integrate over theta using Clenshaw-Curtis quadrature
+        Q1 = np.dot(w_theta, phi_integral_1) * norm_factor
+        Q2 = np.dot(w_theta, phi_integral_2) * norm_factor
         
         mode_power = (abs(Q1)**2 + abs(Q2)**2) / 2.0
         results.append(((n, m), Q1, Q2, mode_power))
@@ -813,36 +874,35 @@ def compute_mode_coefficients_batch(args):
 def compute_mode_coefficients_batch_trapz(args):
     """Original trapz method - fallback for non-uniform grids."""
     modes_batch, THETA, PHI, E_THETA, E_PHI, sin_theta, theta_unique, phi_unique, norm_factor, legendre_data = args
-    
+
     results = []
-    
+    w_theta = _cc_theta_weights(theta_unique)
+
     for n, m in modes_batch:
         P_norm, dP_norm = legendre_data[(n, m)]
         P_norm_2d = P_norm[:, np.newaxis]
         dP_norm_2d = dP_norm[:, np.newaxis]
-        
+
         prefactor = np.sqrt(2 / (n * (n + 1)))
         sign_factor = (m / abs(m)) ** m if m != 0 else 1.0
         phase = np.exp(-1j * m * PHI)
         i_factor_1 = (1j) ** n
         i_factor_2 = (1j) ** (n + 1)
-        
+
         # Use same epsilon as compute_all_modes_legendre for consistency
         sin_theta_safe = np.where(np.abs(sin_theta) < 1e-6, 1e-6, sin_theta)
         mP_over_sin = 1j * m * P_norm_2d / sin_theta_safe
-        
+
         K1_theta = prefactor * sign_factor * phase * i_factor_1 * mP_over_sin
         K1_phi = prefactor * sign_factor * phase * i_factor_1 * dP_norm_2d
         K2_theta = prefactor * sign_factor * phase * i_factor_2 * (dP_norm_2d)
         K2_phi = prefactor * sign_factor * phase * i_factor_2 * (-mP_over_sin)
-        
+
         integrand_1 = (E_THETA * np.conj(K1_theta) + E_PHI * np.conj(K1_phi)) * sin_theta
-        Q1 = np.trapz(np.trapz(integrand_1, phi_unique, axis=1), theta_unique, axis=0)
-        Q1 *= norm_factor
-        
+        Q1 = np.dot(w_theta, np.trapz(integrand_1, phi_unique, axis=1)) * norm_factor
+
         integrand_2 = (E_THETA * np.conj(K2_theta) + E_PHI * np.conj(K2_phi)) * sin_theta
-        Q2 = np.trapz(np.trapz(integrand_2, phi_unique, axis=1), theta_unique, axis=0)
-        Q2 *= norm_factor
+        Q2 = np.dot(w_theta, np.trapz(integrand_2, phi_unique, axis=1)) * norm_factor
         
         mode_power = (abs(Q1)**2 + abs(Q2)**2) / 2.0
         results.append(((n, m), Q1, Q2, mode_power))
@@ -1363,35 +1423,34 @@ class SphericalWaveExpansion:
                 Q1_coeffs = {}
                 Q2_coeffs = {}
                 mode_powers = []
-                
+                w_theta = _cc_theta_weights(theta_unique)
+
                 for mode_idx, (n, m) in enumerate(modes):
                     P_norm, dP_norm = legendre_cache[(n, m)]
-                    
+
                     P_norm_2d = P_norm[:, np.newaxis]
                     dP_norm_2d = dP_norm[:, np.newaxis]
-                    
+
                     prefactor = np.sqrt(2 / (n * (n + 1)))
                     sign_factor = (m / abs(m)) ** m if m != 0 else 1.0
                     phase = np.exp(-1j * m * PHI)
                     i_factor_1 = (1j) ** n
                     i_factor_2 = (1j) ** (n + 1)
-                    
+
                     sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
                     mP_over_sin = 1j * m * P_norm_2d / sin_theta_safe
-                    
+
                     K1_theta = prefactor * sign_factor * phase * i_factor_1 * mP_over_sin
                     K1_phi = prefactor * sign_factor * phase * i_factor_1 * dP_norm_2d
-                    
+
                     K2_theta = prefactor * sign_factor * phase * i_factor_2 * (dP_norm_2d)
                     K2_phi = prefactor * sign_factor * phase * i_factor_2 * (-mP_over_sin)
-                    
+
                     integrand_1 = (E_THETA * np.conj(K1_theta) + E_PHI * np.conj(K1_phi)) * sin_theta
-                    Q1 = np.trapezoid(np.trapezoid(integrand_1, phi_unique, axis=1), theta_unique, axis=0)
-                    Q1 *= norm_factor
-                    
+                    Q1 = np.dot(w_theta, np.trapezoid(integrand_1, phi_unique, axis=1)) * norm_factor
+
                     integrand_2 = (E_THETA * np.conj(K2_theta) + E_PHI * np.conj(K2_phi)) * sin_theta
-                    Q2 = np.trapezoid(np.trapezoid(integrand_2, phi_unique, axis=1), theta_unique, axis=0)
-                    Q2 *= norm_factor
+                    Q2 = np.dot(w_theta, np.trapezoid(integrand_2, phi_unique, axis=1)) * norm_factor
                     
                     Q1_coeffs[(n, m)] = Q1
                     Q2_coeffs[(n, m)] = Q2
@@ -1420,24 +1479,23 @@ class SphericalWaveExpansion:
                 for (n, m), mode_power in mode_powers:
                     power_per_m[abs(m)] += mode_power
 
-                # Find MMAX where tail is small AND cumulative power is sufficient
-                MMAX_truncated = 0
+                # Find MMAX where tail power is negligible AND cumulative power is sufficient
+                MMAX_truncated = MMAX_current  # default: keep everything
                 for m_test in range(0, MMAX_current + 1):
-                    # Cumulative power up to m_test
+                    # Cumulative power up to |m| = m_test
                     cumulative_m = sum(power_per_m[m] for m in range(0, m_test + 1))
                     cumulative_m_fraction = cumulative_m / total_power if total_power > 0 else 0
-                    
-                    # Check power in top modes near m_test
-                    m_cutoff = max(1, int(np.ceil(0.1 * m_test))) if m_test > 0 else 0
-                    high_m = range(max(0, m_test - m_cutoff + 1), m_test + 1)
-                    high_m_power = sum(power_per_m[m] for m in high_m)
-                    high_m_fraction = high_m_power / total_power if total_power > 0 else 0
-                    
-                    # Accept if BOTH: tail is small AND we have enough power
-                    if (high_m_fraction < azimuthal_power_threshold and
-                        cumulative_m_fraction >= power_threshold):
+
+                    # Tail power: power at |m| > m_test (modes we'd discard)
+                    tail_power = sum(power_per_m[m] for m in range(m_test + 1, MMAX_current + 1))
+                    tail_fraction = tail_power / total_power if total_power > 0 else 0
+
+                    # Accept if: enough cumulative power AND discarded tail is small
+                    if (cumulative_m_fraction >= power_threshold and
+                            tail_fraction < azimuthal_power_threshold):
                         MMAX_truncated = m_test
-                        logger.debug(f"Azimuthal truncation: MMAX {MMAX_current} -> {MMAX_truncated}, tail power: {high_m_fraction*100:.3f}%")
+                        logger.debug(f"Azimuthal truncation: MMAX {MMAX_current} -> {MMAX_truncated}, "
+                                     f"tail power: {tail_fraction*100:.4f}%")
                         break
                 
                 # Find highest n where tail modes have negligible power
@@ -1445,22 +1503,25 @@ class SphericalWaveExpansion:
                 for (n, m), pwr in mode_powers:
                     power_by_n[n] += pwr
 
-                NMAX_truncated = 1
-                for n_test in range(1, NMAX+1):
-                    # Check power in top 10% of modes at this truncation level
+                # Find smallest NMAX where local top modes are at noise level AND cumulative is sufficient
+                NMAX_truncated = NMAX  # default: keep everything if no noise floor found
+                for n_test in range(1, NMAX + 1):
+                    # Check power in top few modes near n_test (noise-floor detection)
                     n_cutoff = max(1, int(np.ceil(0.1 * n_test)))
                     high_modes = range(max(1, n_test - n_cutoff + 1), n_test + 1)
                     high_power = sum(power_by_n.get(n, 0) for n in high_modes)
                     high_power_fraction = high_power / total_power if total_power > 0 else 0
-                    
-                    # Also check cumulative power up to n_test
-                    cumulative = sum(power_by_n.get(n, 0) for n in range(1, n_test+1))
+
+                    # Cumulative power up to n_test
+                    cumulative = sum(power_by_n.get(n, 0) for n in range(1, n_test + 1))
                     cumulative_fraction = cumulative / total_power if total_power > 0 else 0
-                    
-                    # Accept if both: (1) tail is small AND (2) we have enough total power
-                    if (high_power_fraction < high_mode_power_threshold and 
-                        cumulative_fraction >= power_threshold):
+
+                    # Accept if: top modes are at noise level AND enough cumulative power
+                    if (high_power_fraction < high_mode_power_threshold and
+                            cumulative_fraction >= power_threshold):
                         NMAX_truncated = n_test
+                        logger.debug(f"N truncation: NMAX {NMAX} -> {NMAX_truncated}, "
+                                     f"local power: {high_power_fraction*100:.4f}%")
                         break
 
                 # Keep ALL modes up to NMAX_truncated and MMAX_truncated
