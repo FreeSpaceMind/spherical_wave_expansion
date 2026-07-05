@@ -1,18 +1,78 @@
 """
-Test: Load .cut -> extract Q coefficients via from_far_field -> compare with .sph reference.
+Test: Load .cut -> extract Q coefficients via from_far_field -> compare with .cut and .grd.
 
-Validates the inverse problem: given a far-field pattern, can we recover
-the spherical wave expansion coefficients that match the original .sph file?
+Validates the inverse problem: given a far-field pattern in Ludwig-3, can we
+recover SWE coefficients that reproduce both the far field (.cut) and near field (.grd)?
 """
 
 import numpy as np
 import pytest
 
-from swe import SphericalWaveExpansion
-from swe.ticra_io import read_grasp_cut, cut_to_fields
-from tests.conftest import (
-    SPH_FILE, CUT_FILE, requires_sph, requires_cut, compute_comparison_metrics
+from swe import SphericalWaveExpansion, cartesian_to_spherical
+from swe.ticra_io import read_grasp_cut, read_grasp_grd
+from swe.ludwig3 import (
+    spherical_to_ludwig3, ludwig3_to_spherical,
+    remap_negative_theta, extract_cut_frequency_set
 )
+from tests.conftest import (
+    SPH_FILE, CUT_FILE, GRD_FILE,
+    requires_sph, requires_cut, requires_grd,
+    compute_comparison_metrics,
+    N_PHI_PER_FREQ, FREQ_INDEX_8GHZ, Z_DISTANCE
+)
+
+
+def _build_full_sphere_grid(cuts):
+    """
+    Build a full-sphere (theta, phi) grid from .cut data with negative-theta remapping.
+
+    Each cut has theta from -180 to +180 deg at a fixed phi. Negative theta maps to
+    theta'=|theta|, phi'=phi+180. With phi from 0-180 deg, this covers the full sphere.
+
+    Returns:
+        theta, phi, E_theta, E_phi as 1D arrays on a regular grid,
+        sorted by (phi, theta) for from_far_field compatibility.
+    """
+    grid_points = {}  # (theta_round, phi_round) -> (E_theta, E_phi)
+
+    for cut in cuts:
+        phi_deg = cut['constant']
+        theta_deg_arr = cut['v_ini'] + np.arange(cut['v_num']) * cut['v_inc']
+        theta_rad, phi_rad = remap_negative_theta(theta_deg_arr, phi_deg)
+
+        Eco = cut['data'][:, 0]
+        Ecx = cut['data'][:, 1]
+        E_theta, E_phi = ludwig3_to_spherical(Eco, Ecx, phi_rad)
+
+        for k in range(len(theta_rad)):
+            th_key = round(np.rad2deg(theta_rad[k]), 4)
+            ph_key = round(np.rad2deg(phi_rad[k]) % 360, 4)
+            grid_points[(th_key, ph_key)] = (E_theta[k], E_phi[k])
+
+    all_theta_deg = sorted(set(k[0] for k in grid_points.keys()))
+    all_phi_deg = sorted(set(k[1] for k in grid_points.keys()))
+
+    n_theta = len(all_theta_deg)
+    n_phi = len(all_phi_deg)
+
+    print(f"\n  Grid: {n_theta} theta x {n_phi} phi = {n_theta * n_phi} points")
+    print(f"  Theta: [{all_theta_deg[0]:.1f}, {all_theta_deg[-1]:.1f}] deg")
+    print(f"  Phi: [{all_phi_deg[0]:.1f}, {all_phi_deg[-1]:.1f}] deg")
+
+    theta_grid = np.deg2rad(np.array(all_theta_deg))
+    phi_grid = np.deg2rad(np.array(all_phi_deg))
+    THETA, PHI = np.meshgrid(theta_grid, phi_grid, indexing='ij')
+
+    E_THETA = np.zeros((n_theta, n_phi), dtype=complex)
+    E_PHI = np.zeros((n_theta, n_phi), dtype=complex)
+
+    for i, th in enumerate(all_theta_deg):
+        for j, ph in enumerate(all_phi_deg):
+            key = (round(th, 4), round(ph, 4))
+            if key in grid_points:
+                E_THETA[i, j], E_PHI[i, j] = grid_points[key]
+
+    return THETA.ravel(), PHI.ravel(), E_THETA.ravel(), E_PHI.ravel()
 
 
 @requires_sph
@@ -21,152 +81,154 @@ class TestCutToSph:
 
     @pytest.fixture(autouse=True)
     def setup(self):
-        """Load the reference data."""
-        self.swe_ref = SphericalWaveExpansion.from_sph_file(SPH_FILE)
-        self.cut_data = read_grasp_cut(CUT_FILE)
-
-    def _build_full_sphere_grid(self):
-        """
-        Build a full-sphere (theta, phi) grid from the .cut file data.
-
-        The .cut file typically only has cuts at a few phi values.
-        For from_far_field to work well, we need data on a regular 2D grid.
-        This function checks if the .cut data covers enough of the sphere.
-
-        Returns:
-            theta, phi, E_theta, E_phi: arrays on a regular grid, or None if
-            the .cut data is insufficient.
-        """
-        cuts = self.cut_data['cuts']
-        if not cuts:
-            return None, None, None, None
-
-        # Check if we have enough phi cuts for a full 2D grid
-        phi_values = sorted(set(c['constant'] for c in cuts))
-        n_phi = len(phi_values)
-
-        # Use the first cut to determine theta sampling
-        first_cut = cuts[0]
-        theta_deg = first_cut['v_ini'] + np.arange(first_cut['v_num']) * first_cut['v_inc']
-        n_theta = len(theta_deg)
-
-        print(f"\n  Cut file has {n_phi} phi values, {n_theta} theta points per cut")
-        print(f"  Phi values: {phi_values}")
-        print(f"  Theta range: [{theta_deg[0]:.1f}, {theta_deg[-1]:.1f}] deg")
-
-        if n_phi < 3:
-            print("  WARNING: Too few phi cuts for reliable SWE extraction.")
-            print("  Need at least a few phi values for from_far_field.")
-
-        # Build 2D grid: theta varies along rows, phi along columns
-        theta_rad = np.deg2rad(theta_deg)
-        phi_rad = np.deg2rad(np.array(phi_values))
-
-        THETA, PHI = np.meshgrid(theta_rad, phi_rad, indexing='ij')
-
-        E_THETA = np.zeros((n_theta, n_phi), dtype=complex)
-        E_PHI = np.zeros((n_theta, n_phi), dtype=complex)
-
-        # Map cuts to grid columns
-        phi_to_col = {phi: j for j, phi in enumerate(phi_values)}
-        for cut in cuts:
-            j = phi_to_col.get(cut['constant'])
-            if j is None:
-                continue
-            # Verify theta sampling matches
-            cut_theta = cut['v_ini'] + np.arange(cut['v_num']) * cut['v_inc']
-            if len(cut_theta) != n_theta or not np.allclose(cut_theta, theta_deg, atol=0.01):
-                print(f"  WARNING: Cut at phi={cut['constant']} has different theta sampling")
-                continue
-            E_THETA[:, j] = cut['data'][:, 0]
-            E_PHI[:, j] = cut['data'][:, 1]
-
-        return THETA.ravel(), PHI.ravel(), E_THETA.ravel(), E_PHI.ravel()
+        """Load reference data."""
+        self.swe_ref = SphericalWaveExpansion.from_sph_file(SPH_FILE, normalize=False)
+        self.freq = self.swe_ref.frequencies[FREQ_INDEX_8GHZ]
+        all_cuts = read_grasp_cut(CUT_FILE)
+        self.cut_data = extract_cut_frequency_set(
+            all_cuts, FREQ_INDEX_8GHZ, N_PHI_PER_FREQ
+        )
 
     def test_cut_to_swe_extraction(self):
         """Extract SWE coefficients from .cut data and compare with .sph reference."""
-        theta, phi, E_theta, E_phi = self._build_full_sphere_grid()
-
-        if theta is None:
-            pytest.skip("Could not build grid from .cut data")
-
-        if self.swe_ref.frequency is None:
-            pytest.skip("Reference .sph has no frequency info")
+        theta, phi, E_theta, E_phi = _build_full_sphere_grid(self.cut_data['cuts'])
 
         print(f"\n  Extracting SWE from {len(theta)} field points...")
-        print(f"  Reference: NMAX={self.swe_ref.NMAX}, MMAX={self.swe_ref.MMAX}")
+        print(f"  Reference: NMAX={self.swe_ref.NMAX(self.freq)}, "
+              f"MMAX={self.swe_ref.MMAX(self.freq)}")
 
-        # Extract coefficients
         swe_extracted = SphericalWaveExpansion.from_far_field(
             theta, phi, E_theta, E_phi,
-            frequency=self.swe_ref.frequency,
-            NMAX_initial=self.swe_ref.NMAX,
-            MMAX_initial=self.swe_ref.MMAX,
+            frequency=self.freq,
+            NMAX_initial=self.swe_ref.NMAX(self.freq),
+            MMAX_initial=self.swe_ref.MMAX(self.freq),
             use_multiprocessing=False,
+            normalize=False,
         )
 
-        print(f"  Extracted: NMAX={swe_extracted.NMAX}, MMAX={swe_extracted.MMAX}")
-        print(f"  Q1 modes: {len(swe_extracted.Q1_coeffs)}")
-        print(f"  Q2 modes: {len(swe_extracted.Q2_coeffs)}")
+        freq_ext = swe_extracted.frequencies[0]
+        print(f"  Extracted: NMAX={swe_extracted.NMAX(freq_ext)}, "
+              f"MMAX={swe_extracted.MMAX(freq_ext)}")
+        print(f"  Q1 modes: {len(swe_extracted.Q1_coeffs(freq_ext))}")
+        print(f"  Q2 modes: {len(swe_extracted.Q2_coeffs(freq_ext))}")
 
-        # Compare Q coefficients
-        self._compare_coefficients(swe_extracted, self.swe_ref)
+        ref_q1 = self.swe_ref.Q1_coeffs(self.freq)
+        ref_q2 = self.swe_ref.Q2_coeffs(self.freq)
+        ext_q1 = swe_extracted.Q1_coeffs(freq_ext)
+        ext_q2 = swe_extracted.Q2_coeffs(freq_ext)
 
-    def _compare_coefficients(self, swe_comp, swe_ref):
-        """Compare Q coefficients between computed and reference SWE."""
-        # Gather all Q1 values for common modes
-        common_keys_q1 = set(swe_comp.Q1_coeffs.keys()) & set(swe_ref.Q1_coeffs.keys())
-        common_keys_q2 = set(swe_comp.Q2_coeffs.keys()) & set(swe_ref.Q2_coeffs.keys())
+        common_q1 = set(ext_q1.keys()) & set(ref_q1.keys())
+        common_q2 = set(ext_q2.keys()) & set(ref_q2.keys())
+        print(f"  Common Q1 modes: {len(common_q1)}")
+        print(f"  Common Q2 modes: {len(common_q2)}")
 
-        print(f"\n  Common Q1 modes: {len(common_keys_q1)}")
-        print(f"  Common Q2 modes: {len(common_keys_q2)}")
+        if common_q1:
+            compute_comparison_metrics(
+                np.array([ext_q1[k] for k in sorted(common_q1)]),
+                np.array([ref_q1[k] for k in sorted(common_q1)]),
+                label="Q1 coefficients"
+            )
+        if common_q2:
+            compute_comparison_metrics(
+                np.array([ext_q2[k] for k in sorted(common_q2)]),
+                np.array([ref_q2[k] for k in sorted(common_q2)]),
+                label="Q2 coefficients"
+            )
 
-        if common_keys_q1:
-            comp_q1 = np.array([swe_comp.Q1_coeffs[k] for k in sorted(common_keys_q1)])
-            ref_q1 = np.array([swe_ref.Q1_coeffs[k] for k in sorted(common_keys_q1)])
-            compute_comparison_metrics(comp_q1, ref_q1, label="Q1 coefficients")
-
-        if common_keys_q2:
-            comp_q2 = np.array([swe_comp.Q2_coeffs[k] for k in sorted(common_keys_q2)])
-            ref_q2 = np.array([swe_ref.Q2_coeffs[k] for k in sorted(common_keys_q2)])
-            compute_comparison_metrics(comp_q2, ref_q2, label="Q2 coefficients")
-
-    def test_cut_roundtrip_via_swe(self):
+    def test_cut_roundtrip_farfield(self):
         """
         Load .cut -> extract SWE -> recompute far field -> compare with original .cut.
-
-        Even if the Q coefficients don't perfectly match the reference .sph,
-        the reconstructed far field from those Q's should match the input .cut.
         """
-        theta, phi, E_theta_ref, E_phi_ref = self._build_full_sphere_grid()
+        theta, phi, E_theta, E_phi = _build_full_sphere_grid(self.cut_data['cuts'])
 
-        if theta is None:
-            pytest.skip("Could not build grid from .cut data")
-
-        if self.swe_ref.frequency is None:
-            pytest.skip("Reference .sph has no frequency info")
-
-        # Extract SWE
         swe_extracted = SphericalWaveExpansion.from_far_field(
-            theta, phi, E_theta_ref, E_phi_ref,
-            frequency=self.swe_ref.frequency,
-            NMAX_initial=self.swe_ref.NMAX,
-            MMAX_initial=self.swe_ref.MMAX,
+            theta, phi, E_theta, E_phi,
+            frequency=self.freq,
+            NMAX_initial=self.swe_ref.NMAX(self.freq),
+            MMAX_initial=self.swe_ref.MMAX(self.freq),
             use_multiprocessing=False,
+            normalize=False,
+        )
+        freq_ext = swe_extracted.frequencies[0]
+
+        print(f"\n{'='*70}")
+        print(f"Roundtrip: .cut -> SWE -> far_field -> Ludwig-3 vs original .cut")
+        print(f"{'='*70}")
+
+        for i, cut in enumerate(self.cut_data['cuts'][:5]):  # first 5 cuts for speed
+            phi_deg = cut['constant']
+            theta_deg = cut['v_ini'] + np.arange(cut['v_num']) * cut['v_inc']
+            theta_rad, phi_rad = remap_negative_theta(theta_deg, phi_deg)
+
+            E_th, E_ph = swe_extracted.far_field(
+                theta_rad, phi_rad, frequency=freq_ext, normalize=False
+            )
+            Eco, Ecx = spherical_to_ludwig3(E_th, E_ph, phi_rad)
+
+            compute_comparison_metrics(
+                Eco, cut['data'][:, 0],
+                label=f"Roundtrip cut {i} (phi={phi_deg}deg) Eco"
+            )
+
+
+@requires_sph
+@requires_cut
+@requires_grd
+class TestCutSweReproducesGrd:
+    """Cross-validation: SWE extracted from .cut should reproduce .grd near field."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        """Load data and extract SWE from .cut."""
+        self.swe_ref = SphericalWaveExpansion.from_sph_file(SPH_FILE, normalize=False)
+        self.freq = self.swe_ref.frequencies[FREQ_INDEX_8GHZ]
+        all_cuts = read_grasp_cut(CUT_FILE)
+        cut_data = extract_cut_frequency_set(
+            all_cuts, FREQ_INDEX_8GHZ, N_PHI_PER_FREQ
+        )
+        self.grd_data = read_grasp_grd(GRD_FILE)
+
+        theta, phi, E_theta, E_phi = _build_full_sphere_grid(cut_data['cuts'])
+        self.swe_extracted = SphericalWaveExpansion.from_far_field(
+            theta, phi, E_theta, E_phi,
+            frequency=self.freq,
+            NMAX_initial=self.swe_ref.NMAX(self.freq),
+            MMAX_initial=self.swe_ref.MMAX(self.freq),
+            use_multiprocessing=False,
+            normalize=False,
+        )
+        self.freq_ext = self.swe_extracted.frequencies[0]
+
+    def test_extracted_swe_reproduces_grd(self):
+        """Compute near field from extracted SWE, compare with .grd at z=0.25m."""
+        field = self.grd_data['fields'][FREQ_INDEX_8GHZ]
+        x = np.linspace(field['grid_min_x'], field['grid_max_x'], field['nx'])
+        y = np.linspace(field['grid_min_y'], field['grid_max_y'], field['ny'])
+        X, Y = np.meshgrid(x, y)
+        Z = np.full_like(X, Z_DISTANCE)
+
+        r, theta, phi = cartesian_to_spherical(X.ravel(), Y.ravel(), Z.ravel())
+
+        print(f"\n  Computing near field at {len(r)} points, z={Z_DISTANCE}m...")
+        (E_r, E_theta, E_phi), _ = self.swe_extracted.near_field(
+            r, theta, phi, frequency=self.freq_ext, normalize=False
         )
 
-        # Recompute far field
-        E_theta_recomp, E_phi_recomp = swe_extracted.far_field(theta, phi)
+        Eco, Ecx = spherical_to_ludwig3(E_theta, E_phi, phi)
+        Eco = Eco.reshape(X.shape)
+        Ecx = Ecx.reshape(X.shape)
 
-        metrics_th = compute_comparison_metrics(
-            E_theta_recomp, E_theta_ref,
-            label="Far-field roundtrip E_theta (.cut -> SWE -> far_field)"
+        ref_Eco = field['data'][:, :, 0]
+        ref_Ecx = field['data'][:, :, 1]
+
+        metrics_co = compute_comparison_metrics(
+            Eco, ref_Eco,
+            label="Cross-val near-field Eco: extracted SWE vs .grd"
         )
-        metrics_ph = compute_comparison_metrics(
-            E_phi_recomp, E_phi_ref,
-            label="Far-field roundtrip E_phi (.cut -> SWE -> far_field)"
+        metrics_cx = compute_comparison_metrics(
+            Ecx, ref_Ecx,
+            label="Cross-val near-field Ecx: extracted SWE vs .grd"
         )
 
-        # The roundtrip should be quite good if enough modes are used
-        print(f"\n  E_theta normalized RMS: {metrics_th['normalized_rms_after_scaling']:.6e}")
-        print(f"  E_phi normalized RMS:   {metrics_ph['normalized_rms_after_scaling']:.6e}")
+        print(f"\n  Eco scaling ratio: {metrics_co['scaling_ratio']:.6f}")
+        print(f"  Ecx scaling ratio: {metrics_cx['scaling_ratio']:.6f}")

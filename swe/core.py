@@ -10,11 +10,7 @@ Key Features:
 - Calculate far-field patterns from Q coefficients
 - Calculate near-field E and H components at arbitrary points
 - Calculate equivalent surface currents on specified surfaces
-- Extract Q coefficients from measurements:
-  * Far-field patterns
-  * Spherical near-field measurements
-  * Planar near-field measurements  
-  * Cylindrical near-field measurements
+- Extract Q coefficients from far-field patterns (from_far_field)
 
 Physical Conventions:
 - Time dependence: exp(jωt) (matches Ticra)
@@ -23,7 +19,7 @@ Physical Conventions:
 - Electric field E: V/m
 - Magnetic field H: A/m
 - Impedance η₀ = 376.73 Ω (free space)
-- Outgoing spherical waves: h_n^(3)(kr) = j_n(kr) - i·y_n(kr)
+- Outgoing spherical waves: h_n^(2)(kr) = j_n(kr) - i·y_n(kr)
 
 Coordinate System:
 - r: radial distance (m)
@@ -291,113 +287,138 @@ _legendre_cache = LegendreCoefficientCache()
 
 def compute_legendre_recurrence(n_max: int, m: int, cos_theta: np.ndarray) -> np.ndarray:
     """
-    Compute associated Legendre functions P_n^m(cos θ) for all n from m to n_max
-    using recurrence relations. Much faster than calling lpmv repeatedly.
-    
-    Args:
-        n_max: Maximum degree
-        m: Order (can be negative)
-        cos_theta: cos(θ) values, shape (N,)
-    
+    Compute NORMALIZED associated Legendre functions P̄_n^m(cos θ) for all n from
+    |m| to n_max using a fully normalized recurrence.
+
+    Normalization (Hansen convention):
+        P̄_n^m = sqrt((2n+1)/2 * (n-|m|)! / (n+|m|)!) * P_n^m
+
+    The recurrence operates entirely on normalized values, preventing float64
+    overflow at any degree/order (including abs_m > ~143 where the un-normalized
+    P_m^m seed would otherwise exceed 1.8e308).
+
+    Seed P̄_m^m is computed in log-space:
+        log|P̄_m^m| = 0.5*(log(2m+1) - log(2) - lgamma(2m+1))
+                    + lgamma(m+0.5) + m*log(2) - 0.5*log(π)
+                    + m*log(sin θ)
+
+    Normalized recurrence (n > m+1):
+        P̄_n^m = A_nm * cos(θ) * P̄_{n-1}^m - B_nm * P̄_{n-2}^m
+        A_nm = sqrt((4n²-1) / (n²-m²))
+        B_nm = sqrt((2n+1)(n-1-m)(n-1+m) / ((2n-3)(n²-m²)))
+
     Returns:
-        Array of shape (n_max - m + 1, N) containing P_m^m, P_{m+1}^m, ..., P_{n_max}^m
+        Array of shape (n_max - |m| + 1, N) containing P̄_{|m|}^m, ..., P̄_{n_max}^m
+        (already Hansen-normalized; callers must NOT multiply by norm_factor again)
     """
     abs_m = abs(m)
     cos_theta = np.atleast_1d(cos_theta)
     N = len(cos_theta)
-    
-    # Avoid singularities
+
     cos_theta = np.clip(cos_theta, -1.0, 1.0)
     sin_theta = np.sqrt(1 - cos_theta**2)
-    
-    # Number of n values we need
+
     n_count = n_max - abs_m + 1
     P = np.zeros((n_count, N))
-    
+
     if abs_m > n_max:
         return P
-    
-    # Starting value: P_m^m using the formula
-    # P_m^m = (-1)^m * (2m-1)!! * sin^m(θ)
+
+    # -----------------------------------------------------------------
+    # Normalized seed P̄_m^m in log-space to prevent float64 overflow.
+    # log C = 0.5*(log(2m+1) - log(2) - lgamma(2m+1))
+    #        + lgamma(m + 0.5) + m*log(2) - 0.5*log(π)
+    # P̄_m^m = (-1)^m * C * sin^m(θ)   (C > 0 by construction)
+    # -----------------------------------------------------------------
     if abs_m == 0:
-        P[0, :] = 1.0
+        P[0, :] = math.sqrt(0.5)   # P̄_0^0 = sqrt(1/2)
     else:
-        # Double factorial: (2m-1)!! = 1*3*5*...*(2m-1)
-        double_fac = 1.0
-        for i in range(1, 2*abs_m, 2):
-            double_fac *= i
-        P[0, :] = double_fac * (sin_theta ** abs_m)
+        log_C = (0.5 * (math.log(2 * abs_m + 1) - math.log(2) - math.lgamma(2 * abs_m + 1))
+                 + math.lgamma(abs_m + 0.5) + abs_m * math.log(2) - 0.5 * math.log(math.pi))
+        with np.errstate(divide='ignore'):
+            log_sin = np.where(sin_theta > 0.0, np.log(sin_theta), -np.inf)
+        log_seed = log_C + abs_m * log_sin
+        # Clamp to avoid both overflow (>709) and extreme underflow — values
+        # beyond these bounds round to +inf or 0 in float64 anyway.
+        P[0, :] = np.where(np.isfinite(log_seed),
+                           np.exp(np.clip(log_seed, -708.0, 708.0)), 0.0)
         if abs_m % 2 == 1:
             P[0, :] *= -1
-    
+
     if n_count == 1:
         return P
-    
-    # Next value: P_{m+1}^m using specific recurrence
-    # P_{m+1}^m = (2m+1) * cos(θ) * P_m^m
-    if abs_m + 1 <= n_max:
-        P[1, :] = (2 * abs_m + 1) * cos_theta * P[0, :]
-    
-    # General recurrence for n >= m+2:
-    # (n-m) P_n^m = (2n-1) cos(θ) P_{n-1}^m - (n+m-1) P_{n-2}^m
+
+    # -----------------------------------------------------------------
+    # First step: P̄_{m+1}^m = sqrt(2m+3) * cos(θ) * P̄_m^m
+    # (derived from A_{m+1,m} = sqrt((4(m+1)²-1)/((m+1)²-m²)) = sqrt(2m+3))
+    # -----------------------------------------------------------------
+    P[1, :] = math.sqrt(2 * abs_m + 3) * cos_theta * P[0, :]
+
+    # -----------------------------------------------------------------
+    # General normalized recurrence for n >= abs_m + 2:
+    #   P̄_n^m = A_nm * cos(θ) * P̄_{n-1}^m - B_nm * P̄_{n-2}^m
+    # -----------------------------------------------------------------
     for i in range(2, n_count):
         n = abs_m + i
-        coeff1 = (2 * n - 1) / (n - abs_m)
-        coeff2 = (n + abs_m - 1) / (n - abs_m)
-        P[i, :] = coeff1 * cos_theta * P[i-1, :] - coeff2 * P[i-2, :]
-    
+        n2 = n * n
+        m2 = abs_m * abs_m
+        n2m2 = n2 - m2                          # n² - m²
+        A = math.sqrt((4 * n2 - 1) / n2m2)
+        B = math.sqrt((2 * n + 1) * (n - 1 - abs_m) * (n - 1 + abs_m)
+                      / ((2 * n - 3) * n2m2))
+        P[i, :] = A * cos_theta * P[i - 1, :] - B * P[i - 2, :]
+
     return P
 
 
 def compute_legendre_derivative_recurrence(n_max: int, m: int, cos_theta: np.ndarray,
                                            P: np.ndarray = None) -> np.ndarray:
     """
-    Compute derivatives dP_n^m/dθ using recurrence relations.
-    
-    The derivative can be computed from:
-    sin(θ) dP_n^m/dθ = n*cos(θ)*P_n^m - (n+m)*P_{n-1}^m
-    
-    Or for better numerical stability:
-    dP_n^m/dθ = (n*cos(θ)*P_n^m - (n+m)*P_{n-1}^m) / sin(θ)
-    
+    Compute derivatives dP̄_n^m/dθ for the NORMALIZED Legendre functions returned
+    by compute_legendre_recurrence.
+
+    Uses the normalized derivative formula:
+        sin(θ) dP̄_n^m/dθ = n*cos(θ)*P̄_n^m - sqrt((n²-m²)(2n+1)/(2n-1)) * P̄_{n-1}^m
+
+    For n = |m| (seed): P̄_{m-1}^m ≡ 0, so:
+        dP̄_m^m/dθ = |m| * cos(θ)/sin(θ) * P̄_m^m
+
     Args:
         n_max: Maximum degree
         m: Order
         cos_theta: cos(θ) values
-        P: Pre-computed P values (optional, will compute if not provided)
-    
+        P: Pre-computed normalized P̄ values from compute_legendre_recurrence
+           (computed if not provided)
+
     Returns:
-        Array of shape (n_max - |m| + 1, N) containing derivatives
+        Array of shape (n_max - |m| + 1, N) containing dP̄_n^m/dθ
     """
     abs_m = abs(m)
     cos_theta = np.atleast_1d(cos_theta)
     N = len(cos_theta)
-    
+
     cos_theta = np.clip(cos_theta, -1.0, 1.0)
     sin_theta = np.sqrt(1 - cos_theta**2)
-    
-    # Compute P if not provided
+
     if P is None:
         P = compute_legendre_recurrence(n_max, m, cos_theta)
-    
+
     n_count = n_max - abs_m + 1
     dP = np.zeros((n_count, N))
-    
-    # For n = m, special case:
-    # dP_m^m/dθ = m * cos(θ)/sin(θ) * P_m^m
-    # But we need P_{m-1}^m which is 0, so:
-    # sin(θ) dP_m^m/dθ = m*cos(θ)*P_m^m - 0
+
+    safe_sin = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
+
+    # Seed: dP̄_m^m/dθ = abs_m * cos(θ)/sin(θ) * P̄_m^m
     if n_count > 0:
-        # Avoid division by zero at poles
-        safe_sin = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
         dP[0, :] = abs_m * cos_theta * P[0, :] / safe_sin
-    
-    # For n > m, use the recurrence with P_{n-1}^m
+
+    # General: sin(θ)*dP̄_n^m/dθ = n*cos(θ)*P̄_n^m - D_nm * P̄_{n-1}^m
+    # where D_nm = sqrt((n²-m²)(2n+1)/(2n-1))
     for i in range(1, n_count):
         n = abs_m + i
-        safe_sin = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
-        dP[i, :] = (n * cos_theta * P[i, :] - (n + abs_m) * P[i-1, :]) / safe_sin
-    
+        D = math.sqrt((n * n - abs_m * abs_m) * (2 * n + 1) / (2 * n - 1))
+        dP[i, :] = (n * cos_theta * P[i, :] - D * P[i - 1, :]) / safe_sin
+
     return dP
 
 
@@ -421,23 +442,12 @@ def normalized_associated_legendre(n: int, m: int,
     
     abs_m = abs(m)
     
-    # Compute P_n^m for this n and all lower n values using recurrence
-    # We need P_{n-1}^m for the derivative, so compute up to n
+    # compute_legendre_recurrence returns already-normalized P̄_n^m values.
+    # We need up to n so the derivative recurrence has P̄_{n-1}^m available.
     P_all = compute_legendre_recurrence(n, abs(m), cos_theta)
-    
-    # Extract P_n^m (it's the last one in the array)
-    P_n_m = P_all[-1, :]
-    
-    # Compute derivative
     dP_all = compute_legendre_derivative_recurrence(n, abs(m), cos_theta, P_all)
-    dP_n_m_dtheta = dP_all[-1, :]
-    
-    # Apply Hansen normalization
-    norm_factor = _legendre_cache.normalization_factor(n, m)
-    P_norm = norm_factor * P_n_m
-    dP_norm = norm_factor * dP_n_m_dtheta
-    
-    return P_norm, dP_norm
+
+    return P_all[-1, :], dP_all[-1, :]
 
 
 def compute_pole_limits(n: int, m: int, pole: str = 'north') -> Tuple[float, float]:
@@ -541,23 +551,20 @@ def compute_all_modes_legendre(n_max: int, m_max: int,
         P_all = compute_legendre_recurrence(n_max, m, cos_theta)
         dP_all = compute_legendre_derivative_recurrence(n_max, m, cos_theta, P_all)
         
-        # Store normalized results for each n
+        # compute_legendre_recurrence now returns already-normalized P̄_n^m values;
+        # no additional norm_factor multiplication is needed.
         for i, n in enumerate(range(abs_m, n_max + 1)):
             if n < 1:  # Skip n=0 for spherical wave expansion
                 continue
-            
-            norm_factor = _legendre_cache.normalization_factor(n, m)
-            P_norm = norm_factor * P_all[i, :]
-            dP_norm = norm_factor * dP_all[i, :]
-            
-            results[(n, m)] = (P_norm, dP_norm)
+            results[(n, m)] = (P_all[i, :], dP_all[i, :])
     
     return results
 
 def far_field_pattern_functions(n: int, m: int,
                                          theta: np.ndarray,
                                          phi: np.ndarray,
-                                         legendre_cache: Dict = None):
+                                         legendre_cache: Dict = None,
+                                         phase_cache: Dict = None):
     """
     Optimized version that can use pre-computed Legendre functions.
 
@@ -571,6 +578,8 @@ def far_field_pattern_functions(n: int, m: int,
         theta: Polar angles
         phi: Azimuthal angles
         legendre_cache: Optional pre-computed dict from compute_all_modes_legendre
+        phase_cache: Optional dict mapping m -> exp(-1j*m*phi) (avoids recomputing
+                     the same phase for every n at a fixed m value)
 
     Returns:
         (K1_theta, K1_phi), (K2_theta, K2_phi)
@@ -603,15 +612,16 @@ def far_field_pattern_functions(n: int, m: int,
         sign_factor = (-m / abs(m)) ** m
 
     # Ticra sign convention: negative phase progression
-    phase = np.exp(-1j * m * phi)
+    if phase_cache is not None and m in phase_cache:
+        phase = phase_cache[m]
+    else:
+        phase = np.exp(-1j * m * phi)
     i_factor_1 = (1j) ** (n + 1)
     i_factor_2 = (1j) ** (n)
 
     sin_theta = np.sin(theta_safe)
     mP_over_sin = m * P_norm / sin_theta
 
-    # signs are tricky here, had to compare near field form of Ticra and Hansen to
-    # derive far field forms for Ticra
     K1_theta = prefactor * sign_factor * phase * i_factor_1 * (-1j * mP_over_sin)
     K1_phi = prefactor * sign_factor * phase * i_factor_1 * (-dP_norm_dtheta)
     
@@ -621,8 +631,44 @@ def far_field_pattern_functions(n: int, m: int,
     return (K1_theta, K1_phi), (K2_theta, K2_phi)
 
 
+def _precompute_bessel_numpy(nmax: int, kr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Numpy upward recurrence for spherical Bessel functions (no Numba required).
+
+    Uses the same recurrence as the Numba version:
+        f_{n+1}(x) = (2n+1)/x * f_n(x) - f_{n-1}(x)
+
+    This is stable for y_n (Neumann, growing) and for j_n when n < kr.
+    For n >> kr the j_n recurrence loses relative precision, but this is
+    acceptable in practice because those modes carry negligible power.
+
+    Each recurrence step is a single vectorised numpy operation over all
+    kr values, replacing the 2*(nmax+1) individual scipy calls.
+    """
+    kr = np.where(kr < 1e-30, 1e-30, kr)  # guard against division by zero
+
+    j_all = np.empty((nmax + 1, len(kr)))
+    y_all = np.empty((nmax + 1, len(kr)))
+
+    # Analytic initial values
+    j_all[0] = np.sin(kr) / kr
+    y_all[0] = -np.cos(kr) / kr
+
+    if nmax >= 1:
+        j_all[1] = np.sin(kr) / kr**2 - np.cos(kr) / kr
+        y_all[1] = -np.cos(kr) / kr**2 - np.sin(kr) / kr
+
+    # Upward recurrence: f_{n+1} = (2n+1)/x * f_n - f_{n-1}
+    for n in range(1, nmax):
+        factor = (2 * n + 1) / kr
+        j_all[n + 1] = factor * j_all[n] - j_all[n - 1]
+        y_all[n + 1] = factor * y_all[n] - y_all[n - 1]
+
+    return j_all, y_all
+
+
 def _precompute_bessel_scipy(nmax: int, kr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Scipy-based Bessel pre-computation (fallback when Numba not available)."""
+    """Scipy-based Bessel pre-computation (kept as reference/fallback)."""
     N = len(kr)
     j_all = np.zeros((nmax + 1, N))
     y_all = np.zeros((nmax + 1, N))
@@ -699,7 +745,7 @@ def precompute_spherical_bessel(nmax: int, kr: np.ndarray,
     if use_numba and HAS_NUMBA:
         return _precompute_bessel_numba(nmax, kr)
     else:
-        return _precompute_bessel_scipy(nmax, kr)
+        return _precompute_bessel_numpy(nmax, kr)
 
 
 def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
@@ -712,18 +758,21 @@ def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
     """
     abs_m = abs(m)
     
-    # Apply pole avoidance
+    # Apply pole avoidance — epsilon must match compute_all_modes_legendre (1e-6)
+    # so that P_norm from cache and sin_theta are evaluated at the same clamped θ.
+    # A larger epsilon here would make mP_over_sin = jm·P_norm/sin_theta wrong
+    # at the exact pole (θ=0) by a factor of epsilon_here/epsilon_cache.
     theta_safe = np.copy(theta)
-    epsilon = 1e-3
+    epsilon = 1e-6
     theta_safe = np.where(theta < epsilon, epsilon, theta_safe)
     theta_safe = np.where(theta > (np.pi - epsilon), np.pi - epsilon, theta_safe)
-    
+
     # Get Legendre functions
     if legendre_cache is not None and (n, m) in legendre_cache:
         P_norm, dP_norm = legendre_cache[(n, m)]
     else:
         P_norm, dP_norm = normalized_associated_legendre(n, m, theta_safe)
-    
+
     # Radial functions - Hankel function of second kind
     kr = k * r
 
@@ -739,7 +788,7 @@ def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
             j_n_m1 = j_all[n - 1]
             y_n_m1 = y_all[n - 1]
     else:
-        # Fallback to scipy calls (backward compatibility)
+        # No pre-computed cache: call scipy directly
         j_n = spherical_jn(n, kr)
         y_n = spherical_yn(n, kr)
         if n == 0:
@@ -793,6 +842,63 @@ def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
     return (F1_E_r, F1_E_theta, F1_E_phi), (F2_E_r, F2_E_theta, F2_E_phi), \
            (F1_H_r, F1_H_theta, F1_H_phi), (F2_H_r, F2_H_theta, F2_H_phi)
 
+
+def _cc_theta_weights(theta_unique: np.ndarray) -> np.ndarray:
+    """Effective theta quadrature weights for Clenshaw-Curtis integration.
+
+    The existing integration code computes:
+
+        Q ∝ sum_j w_j * phi_integral_j
+
+    where phi_integral_j already contains the sin(theta_j) Jacobian factor.
+    The weights returned here satisfy:
+
+        sum_j w_j * [g(theta_j) * sin(theta_j)]
+            ≈ integral_0^pi g(theta) sin(theta) dtheta
+
+    i.e.,  w_j = w_CC_j / sin(theta_j)   (with w_j=0 at poles where sin=0).
+
+    For a uniform grid theta_j = j*pi/(N-1) (CGL nodes in x=cos(theta)), w_CC
+    is computed via the Waldvogel/Trefethen FFT algorithm.  For non-uniform
+    grids, plain trapezoidal step-sizes are returned instead.
+    """
+    N = len(theta_unique)
+    if N < 2:
+        return np.ones(N)
+
+    n = N - 1  # number of intervals
+
+    # Check that this is a uniform grid
+    expected = np.linspace(theta_unique[0], theta_unique[-1], N)
+    if not np.allclose(theta_unique, expected, rtol=1e-6):
+        # Non-uniform grid: return trapezoidal step sizes
+        dt = np.zeros(N)
+        dt[0] = (theta_unique[1] - theta_unique[0]) / 2
+        dt[-1] = (theta_unique[-1] - theta_unique[-2]) / 2
+        dt[1:-1] = (theta_unique[2:] - theta_unique[:-2]) / 2
+        return dt
+
+    # Waldvogel algorithm for CC weights on CGL nodes (Trefethen clencurt.m).
+    # w_CC satisfies: sum_j w_CC[j] * f(x_j) ≈ integral_{-1}^{1} f(x) dx
+    # which equals integral_0^pi f(cos θ) sin(θ) dθ  (x = cos θ).
+    # numpy ifft normalises by len(c_mirror)=2n; multiply by 2 to restore [-1,1] scale.
+    c = np.zeros(n + 1)
+    c[0::2] = 2.0 / (1.0 - np.arange(0, n + 1, 2, dtype=float) ** 2)
+    c_mirror = np.r_[c, c[-2:0:-1]]      # length 2n = (n+1)+(n-1)
+    w_cc = np.real(np.fft.ifft(c_mirror))[:n + 1] * 2  # factor 2: ifft 1/(2n) vs needed 1/n
+    w_cc[0] /= 2.0   # endpoint nodes appear twice in mirror
+    w_cc[-1] /= 2.0
+
+    # Convert to effective weights for integrands that already carry sin(theta).
+    # w_eff[j] = w_CC[j] / sin(theta_j), except at poles (sin=0) where the
+    # integrand vanishes anyway so w_eff=0.
+    sin_t = np.sin(theta_unique)
+    w_eff = np.zeros(N)
+    ok = sin_t > 1e-10
+    w_eff[ok] = w_cc[ok] / sin_t[ok]
+    return w_eff
+
+
 def compute_mode_coefficients_batch(args):
     """Compute Q coefficients for a batch of modes - with FFT optimization for phi integration."""
     modes_batch, THETA, PHI, E_THETA, E_PHI, sin_theta, theta_unique, phi_unique, norm_factor, legendre_data = args
@@ -808,7 +914,8 @@ def compute_mode_coefficients_batch(args):
     # FFT-optimized method for uniform phi grids
     results = []
     N_phi = len(phi_unique)
-    
+    w_theta = _cc_theta_weights(theta_unique)
+
     for n, m in modes_batch:
         # Unpack Legendre data
         P_norm, dP_norm = legendre_data[(n, m)]
@@ -853,9 +960,9 @@ def compute_mode_coefficients_batch(args):
         phi_integral_1 = np.fft.fft(integrand_1_with_phase, axis=1)[:, 0] * (2 * np.pi / N_phi)
         phi_integral_2 = np.fft.fft(integrand_2_with_phase, axis=1)[:, 0] * (2 * np.pi / N_phi)
         
-        # Now integrate over theta
-        Q1 = np.trapz(phi_integral_1, theta_unique, axis=0) * norm_factor
-        Q2 = np.trapz(phi_integral_2, theta_unique, axis=0) * norm_factor
+        # Now integrate over theta using Clenshaw-Curtis quadrature
+        Q1 = np.dot(w_theta, phi_integral_1) * norm_factor
+        Q2 = np.dot(w_theta, phi_integral_2) * norm_factor
         
         mode_power = (abs(Q1)**2 + abs(Q2)**2) / 2.0
         results.append(((n, m), Q1, Q2, mode_power))
@@ -866,73 +973,88 @@ def compute_mode_coefficients_batch(args):
 def compute_mode_coefficients_batch_trapz(args):
     """Original trapz method - fallback for non-uniform grids."""
     modes_batch, THETA, PHI, E_THETA, E_PHI, sin_theta, theta_unique, phi_unique, norm_factor, legendre_data = args
-    
+
     results = []
-    
+    w_theta = _cc_theta_weights(theta_unique)
+
     for n, m in modes_batch:
         P_norm, dP_norm = legendre_data[(n, m)]
         P_norm_2d = P_norm[:, np.newaxis]
         dP_norm_2d = dP_norm[:, np.newaxis]
-        
+
         prefactor = np.sqrt(2 / (n * (n + 1)))
         sign_factor = (m / abs(m)) ** m if m != 0 else 1.0
         phase = np.exp(-1j * m * PHI)
         i_factor_1 = (1j) ** n
         i_factor_2 = (1j) ** (n + 1)
-        
+
         # Use same epsilon as compute_all_modes_legendre for consistency
         sin_theta_safe = np.where(np.abs(sin_theta) < 1e-6, 1e-6, sin_theta)
         mP_over_sin = 1j * m * P_norm_2d / sin_theta_safe
-        
+
         K1_theta = prefactor * sign_factor * phase * i_factor_1 * mP_over_sin
         K1_phi = prefactor * sign_factor * phase * i_factor_1 * dP_norm_2d
         K2_theta = prefactor * sign_factor * phase * i_factor_2 * (dP_norm_2d)
         K2_phi = prefactor * sign_factor * phase * i_factor_2 * (-mP_over_sin)
-        
+
         integrand_1 = (E_THETA * np.conj(K1_theta) + E_PHI * np.conj(K1_phi)) * sin_theta
-        Q1 = np.trapz(np.trapz(integrand_1, phi_unique, axis=1), theta_unique, axis=0)
-        Q1 *= norm_factor
-        
+        Q1 = np.dot(w_theta, np.trapz(integrand_1, phi_unique, axis=1)) * norm_factor
+
         integrand_2 = (E_THETA * np.conj(K2_theta) + E_PHI * np.conj(K2_phi)) * sin_theta
-        Q2 = np.trapz(np.trapz(integrand_2, phi_unique, axis=1), theta_unique, axis=0)
-        Q2 *= norm_factor
+        Q2 = np.dot(w_theta, np.trapz(integrand_2, phi_unique, axis=1)) * norm_factor
         
         mode_power = (abs(Q1)**2 + abs(Q2)**2) / 2.0
         results.append(((n, m), Q1, Q2, mode_power))
-    
+
     return results
+
+
 # ==============================================================================
 # Main SWE Class
 # ==============================================================================
 
 class SphericalWaveExpansion:
     """
-    Spherical Wave Expansion representation of electromagnetic fields.
-    
-    Attributes:
-        Q1_coeffs: Dictionary of Q₁ coefficients with keys (n, m)
-        Q2_coeffs: Dictionary of Q₂ coefficients with keys (n, m)
-        frequency: Frequency in Hz
-        k: Wavenumber in rad/m
-        NMAX: Maximum degree
-        MMAX: Maximum order
+    Multi-frequency Spherical Wave Expansion representation of electromagnetic fields.
+
+    Stores Q₁ and Q₂ coefficients for one or more frequencies.  All compute
+    methods (far_field, near_field, …) require an explicit ``frequency``
+    argument so that the caller selects which frequency block to evaluate.
+
+    Typical usage::
+
+        swe = SphericalWaveExpansion.from_sph_file("antenna.sph")
+        for f in swe.frequencies:
+            Et, Ep = swe.far_field(theta, phi, frequency=f)
+
+    Attributes (per-frequency, accessed via methods):
+        frequencies : sorted list of loaded frequencies in Hz
+        Q1_coeffs(f): Dict[(n, m) -> complex] for frequency f
+        Q2_coeffs(f): Dict[(n, m) -> complex] for frequency f
+        NMAX(f)     : maximum degree for frequency f
+        MMAX(f)     : maximum order  for frequency f
+        k(f)        : wavenumber (rad/m) for frequency f
+        wavelength(f): wavelength (m) for frequency f
+        total_power(f): Σ(|Q1|²+|Q2|²) for frequency f
     """
-    
-    def __init__(self, 
-                 Q1_coeffs: Optional[Dict[Tuple[int, int], complex]] = None,
-                 Q2_coeffs: Optional[Dict[Tuple[int, int], complex]] = None,
-                 frequency: Optional[float] = None,
-                 NMAX: Optional[int] = None,
-                 MMAX: Optional[int] = None):
+
+    _C = 299792458.0  # speed of light (m/s)
+
+    def __init__(self,
+                 Q1_coeffs: Optional[Dict[float, Dict[Tuple[int, int], complex]]] = None,
+                 Q2_coeffs: Optional[Dict[float, Dict[Tuple[int, int], complex]]] = None,
+                 NMAX: Optional[Dict[float, int]] = None,
+                 MMAX: Optional[Dict[float, int]] = None):
         """
-        Initialize SWE object.
-        
+        Initialize a multi-frequency SWE object.
+
         Args:
-            Q1_coeffs: Q₁ coefficients dictionary
-            Q2_coeffs: Q₂ coefficients dictionary
-            frequency: Frequency in Hz
-            NMAX: Maximum degree (auto-detected if None)
-            MMAX: Maximum order (auto-detected if None)
+            Q1_coeffs: ``{freq_Hz: {(n, m): complex}}`` mapping for Q₁ modes.
+            Q2_coeffs: ``{freq_Hz: {(n, m): complex}}`` mapping for Q₂ modes.
+            NMAX: ``{freq_Hz: int}`` maximum degree per frequency.
+                  Auto-detected from coefficient keys when omitted.
+            MMAX: ``{freq_Hz: int}`` maximum order per frequency.
+                  Auto-detected from coefficient keys when omitted.
         """
         q1 = dict(Q1_coeffs) if Q1_coeffs is not None else {}
         q2 = dict(Q2_coeffs) if Q2_coeffs is not None else {}
@@ -1073,14 +1195,20 @@ class SphericalWaveExpansion:
             power += abs(Q) ** 2
         return power
 
-    def normalize_coefficients(self):
-        """Normalize Q coefficients so that total_power = 1.
+    # ------------------------------------------------------------------
+    # Coefficient normalization
+    # ------------------------------------------------------------------
+
+    def normalize_coefficients(self, freq: Optional[float] = None) -> None:
+        """Normalize Q coefficients so that total_power == 1.
 
         After normalization, far_field(normalize=True) and
         near_field(normalize=True) produce directivity-referenced fields
-        regardless of the original coefficient convention (TICRA, Hansen, etc.).
+        regardless of the original coefficient convention.
 
-        This makes the SWE object convention-independent for downstream use.
+        Args:
+            freq: Frequency (Hz) to normalize.  When *None* (default), all
+                  stored frequencies are normalized.
         """
         if self._frequency_order:
             for freq in self._frequency_order:
@@ -1117,6 +1245,7 @@ class SphericalWaveExpansion:
             self.Q2_coeffs[key] /= norm
 
     def far_field(self, theta: np.ndarray, phi: np.ndarray,
+                  frequency: float,
                   power_threshold: float = 0.999,
                   normalize: bool = True,
                   frequency: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray]:
@@ -1130,6 +1259,7 @@ class SphericalWaveExpansion:
         Args:
             theta: Polar angle(s) in radians
             phi: Azimuthal angle(s) in radians
+            frequency: Frequency in Hz (must be a loaded frequency)
             power_threshold: Only include modes containing this fraction of total power.
                            Default 0.999 (99.9%) filters out noise in high-n modes
                            that can cause boresight artifacts. Set to 1.0 to include all modes.
@@ -1162,6 +1292,9 @@ class SphericalWaveExpansion:
         if theta.shape != phi.shape:
             theta, phi = np.broadcast_arrays(theta, phi)
 
+        q1 = self._Q1[frequency]
+        q2 = self._Q2[frequency]
+
         # Compute mode powers and filter by cumulative power threshold
         all_modes = set(q1_coeffs.keys()) | set(q2_coeffs.keys())
 
@@ -1171,7 +1304,10 @@ class SphericalWaveExpansion:
             E_phi = np.zeros_like(phi, dtype=complex)
             return E_theta, E_phi
 
-        # Calculate power per mode and sort by n
+        nmax = self._nmax[frequency]
+        mmax = self._mmax[frequency]
+
+        # Calculate power per mode
         mode_powers = []
         for (n, m) in all_modes:
             Q1 = q1_coeffs.get((n, m), 0)
@@ -1181,14 +1317,16 @@ class SphericalWaveExpansion:
 
         total_power = sum(p for _, p in mode_powers)
 
-        # Find effective NMAX based on power threshold
+        # Find effective NMAX based on cumulative n-shell power threshold,
+        # then additionally skip any individual modes with negligible power
+        # (e.g. zero-coefficient m values within an otherwise active n-shell).
         if power_threshold < 1.0 and total_power > 0:
-            # Sum power by n and find cutoff
             n_power = {}
             for (n, m), p in mode_powers:
                 n_power[n] = n_power.get(n, 0) + p
 
             cumulative = 0
+            effective_nmax = nmax
             effective_nmax = nmax
             for n in sorted(n_power.keys()):
                 cumulative += n_power[n]
@@ -1196,15 +1334,22 @@ class SphericalWaveExpansion:
                     effective_nmax = n
                     break
 
-            # Filter modes
-            filtered_modes = [(nm, p) for nm, p in mode_powers if nm[0] <= effective_nmax]
+            # Per-mode cutoff: skip modes whose power is negligible relative to total
+            mode_cutoff = 1e-8 * total_power
+            filtered_modes = [(nm, p) for nm, p in mode_powers
+                              if nm[0] <= effective_nmax and p > mode_cutoff]
             if len(filtered_modes) < len(mode_powers):
-                logger.debug(f"Power filtering: using NMAX={effective_nmax} ({len(filtered_modes)}/{len(mode_powers)} modes, {100*power_threshold:.2f}% power)")
+                logger.debug(f"Power filtering: using NMAX={effective_nmax}, "
+                             f"{len(filtered_modes)}/{len(mode_powers)} modes kept "
+                             f"({100*power_threshold:.2f}% power, per-mode cutoff 1e-8)")
         else:
+            mode_cutoff = 0.0
             filtered_modes = mode_powers
             effective_nmax = nmax
+            effective_nmax = nmax
 
-        logger.debug(f"Computing far field at {len(theta.flatten())} points, effective NMAX={effective_nmax}")
+        logger.debug(f"Computing far field at {len(theta.flatten())} points, "
+                     f"effective NMAX={effective_nmax}")
 
         E_theta = np.zeros_like(theta, dtype=complex)
         E_phi = np.zeros_like(phi, dtype=complex)
@@ -1213,13 +1358,17 @@ class SphericalWaveExpansion:
         effective_mmax = min(mmax, effective_nmax)
         legendre_cache = compute_all_modes_legendre(effective_nmax, effective_mmax, theta)
 
-        # Now loop through filtered modes
+        # Precompute exp(-1j*m*phi) for each unique m in filtered_modes.
+        # Many n values share the same m, so this avoids redundant complex exponentials.
+        unique_m = {nm[1] for nm, _ in filtered_modes}
+        phase_cache = {m_val: np.exp(-1j * m_val * phi) for m_val in unique_m}
+
         for (n, m), _ in filtered_modes:
             if (n, m) not in legendre_cache:
                 continue
 
             (K1_theta, K1_phi), (K2_theta, K2_phi) = \
-                far_field_pattern_functions(n, m, theta, phi, legendre_cache)
+                far_field_pattern_functions(n, m, theta, phi, legendre_cache, phase_cache)
 
             if (n, m) in q1_coeffs:
                 Q1 = q1_coeffs[(n, m)]
@@ -1247,13 +1396,14 @@ class SphericalWaveExpansion:
                             E_phi: np.ndarray,
                             frequency: float,
                             r0: float = None,
-                            NMAX_initial: int = 100,  # Start larger
+                            NMAX_initial: int = 100,
                             MMAX_initial: int = 50,
                             power_threshold: float = 0.999,
                             high_mode_power_threshold: float = 0.00001,
                             azimuthal_power_threshold: float = 0.00001,
                             use_multiprocessing: bool = True,
-                            n_workers: int = None):
+                            n_workers: int = None,
+                            normalize: bool = True):
         """
         Adaptively calculate Q coefficients from far-field patterns using orthogonality integral.
         
@@ -1266,14 +1416,16 @@ class SphericalWaveExpansion:
             E_phi: Phi component of electric field
             frequency: Frequency in Hz
             r0: Radius of minimum sphere enclosing sources (meters)
-            NMAX_initial: Starting NMAX (default: 50)
+            NMAX_initial: Starting NMAX (default: 100)
             MMAX_initial: Starting MMAX (if None, grows with NMAX)
             power_threshold: Retain modes with this fraction of power (0.999 = 99.9%)
             high_mode_power_threshold: Max power in top 10% n-modes (0.001 = 0.51)
             azimuthal_power_threshold: Min power per |m| to include (0.00005 = 0.005%)
             use_multiprocessing: Enable parallel computation
             n_workers: Number of parallel workers (None = auto-detect)
-        
+            normalize: If True (default), normalize coefficients so total_power=1.
+                      If False, preserve original scaling for absolute field comparison.
+
         Returns:
             SphericalWaveExpansion object with adaptively determined modes
         """
@@ -1313,7 +1465,6 @@ class SphericalWaveExpansion:
 
         logger.info(f"Starting SWE coefficient extraction: NMAX_initial={NMAX_initial}, frequency={frequency/1e9:.4f} GHz")
         
-        # MMAX_initial = None means let it grow with NMAX
         use_adaptive_mmax = (MMAX_initial is None)
         if MMAX_initial is None:
             MMAX_initial = NMAX_initial
@@ -1337,10 +1488,53 @@ class SphericalWaveExpansion:
 
             logger.info(f"Iteration {iteration + 1}: Computing coefficients for NMAX={NMAX}, MMAX={MMAX_current}")
 
+            # ------------------------------------------------------------------
+            # Azimuthal pre-screening: compute m=0 and m=±1 modes first.
+            # If they already account for ≥ power_threshold of extracted power,
+            # cap MMAX_current=1 and skip the remaining |m| values entirely.
+            # This avoids computing thousands of empty modes for rotationally
+            # symmetric or near-symmetric antennas.
+            # ------------------------------------------------------------------
+            if use_adaptive_mmax and MMAX_current > 1:
+                prescreened_mmax = min(1, MMAX_current)
+                leg_pre = compute_all_modes_legendre(NMAX, prescreened_mmax, THETA[:, 0])
+                modes_pre = [(n, m) for n in range(1, NMAX + 1)
+                             for m in range(-min(n, prescreened_mmax), min(n, prescreened_mmax) + 1)]
+                args_pre = [(modes_pre, THETA, PHI, E_THETA, E_PHI, sin_theta,
+                             theta_unique, phi_unique, norm_factor,
+                             {nm: leg_pre[nm] for nm in modes_pre if nm in leg_pre})]
+                pre_results = compute_mode_coefficients_batch(args_pre[0])
+                pre_total = sum(pw for _, _, _, pw in pre_results)
+                all_m01_power = pre_total
+
+                # Estimate full total power by sampling a few higher |m| modes
+                # (m=2,3) to see if they carry significant energy
+                if MMAX_current >= 2:
+                    leg_m2 = compute_all_modes_legendre(min(NMAX, 10), 2, THETA[:, 0])
+                    modes_m2 = [(n, m) for n in range(1, min(NMAX, 10) + 1)
+                                for m in [-2, 2] if abs(m) <= n]
+                    modes_m2 = [nm for nm in modes_m2 if nm in leg_m2]
+                    if modes_m2:
+                        args_m2 = [(modes_m2, THETA, PHI, E_THETA, E_PHI, sin_theta,
+                                    theta_unique, phi_unique, norm_factor,
+                                    {nm: leg_m2[nm] for nm in modes_m2})]
+                        m2_results = compute_mode_coefficients_batch(args_m2[0])
+                        m2_power = sum(pw for _, _, _, pw in m2_results)
+                    else:
+                        m2_power = 0.0
+                else:
+                    m2_power = 0.0
+
+                # If |m|≥2 modes contain < 0.1% of the |m|≤1 power, cap MMAX
+                if all_m01_power > 0 and m2_power / all_m01_power < 0.001:
+                    MMAX_current = 1
+                    logger.info(f"Azimuthal pre-screening: |m|≥2 power is {m2_power/all_m01_power*100:.4f}% "
+                                f"of |m|≤1 power — capping MMAX={MMAX_current}")
+
             # Pre-compute Legendre functions for all modes
             logger.debug("Computing Legendre functions...")
             legendre_cache = compute_all_modes_legendre(NMAX, MMAX_current, THETA[:, 0])
-            
+
             # Build mode list
             modes = []
             for n in range(1, NMAX + 1):
@@ -1385,35 +1579,34 @@ class SphericalWaveExpansion:
                 Q1_coeffs = {}
                 Q2_coeffs = {}
                 mode_powers = []
-                
+                w_theta = _cc_theta_weights(theta_unique)
+
                 for mode_idx, (n, m) in enumerate(modes):
                     P_norm, dP_norm = legendre_cache[(n, m)]
-                    
+
                     P_norm_2d = P_norm[:, np.newaxis]
                     dP_norm_2d = dP_norm[:, np.newaxis]
-                    
+
                     prefactor = np.sqrt(2 / (n * (n + 1)))
                     sign_factor = (m / abs(m)) ** m if m != 0 else 1.0
                     phase = np.exp(-1j * m * PHI)
                     i_factor_1 = (1j) ** n
                     i_factor_2 = (1j) ** (n + 1)
-                    
+
                     sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
                     mP_over_sin = 1j * m * P_norm_2d / sin_theta_safe
-                    
+
                     K1_theta = prefactor * sign_factor * phase * i_factor_1 * mP_over_sin
                     K1_phi = prefactor * sign_factor * phase * i_factor_1 * dP_norm_2d
-                    
+
                     K2_theta = prefactor * sign_factor * phase * i_factor_2 * (dP_norm_2d)
                     K2_phi = prefactor * sign_factor * phase * i_factor_2 * (-mP_over_sin)
-                    
+
                     integrand_1 = (E_THETA * np.conj(K1_theta) + E_PHI * np.conj(K1_phi)) * sin_theta
-                    Q1 = np.trapezoid(np.trapezoid(integrand_1, phi_unique, axis=1), theta_unique, axis=0)
-                    Q1 *= norm_factor
-                    
+                    Q1 = np.dot(w_theta, np.trapezoid(integrand_1, phi_unique, axis=1)) * norm_factor
+
                     integrand_2 = (E_THETA * np.conj(K2_theta) + E_PHI * np.conj(K2_phi)) * sin_theta
-                    Q2 = np.trapezoid(np.trapezoid(integrand_2, phi_unique, axis=1), theta_unique, axis=0)
-                    Q2 *= norm_factor
+                    Q2 = np.dot(w_theta, np.trapezoid(integrand_2, phi_unique, axis=1)) * norm_factor
                     
                     Q1_coeffs[(n, m)] = Q1
                     Q2_coeffs[(n, m)] = Q2
@@ -1441,30 +1634,24 @@ class SphericalWaveExpansion:
                 power_per_m = np.zeros(MMAX_current + 1)
                 for (n, m), mode_power in mode_powers:
                     power_per_m[abs(m)] += mode_power
-                
-                # Calculate power per |m| for azimuthal truncation
-                power_per_m = np.zeros(MMAX_current + 1)
-                for (n, m), mode_power in mode_powers:
-                    power_per_m[abs(m)] += mode_power
 
-                # Find MMAX where tail is small AND cumulative power is sufficient
-                MMAX_truncated = 0
+                # Find MMAX where tail power is negligible AND cumulative power is sufficient
+                MMAX_truncated = MMAX_current  # default: keep everything
                 for m_test in range(0, MMAX_current + 1):
-                    # Cumulative power up to m_test
+                    # Cumulative power up to |m| = m_test
                     cumulative_m = sum(power_per_m[m] for m in range(0, m_test + 1))
                     cumulative_m_fraction = cumulative_m / total_power if total_power > 0 else 0
-                    
-                    # Check power in top modes near m_test
-                    m_cutoff = max(1, int(np.ceil(0.1 * m_test))) if m_test > 0 else 0
-                    high_m = range(max(0, m_test - m_cutoff + 1), m_test + 1)
-                    high_m_power = sum(power_per_m[m] for m in high_m)
-                    high_m_fraction = high_m_power / total_power if total_power > 0 else 0
-                    
-                    # Accept if BOTH: tail is small AND we have enough power
-                    if (high_m_fraction < azimuthal_power_threshold and
-                        cumulative_m_fraction >= power_threshold):
+
+                    # Tail power: power at |m| > m_test (modes we'd discard)
+                    tail_power = sum(power_per_m[m] for m in range(m_test + 1, MMAX_current + 1))
+                    tail_fraction = tail_power / total_power if total_power > 0 else 0
+
+                    # Accept if: enough cumulative power AND discarded tail is small
+                    if (cumulative_m_fraction >= power_threshold and
+                            tail_fraction < azimuthal_power_threshold):
                         MMAX_truncated = m_test
-                        logger.debug(f"Azimuthal truncation: MMAX {MMAX_current} -> {MMAX_truncated}, tail power: {high_m_fraction*100:.3f}%")
+                        logger.debug(f"Azimuthal truncation: MMAX {MMAX_current} -> {MMAX_truncated}, "
+                                     f"tail power: {tail_fraction*100:.4f}%")
                         break
                 
                 # Find highest n where tail modes have negligible power
@@ -1472,22 +1659,25 @@ class SphericalWaveExpansion:
                 for (n, m), pwr in mode_powers:
                     power_by_n[n] += pwr
 
-                NMAX_truncated = 1
-                for n_test in range(1, NMAX+1):
-                    # Check power in top 10% of modes at this truncation level
+                # Find smallest NMAX where local top modes are at noise level AND cumulative is sufficient
+                NMAX_truncated = NMAX  # default: keep everything if no noise floor found
+                for n_test in range(1, NMAX + 1):
+                    # Check power in top few modes near n_test (noise-floor detection)
                     n_cutoff = max(1, int(np.ceil(0.1 * n_test)))
                     high_modes = range(max(1, n_test - n_cutoff + 1), n_test + 1)
                     high_power = sum(power_by_n.get(n, 0) for n in high_modes)
                     high_power_fraction = high_power / total_power if total_power > 0 else 0
-                    
-                    # Also check cumulative power up to n_test
-                    cumulative = sum(power_by_n.get(n, 0) for n in range(1, n_test+1))
+
+                    # Cumulative power up to n_test
+                    cumulative = sum(power_by_n.get(n, 0) for n in range(1, n_test + 1))
                     cumulative_fraction = cumulative / total_power if total_power > 0 else 0
-                    
-                    # Accept if both: (1) tail is small AND (2) we have enough total power
-                    if (high_power_fraction < high_mode_power_threshold and 
-                        cumulative_fraction >= power_threshold):
+
+                    # Accept if: top modes are at noise level AND enough cumulative power
+                    if (high_power_fraction < high_mode_power_threshold and
+                            cumulative_fraction >= power_threshold):
                         NMAX_truncated = n_test
+                        logger.debug(f"N truncation: NMAX {NMAX} -> {NMAX_truncated}, "
+                                     f"local power: {high_power_fraction*100:.4f}%")
                         break
 
                 # Keep ALL modes up to NMAX_truncated and MMAX_truncated
@@ -1533,10 +1723,16 @@ class SphericalWaveExpansion:
                     f"SWE extraction complete: NMAX={NMAX_truncated}, MMAX={MMAX_truncated}, "
                     f"retained power={retained_fraction*100:.2f}%, {len(Q1_final)} modes"
                 )
-                swe = cls(Q1_final, Q2_final, frequency, NMAX_truncated, MMAX_truncated)
-                swe.normalize_coefficients()
+                swe = cls(
+                    {frequency: Q1_final},
+                    {frequency: Q2_final},
+                    NMAX={frequency: NMAX_truncated},
+                    MMAX={frequency: MMAX_truncated},
+                )
+                if normalize:
+                    swe.normalize_coefficients()
                 return swe
-            
+
             else:
                 # Need more modes
                 logger.debug(f"High mode power fraction {high_mode_fraction*100:.2f}% exceeds threshold, increasing NMAX from {NMAX} to {NMAX + 50}")
@@ -1552,21 +1748,23 @@ class SphericalWaveExpansion:
             "Results may be inaccurate.",
             UserWarning
         )
-        swe = cls(Q1_coeffs, Q2_coeffs, frequency, NMAX, MMAX_current)
-        swe.normalize_coefficients()
+        swe = cls(
+            {frequency: Q1_coeffs},
+            {frequency: Q2_coeffs},
+            NMAX={frequency: NMAX},
+            MMAX={frequency: MMAX_current},
+        )
+        if normalize:
+            swe.normalize_coefficients()
         return swe
 
     @classmethod
     def from_sph_file(cls, filename: str,
                       frequencies: Optional[Iterable[float]] = None) -> 'SphericalWaveExpansion':
         """
-        Create SWE object from TICRA .sph file.
+        Create a multi-frequency SWE object from a TICRA .sph file.
 
-        Note:
-            When exporting .sph files from TICRA/GRASP, enable power normalization
-            in the export settings so that the coefficients are normalized to unit
-            radiated power. Unnormalized TICRA exports can produce incorrect
-            near-field magnitudes in PO analysis.
+        All frequency blocks present in the file are loaded.
 
         Args:
             filename: Path to .sph file
@@ -1574,7 +1772,7 @@ class SphericalWaveExpansion:
                 blocks in the file are loaded.
 
         Returns:
-            SphericalWaveExpansion object
+            SphericalWaveExpansion object with all frequencies loaded.
         """
         logger.info(f"Creating SphericalWaveExpansion from file: {filename}")
         blocks = read_ticra_sph_blocks(filename)
@@ -1608,24 +1806,25 @@ class SphericalWaveExpansion:
 
         swe = cls.from_frequency_data(frequency_data)
 
-        # Normalize so total_power = 1, making the SWE convention-independent.
-        # This ensures TICRA, Hansen, and from_far_field coefficients all
-        # produce identical near/far fields after normalization.
-        swe.normalize_coefficients()
+        swe = cls(Q1_coeffs=Q1_all, Q2_coeffs=Q2_all,
+                  NMAX=nmax_all, MMAX=mmax_all)
+
+        if normalize:
+            swe.normalize_coefficients()
 
         return swe
-    
+
     def to_sph_file(self, filename: str,
-                   NTHE: int = 181, NPHI: int = 361,
-                   description: str = "Generated by SWE module"):
+                    NTHE: int = 181, NPHI: int = 361,
+                    description: str = "Generated by SWE module"):
         """
-        Write SWE object to TICRA .sph file.
+        Write all frequency blocks in this SWE object to a TICRA .sph file.
 
         Args:
             filename: Output file path
-            NTHE: Number of theta samples (for header)
-            NPHI: Number of phi samples (for header)
-            description: Description text
+            NTHE: Number of theta samples written in every block header
+            NPHI: Number of phi samples written in every block header
+            description: Description text written in every block header
         """
         logger.info(f"Writing SphericalWaveExpansion to file: {filename}")
         frequencies = self.frequencies
@@ -1654,17 +1853,23 @@ class SphericalWaveExpansion:
                    frequency: Optional[float] = None,
                    normalize: bool = True) -> \
             Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray],
-                Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+                  Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """
         Calculate near-field E and H components.
 
         By default, normalizes by sqrt(total_power) so that the fields are
         consistent with the directivity-normalized far field.
 
+        Scaling note: the prefactors used are sqrt(4π) for E and j*sqrt(4π)/Z0
+        for H, consistent with the far-field K-function normalisation. TICRA's
+        internal convention stores Q_internal = -conj(Q_file) with no additional
+        scaling factor.
+
         Args:
             r: Radial distance(s) in meters
             theta: Polar angle(s) in radians
             phi: Azimuthal angle(s) in radians
+            frequency: Frequency in Hz (must be a loaded frequency)
             normalize: If True (default), divide by sqrt(total_power) for
                       consistency with directivity-normalized far field.
 
@@ -1702,7 +1907,9 @@ class SphericalWaveExpansion:
 
         logger.debug(f"Computing near field at {len(r.flatten())} points, NMAX={nmax}, MMAX={mmax}")
 
-        # Initialize output arrays
+        logger.debug(f"Computing near field at {len(r.flatten())} points, "
+                     f"NMAX={nmax}, MMAX={mmax}")
+
         E_r = np.zeros_like(r, dtype=complex)
         E_theta = np.zeros_like(theta, dtype=complex)
         E_phi = np.zeros_like(phi, dtype=complex)
@@ -1724,15 +1931,16 @@ class SphericalWaveExpansion:
         kr = k * r.ravel()
         bessel_cache = precompute_spherical_bessel(nmax, kr)
 
-        # scaling factors from Ticra (eq 4.212 abd 4.213)
+        # Scaling prefactors for near-field E and H.
+        # TICRA's internal convention is Q_internal = -conj(Q_file) with no extra scaling.
+        # The effective prefactor consistent with the far-field K-function scaling is sqrt(4π).
         Z0 = 376.730313668
         E_prefactor = k * np.sqrt(Z0)
         H_prefactor = 1j*k/np.sqrt(Z0)
 
-        # Loop through modes
-        for (n, m) in all_modes:
-            # Get near-field pattern functions for this mode
+        for (n, m) in active_modes:
             F1_E, F2_E, F1_H, F2_H = near_field_pattern_functions(
+                n, m, r, theta, phi, k, legendre_cache, bessel_cache
                 n, m, r, theta, phi, k, legendre_cache, bessel_cache
             )
             
@@ -1742,7 +1950,6 @@ class SphericalWaveExpansion:
                 E_r += E_prefactor * Q1 * F1_E[0]
                 E_theta += E_prefactor * Q1 * F1_E[1]
                 E_phi += E_prefactor * Q1 * F1_E[2]
-                
                 H_r += H_prefactor * Q1 * F1_H[0]
                 H_theta += H_prefactor * Q1 * F1_H[1]
                 H_phi += H_prefactor * Q1 * F1_H[2]
@@ -1753,12 +1960,10 @@ class SphericalWaveExpansion:
                 E_r += E_prefactor * Q2 * F2_E[0]
                 E_theta += E_prefactor * Q2 * F2_E[1]
                 E_phi += E_prefactor * Q2 * F2_E[2]
-
                 H_r += H_prefactor * Q2 * F2_H[0]
                 H_theta += H_prefactor * Q2 * F2_H[1]
                 H_phi += H_prefactor * Q2 * F2_H[2]
 
-        # Normalize consistently with directivity-normalized far field
         if normalize:
             tp = self._total_power_for(q1_coeffs, q2_coeffs)
             if tp > 0:
@@ -1782,6 +1987,7 @@ class SphericalWaveExpansion:
 
         Args:
             x, y, z: Cartesian coordinates in meters
+            frequency: Frequency in Hz (must be a loaded frequency)
             normalize: If True (default), divide by sqrt(total_power) for
                       consistency with directivity-normalized far field.
 
@@ -1804,7 +2010,6 @@ class SphericalWaveExpansion:
         # Convert to Cartesian basis
         E_x, E_y, E_z = spherical_to_cartesian_field(E_r, E_theta, E_phi, theta, phi)
         H_x, H_y, H_z = spherical_to_cartesian_field(H_r, H_theta, H_phi, theta, phi)
-        
         return (E_x, E_y, E_z), (H_x, H_y, H_z)
     
     def currents_on_surface(self, rr: np.ndarray, unr: np.ndarray, dSr: np.ndarray,
@@ -1813,18 +2018,17 @@ class SphericalWaveExpansion:
                                 frequency: Optional[float] = None) -> \
             Tuple[np.ndarray, np.ndarray]:
         """
-        Calculate equivalent surface currents on an arbitrary reflector surface from SWE source.
+        Calculate equivalent surface currents on an arbitrary reflector surface.
 
-        Two modes are supported:
-        - Surface Equivalence Theorem (default): J = n × H, M = -n × E
-        - Physical Optics (physical_optics=True): J = 2(n × H), M = 0 for PEC reflectors
+        Uses the Surface Equivalence Theorem: J = n × H, M = -n × E.
 
         Args:
             rr: Nr x 3 array of reflector surface points (Cartesian, meters)
             unr: Nr x 3 array of surface normal vectors (outward)
             dSr: Nr array of surface element areas (m²)
-            swe_origin: 3-element array, SWE coordinate origin in reflector frame (meters)
-                        Default is [0, 0, 0]
+            frequency: Frequency in Hz (must be a loaded frequency)
+            swe_origin: 3-element array, SWE coordinate origin in reflector frame.
+                        Default is [0, 0, 0].
             swe_rotation: (alpha, beta, gamma) Euler angles (radians, ZYZ convention)
                         rotating SWE frame to reflector frame. Default is no rotation.
 
@@ -1832,24 +2036,21 @@ class SphericalWaveExpansion:
             Jrr: Nr x 3 array of equivalent electric currents (A)
             Mrr: Nr x 3 array of equivalent magnetic currents (V)
         """
+        self._validate_freq(frequency)
         Nr = len(rr)
         logger.debug(f"Computing surface currents on {Nr} surface points")
-        
-        # Default origin at coordinate system origin
+
         if swe_origin is None:
             swe_origin = np.array([0., 0., 0.])
-        
-        # Transform reflector points to SWE coordinate system
+
         rr_swe = rr - swe_origin[np.newaxis, :]
-        
+
         if swe_rotation is not None:
-            # Apply inverse rotation (reflector -> SWE frame)
             rr_swe = self._apply_inverse_rotation(rr_swe, swe_rotation)
             unr_swe = self._apply_inverse_rotation(unr, swe_rotation)
         else:
             unr_swe = unr.copy()
-        
-        # Calculate near field at surface
+
         x, y, z = rr_swe[:, 0], rr_swe[:, 1], rr_swe[:, 2]
         (Ex, Ey, Ez), (Hx, Hy, Hz) = self.near_field_cartesian(
             x, y, z, frequency=frequency
@@ -1858,15 +2059,13 @@ class SphericalWaveExpansion:
         E_total = np.column_stack([Ex, Ey, Ez])
         H_total = np.column_stack([Hx, Hy, Hz])
 
-        # Transform E and H back to reflector frame if rotated
         if swe_rotation is not None:
             E_total = self._apply_rotation(E_total, swe_rotation)
             H_total = self._apply_rotation(H_total, swe_rotation)
-        
-        # Calculate surface currents
+
         Jrr = np.cross(unr_swe, H_total, axis=-1) * dSr[:, np.newaxis]
         Mrr = -np.cross(unr_swe, E_total, axis=-1) * dSr[:, np.newaxis]
-        
+
         return Jrr, Mrr
 
     def _apply_rotation(self, vectors: np.ndarray, angles: Tuple[float, float, float]) -> np.ndarray:
@@ -2090,14 +2289,22 @@ def write_ticra_sph(filename: str,
     """
     Write spherical wave coefficients to TICRA .sph file format.
 
-    Input coefficients should be in TICRA working convention.
-    They will be conjugated before writing to match the .sph file format.
-    """
-    logger.info(f"Writing TICRA .sph file: {filename}")
-    logger.debug(f"Writing SWE: NMAX={NMAX}, MMAX={MMAX}, frequency={frequency_GHz} GHz, {len(Q1_coeffs)} Q1 modes, {len(Q2_coeffs)} Q2 modes")
+    Args:
+        filename: Output file path
+        freq_data_list: List of per-frequency dicts, each containing:
+            'Q1_coeffs'    : Dict[(n, m) -> complex]  (internal convention)
+            'Q2_coeffs'    : Dict[(n, m) -> complex]
+            'frequency_GHz': float
+            'NMAX'         : int
+            'MMAX'         : int
+            'NTHE'         : int  (optional, default 181)
+            'NPHI'         : int  (optional, default 361)
+        description: Description text written in every block header
 
-    # normalization factor (between Ticra and Hansen)
-    normalization_factor = np.sqrt(8*np.pi)
+    Internal coefficients are converted back to file convention on write:
+        Q_file = -conj(Q_internal)
+    """
+    logger.info(f"Writing TICRA .sph file: {filename} ({len(freq_data_list)} frequency block(s))")
 
     with open(filename, file_mode) as f:
         # Record 1: PRGTAG
