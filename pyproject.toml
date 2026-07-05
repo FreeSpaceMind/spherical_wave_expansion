@@ -6,16 +6,16 @@ build-backend = "setuptools.build_meta"
 name = "swe"
 version = "0.1.0"
 description = "Spherical wave expansion analysis for electromagnetic fields"
+readme = "README.md"
 authors = [{name = "Justin Long", email = "justinwlong1@gmail.com"}]
 requires-python = ">=3.9"
-license = {text = "MIT"}
+license = "MIT"
 
 keywords = ["spherical", "wave", "expansion", "antenna", "electromagnetic", "near-field"]
 
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
@@ -35,6 +35,9 @@ dev = [
     "pytest-cov",
     "black",
     "flake8",
+    "matplotlib>=3.3.0",
+]
+viz = [
     "matplotlib>=3.3.0",
 ]
 

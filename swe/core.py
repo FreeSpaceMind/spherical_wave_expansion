@@ -46,7 +46,7 @@ import math
 import numpy as np
 from scipy.special import lpmv, spherical_jn, spherical_yn
 from scipy.optimize import lsq_linear
-from typing import Dict, Tuple, Optional, Union
+from typing import Dict, Tuple, Optional, Union, Iterable, List
 import warnings
 from multiprocessing import Pool
 import os
@@ -60,6 +60,105 @@ except ImportError:
 
 # Configure module-level logger
 logger = logging.getLogger(__name__)
+
+
+def _match_frequency_key(frequency: float,
+                         available: Iterable[float],
+                         rtol: float = 1e-6) -> float:
+    """Return the available frequency matching ``frequency`` within tolerance."""
+    available_list = [float(freq) for freq in available]
+    if not available_list:
+        raise ValueError("No SWE frequencies are available")
+
+    target = float(frequency)
+    matches = [
+        freq for freq in available_list
+        if np.isclose(freq, target, rtol=rtol, atol=0.0)
+    ]
+    if matches:
+        return min(matches, key=lambda freq: abs(freq - target))
+
+    available_text = ", ".join(f"{freq / 1e9:.9g} GHz" for freq in available_list)
+    raise ValueError(
+        f"Frequency {target / 1e9:.9g} GHz is not available. "
+        f"Available frequencies: {available_text}"
+    )
+
+
+class _FrequencyIndexedCoefficients(dict):
+    """Dict-compatible coefficient view that can also be called by frequency."""
+
+    def __init__(self,
+                 by_frequency: Dict[float, Dict[Tuple[int, int], complex]],
+                 active_frequency: Optional[float]):
+        self._by_frequency = by_frequency
+        self._active_frequency = active_frequency
+        active = self._active_dict()
+        super().__init__(active)
+
+    def _active_key(self) -> Optional[float]:
+        if not self._by_frequency:
+            return None
+        if self._active_frequency is None:
+            return next(iter(self._by_frequency))
+        return _match_frequency_key(self._active_frequency, self._by_frequency.keys())
+
+    def _active_dict(self) -> Dict[Tuple[int, int], complex]:
+        key = self._active_key()
+        if key is None:
+            return {}
+        return self._by_frequency[key]
+
+    def set_active_frequency(self, frequency: Optional[float]) -> None:
+        self._active_frequency = frequency
+        super().clear()
+        super().update(self._active_dict())
+
+    def __call__(self, frequency: Optional[float] = None) -> Dict[Tuple[int, int], complex]:
+        if frequency is None:
+            return self._active_dict()
+        key = _match_frequency_key(float(frequency), self._by_frequency.keys())
+        return self._by_frequency[key]
+
+    def __setitem__(self, key, value):
+        active = self._active_dict()
+        active[key] = value
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        active = self._active_dict()
+        if key in active:
+            del active[key]
+        super().__delitem__(key)
+
+    def clear(self):
+        self._active_dict().clear()
+        super().clear()
+
+    def update(self, *args, **kwargs):
+        active = self._active_dict()
+        active.update(*args, **kwargs)
+        super().clear()
+        super().update(active)
+
+
+class _FrequencyIndexedInt(int):
+    """Integer that keeps old int behavior and supports calls by frequency."""
+
+    def __new__(cls,
+                value: int,
+                by_frequency: Dict[float, int],
+                active_frequency: Optional[float]):
+        obj = int.__new__(cls, int(value))
+        obj._by_frequency = by_frequency
+        obj._active_frequency = active_frequency
+        return obj
+
+    def __call__(self, frequency: Optional[float] = None) -> int:
+        if frequency is None or not self._by_frequency:
+            return int(self)
+        key = _match_frequency_key(float(frequency), self._by_frequency.keys())
+        return int(self._by_frequency[key])
 
 
 # ==============================================================================
@@ -835,27 +934,99 @@ class SphericalWaveExpansion:
             NMAX: Maximum degree (auto-detected if None)
             MMAX: Maximum order (auto-detected if None)
         """
-        self.Q1_coeffs = Q1_coeffs if Q1_coeffs is not None else {}
-        self.Q2_coeffs = Q2_coeffs if Q2_coeffs is not None else {}
-        self._frequency = frequency
+        q1 = dict(Q1_coeffs) if Q1_coeffs is not None else {}
+        q2 = dict(Q2_coeffs) if Q2_coeffs is not None else {}
+        self._frequency_order: List[float] = []
+        self._Q1_by_frequency: Dict[float, Dict[Tuple[int, int], complex]] = {}
+        self._Q2_by_frequency: Dict[float, Dict[Tuple[int, int], complex]] = {}
+        self._NMAX_by_frequency: Dict[float, int] = {}
+        self._MMAX_by_frequency: Dict[float, int] = {}
+        self._frequency = float(frequency) if frequency is not None else None
 
         # Auto-detect NMAX and MMAX if not provided
         if NMAX is None or MMAX is None:
-            all_keys = list(self.Q1_coeffs.keys()) + list(self.Q2_coeffs.keys())
+            all_keys = list(q1.keys()) + list(q2.keys())
             if all_keys:
-                self.NMAX = max(n for n, m in all_keys)
-                self.MMAX = max(abs(m) for n, m in all_keys)
-                logger.debug(f"Auto-detected NMAX={self.NMAX}, MMAX={self.MMAX} from {len(all_keys)} mode keys")
+                nmax_value = max(n for n, m in all_keys)
+                mmax_value = max(abs(m) for n, m in all_keys)
+                logger.debug(f"Auto-detected NMAX={nmax_value}, MMAX={mmax_value} from {len(all_keys)} mode keys")
             else:
-                self.NMAX = NMAX if NMAX is not None else 0
-                self.MMAX = MMAX if MMAX is not None else 0
+                nmax_value = NMAX if NMAX is not None else 0
+                mmax_value = MMAX if MMAX is not None else 0
         else:
-            self.NMAX = NMAX
-            self.MMAX = MMAX
+            nmax_value = NMAX
+            mmax_value = MMAX
 
-        n_modes = len(self.Q1_coeffs) + len(self.Q2_coeffs)
+        self._unindexed_Q1_coeffs = q1
+        self._unindexed_Q2_coeffs = q2
+        self._unindexed_NMAX = int(nmax_value)
+        self._unindexed_MMAX = int(mmax_value)
+
+        if self._frequency is not None:
+            self._frequency_order = [self._frequency]
+            self._Q1_by_frequency[self._frequency] = q1
+            self._Q2_by_frequency[self._frequency] = q2
+            self._NMAX_by_frequency[self._frequency] = int(nmax_value)
+            self._MMAX_by_frequency[self._frequency] = int(mmax_value)
+
+        self._sync_active_views()
+
+        n_modes = len(q1) + len(q2)
         if n_modes > 0:
-            logger.debug(f"SphericalWaveExpansion initialized: NMAX={self.NMAX}, MMAX={self.MMAX}, {len(self.Q1_coeffs)} Q1 modes, {len(self.Q2_coeffs)} Q2 modes")
+            logger.debug(f"SphericalWaveExpansion initialized: NMAX={int(self.NMAX)}, MMAX={int(self.MMAX)}, {len(q1)} Q1 modes, {len(q2)} Q2 modes")
+
+    @classmethod
+    def from_frequency_data(cls, frequency_data: Iterable[Dict]) -> 'SphericalWaveExpansion':
+        """Create a possibly multi-frequency SWE object from parsed blocks."""
+        obj = cls()
+        for block in frequency_data:
+            freq = float(block['frequency'])
+            obj._frequency_order.append(freq)
+            obj._Q1_by_frequency[freq] = dict(block.get('Q1_coeffs', {}))
+            obj._Q2_by_frequency[freq] = dict(block.get('Q2_coeffs', {}))
+            obj._NMAX_by_frequency[freq] = int(block.get('NMAX', 0) or 0)
+            obj._MMAX_by_frequency[freq] = int(block.get('MMAX', 0) or 0)
+
+        if obj._frequency_order:
+            obj._frequency = obj._frequency_order[0]
+        obj._sync_active_views()
+        return obj
+
+    def _sync_active_views(self) -> None:
+        if self._frequency_order and self._frequency is None:
+            self._frequency = self._frequency_order[0]
+        active = self._active_frequency_key(required=False)
+        active_q1 = self._Q1_by_frequency.get(active, {})
+        active_q2 = self._Q2_by_frequency.get(active, {})
+        active_nmax = self._NMAX_by_frequency.get(active, 0)
+        active_mmax = self._MMAX_by_frequency.get(active, 0)
+        if active is None:
+            self.Q1_coeffs = self._unindexed_Q1_coeffs
+            self.Q2_coeffs = self._unindexed_Q2_coeffs
+            self.NMAX = self._unindexed_NMAX
+            self.MMAX = self._unindexed_MMAX
+            return
+
+        self.Q1_coeffs = _FrequencyIndexedCoefficients(self._Q1_by_frequency, active)
+        self.Q2_coeffs = _FrequencyIndexedCoefficients(self._Q2_by_frequency, active)
+        self.NMAX = _FrequencyIndexedInt(active_nmax, self._NMAX_by_frequency, active)
+        self.MMAX = _FrequencyIndexedInt(active_mmax, self._MMAX_by_frequency, active)
+
+    def _active_frequency_key(self, frequency: Optional[float] = None,
+                              required: bool = True) -> Optional[float]:
+        if not self._frequency_order:
+            if required:
+                raise ValueError("No SWE frequencies are available")
+            return None
+        target = self._frequency if frequency is None else float(frequency)
+        if target is None:
+            return self._frequency_order[0]
+        return _match_frequency_key(target, self._frequency_order)
+
+    @property
+    def frequencies(self) -> np.ndarray:
+        """Available frequencies in Hz, in file/construction order."""
+        return np.asarray(self._frequency_order, dtype=float)
     
     @property
     def frequency(self) -> Optional[float]:
@@ -865,7 +1036,8 @@ class SphericalWaveExpansion:
     @frequency.setter
     def frequency(self, freq: float):
         """Set frequency in Hz."""
-        self._frequency = freq
+        self._frequency = float(freq) if freq is not None else None
+        self._sync_active_views()
     
     @property
     def k(self) -> Optional[float]:
@@ -889,10 +1061,15 @@ class SphericalWaveExpansion:
         (via normalize_coefficients()), total_power = 1.0 and the far field
         with normalize=True gives |E|² = directivity.
         """
+        return self._total_power_for(self.Q1_coeffs, self.Q2_coeffs)
+
+    @staticmethod
+    def _total_power_for(q1_coeffs: Dict[Tuple[int, int], complex],
+                         q2_coeffs: Dict[Tuple[int, int], complex]) -> float:
         power = 0.0
-        for Q in self.Q1_coeffs.values():
+        for Q in q1_coeffs.values():
             power += abs(Q) ** 2
-        for Q in self.Q2_coeffs.values():
+        for Q in q2_coeffs.values():
             power += abs(Q) ** 2
         return power
 
@@ -905,6 +1082,29 @@ class SphericalWaveExpansion:
 
         This makes the SWE object convention-independent for downstream use.
         """
+        if self._frequency_order:
+            for freq in self._frequency_order:
+                q1 = self._Q1_by_frequency[freq]
+                q2 = self._Q2_by_frequency[freq]
+                tp = self._total_power_for(q1, q2)
+                if tp <= 0:
+                    logger.warning(
+                        "Cannot normalize %.9g GHz: total_power is zero",
+                        freq / 1e9,
+                    )
+                    continue
+                norm = np.sqrt(tp)
+                logger.debug(
+                    f"Normalizing coefficients at {freq/1e9:.6g} GHz: "
+                    f"total_power={tp:.6f}, dividing by {norm:.6f}"
+                )
+                for key in list(q1.keys()):
+                    q1[key] /= norm
+                for key in list(q2.keys()):
+                    q2[key] /= norm
+            self._sync_active_views()
+            return
+
         tp = self.total_power
         if tp <= 0:
             logger.warning("Cannot normalize: total_power is zero")
@@ -918,7 +1118,8 @@ class SphericalWaveExpansion:
 
     def far_field(self, theta: np.ndarray, phi: np.ndarray,
                   power_threshold: float = 0.999,
-                  normalize: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+                  normalize: bool = True,
+                  frequency: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray]:
         """
         Compute far-field pattern from SWE coefficients.
 
@@ -939,7 +1140,20 @@ class SphericalWaveExpansion:
             E_theta: Theta component of electric field
             E_phi: Phi component of electric field
         """
-        if self.k is None:
+        if self._frequency_order:
+            freq_key = self._active_frequency_key(frequency)
+            q1_coeffs = self._Q1_by_frequency[freq_key]
+            q2_coeffs = self._Q2_by_frequency[freq_key]
+            nmax = self._NMAX_by_frequency[freq_key]
+            mmax = self._MMAX_by_frequency[freq_key]
+        else:
+            freq_key = self._frequency if frequency is None else float(frequency)
+            q1_coeffs = self.Q1_coeffs
+            q2_coeffs = self.Q2_coeffs
+            nmax = int(self.NMAX)
+            mmax = int(self.MMAX)
+
+        if freq_key is None:
             raise ValueError("Frequency must be set before computing far field")
 
         theta = np.atleast_1d(theta)
@@ -949,7 +1163,7 @@ class SphericalWaveExpansion:
             theta, phi = np.broadcast_arrays(theta, phi)
 
         # Compute mode powers and filter by cumulative power threshold
-        all_modes = set(self.Q1_coeffs.keys()) | set(self.Q2_coeffs.keys())
+        all_modes = set(q1_coeffs.keys()) | set(q2_coeffs.keys())
 
         if not all_modes:
             logger.debug("No modes present, returning zero field")
@@ -960,8 +1174,8 @@ class SphericalWaveExpansion:
         # Calculate power per mode and sort by n
         mode_powers = []
         for (n, m) in all_modes:
-            Q1 = self.Q1_coeffs.get((n, m), 0)
-            Q2 = self.Q2_coeffs.get((n, m), 0)
+            Q1 = q1_coeffs.get((n, m), 0)
+            Q2 = q2_coeffs.get((n, m), 0)
             power = abs(Q1)**2 + abs(Q2)**2
             mode_powers.append(((n, m), power))
 
@@ -975,7 +1189,7 @@ class SphericalWaveExpansion:
                 n_power[n] = n_power.get(n, 0) + p
 
             cumulative = 0
-            effective_nmax = self.NMAX
+            effective_nmax = nmax
             for n in sorted(n_power.keys()):
                 cumulative += n_power[n]
                 if cumulative >= power_threshold * total_power:
@@ -988,7 +1202,7 @@ class SphericalWaveExpansion:
                 logger.debug(f"Power filtering: using NMAX={effective_nmax} ({len(filtered_modes)}/{len(mode_powers)} modes, {100*power_threshold:.2f}% power)")
         else:
             filtered_modes = mode_powers
-            effective_nmax = self.NMAX
+            effective_nmax = nmax
 
         logger.debug(f"Computing far field at {len(theta.flatten())} points, effective NMAX={effective_nmax}")
 
@@ -996,7 +1210,7 @@ class SphericalWaveExpansion:
         E_phi = np.zeros_like(phi, dtype=complex)
 
         # PRE-COMPUTE ALL LEGENDRE FUNCTIONS AT ONCE
-        effective_mmax = min(self.MMAX, effective_nmax)
+        effective_mmax = min(mmax, effective_nmax)
         legendre_cache = compute_all_modes_legendre(effective_nmax, effective_mmax, theta)
 
         # Now loop through filtered modes
@@ -1007,13 +1221,13 @@ class SphericalWaveExpansion:
             (K1_theta, K1_phi), (K2_theta, K2_phi) = \
                 far_field_pattern_functions(n, m, theta, phi, legendre_cache)
 
-            if (n, m) in self.Q1_coeffs:
-                Q1 = self.Q1_coeffs[(n, m)]
+            if (n, m) in q1_coeffs:
+                Q1 = q1_coeffs[(n, m)]
                 E_theta += Q1 * K1_theta
                 E_phi += Q1 * K1_phi
 
-            if (n, m) in self.Q2_coeffs:
-                Q2 = self.Q2_coeffs[(n, m)]
+            if (n, m) in q2_coeffs:
+                Q2 = q2_coeffs[(n, m)]
                 E_theta += Q2 * K2_theta
                 E_phi += Q2 * K2_phi
 
@@ -1343,7 +1557,8 @@ class SphericalWaveExpansion:
         return swe
 
     @classmethod
-    def from_sph_file(cls, filename: str) -> 'SphericalWaveExpansion':
+    def from_sph_file(cls, filename: str,
+                      frequencies: Optional[Iterable[float]] = None) -> 'SphericalWaveExpansion':
         """
         Create SWE object from TICRA .sph file.
 
@@ -1355,23 +1570,43 @@ class SphericalWaveExpansion:
 
         Args:
             filename: Path to .sph file
+            frequencies: Optional frequencies in Hz to retain. If None, all
+                blocks in the file are loaded.
 
         Returns:
             SphericalWaveExpansion object
         """
         logger.info(f"Creating SphericalWaveExpansion from file: {filename}")
-        data = read_ticra_sph(filename)
+        blocks = read_ticra_sph_blocks(filename)
 
-        # Convert frequency from GHz to Hz
-        frequency = data['frequency'] * 1e9 if data['frequency'] is not None else None
+        if frequencies is not None:
+            requested = np.asarray(list(np.atleast_1d(frequencies)), dtype=float).reshape(-1)
+            available = [block['frequency'] * 1e9 for block in blocks]
+            selected_blocks = []
+            for requested_freq in requested:
+                match = _match_frequency_key(float(requested_freq), available)
+                selected_blocks.append(
+                    blocks[available.index(match)]
+                )
+            blocks = selected_blocks
 
-        swe = cls(
-            Q1_coeffs=data['Q1_coeffs'],
-            Q2_coeffs=data['Q2_coeffs'],
-            frequency=frequency,
-            NMAX=data['NMAX'],
-            MMAX=data['MMAX']
-        )
+        frequency_data = []
+        for data in blocks:
+            frequency = data['frequency'] * 1e9 if data['frequency'] is not None else None
+            if frequency is None:
+                continue
+            frequency_data.append({
+                'frequency': frequency,
+                'Q1_coeffs': data['Q1_coeffs'],
+                'Q2_coeffs': data['Q2_coeffs'],
+                'NMAX': data['NMAX'],
+                'MMAX': data['MMAX'],
+            })
+
+        if not frequency_data:
+            raise ValueError(f"No frequency blocks found in {filename}")
+
+        swe = cls.from_frequency_data(frequency_data)
 
         # Normalize so total_power = 1, making the SWE convention-independent.
         # This ensures TICRA, Hansen, and from_far_field coefficients all
@@ -1393,17 +1628,30 @@ class SphericalWaveExpansion:
             description: Description text
         """
         logger.info(f"Writing SphericalWaveExpansion to file: {filename}")
-        write_ticra_sph(
-            filename,
-            self.Q1_coeffs,
-            self.Q2_coeffs,
-            self.frequency / 1e9 if self.frequency is not None else 1.0,
-            NTHE, NPHI,
-            self.NMAX, self.MMAX,
-            description
-        )
+        frequencies = self.frequencies
+        if len(frequencies) == 0:
+            frequencies = np.asarray([self.frequency], dtype=float)
+
+        for idx, freq in enumerate(frequencies):
+            if freq is None or not np.isfinite(freq):
+                continue
+            q1 = self.Q1_coeffs(freq) if callable(self.Q1_coeffs) else self.Q1_coeffs
+            q2 = self.Q2_coeffs(freq) if callable(self.Q2_coeffs) else self.Q2_coeffs
+            nmax = self.NMAX(freq) if callable(self.NMAX) else self.NMAX
+            mmax = self.MMAX(freq) if callable(self.MMAX) else self.MMAX
+            write_ticra_sph(
+                filename,
+                q1,
+                q2,
+                float(freq) / 1e9,
+                NTHE, NPHI,
+                int(nmax), int(mmax),
+                description,
+                file_mode='w' if idx == 0 else 'a',
+            )
     
     def near_field(self, r: np.ndarray, theta: np.ndarray, phi: np.ndarray,
+                   frequency: Optional[float] = None,
                    normalize: bool = True) -> \
             Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray],
                 Tuple[np.ndarray, np.ndarray, np.ndarray]]:
@@ -1424,8 +1672,26 @@ class SphericalWaveExpansion:
             E: Tuple of (E_r, E_theta, E_phi) in V/m
             H: Tuple of (H_r, H_theta, H_phi) in A/m
         """
-        if self.k is None:
+        if isinstance(frequency, (bool, np.bool_)):
+            normalize = bool(frequency)
+            frequency = None
+
+        if self._frequency_order:
+            freq_key = self._active_frequency_key(frequency)
+            q1_coeffs = self._Q1_by_frequency[freq_key]
+            q2_coeffs = self._Q2_by_frequency[freq_key]
+            nmax = self._NMAX_by_frequency[freq_key]
+            mmax = self._MMAX_by_frequency[freq_key]
+        else:
+            freq_key = self._frequency if frequency is None else float(frequency)
+            q1_coeffs = self.Q1_coeffs
+            q2_coeffs = self.Q2_coeffs
+            nmax = int(self.NMAX)
+            mmax = int(self.MMAX)
+
+        if freq_key is None:
             raise ValueError("Frequency must be set before computing near field")
+        k = 2 * np.pi * float(freq_key) / 299792458.0
 
         r = np.atleast_1d(r)
         theta = np.atleast_1d(theta)
@@ -1434,7 +1700,7 @@ class SphericalWaveExpansion:
         if not (r.shape == theta.shape == phi.shape):
             r, theta, phi = np.broadcast_arrays(r, theta, phi)
 
-        logger.debug(f"Computing near field at {len(r.flatten())} points, NMAX={self.NMAX}, MMAX={self.MMAX}")
+        logger.debug(f"Computing near field at {len(r.flatten())} points, NMAX={nmax}, MMAX={mmax}")
 
         # Initialize output arrays
         E_r = np.zeros_like(r, dtype=complex)
@@ -1444,35 +1710,35 @@ class SphericalWaveExpansion:
         H_theta = np.zeros_like(theta, dtype=complex)
         H_phi = np.zeros_like(phi, dtype=complex)
 
-        all_modes = set(self.Q1_coeffs.keys()) | set(self.Q2_coeffs.keys())
+        all_modes = set(q1_coeffs.keys()) | set(q2_coeffs.keys())
 
         if not all_modes:
             logger.debug("No modes present, returning zero fields")
             return (E_r, E_theta, E_phi), (H_r, H_theta, H_phi)
 
         # Pre-compute Legendre functions
-        legendre_cache = compute_all_modes_legendre(self.NMAX, self.MMAX, theta)
+        legendre_cache = compute_all_modes_legendre(nmax, mmax, theta)
 
         # Pre-compute ALL spherical Bessel functions for n=0 to NMAX
         # This eliminates redundant scipy calls since Bessel functions depend on (n, kr), not m
-        kr = self.k * r.ravel()
-        bessel_cache = precompute_spherical_bessel(self.NMAX, kr)
+        kr = k * r.ravel()
+        bessel_cache = precompute_spherical_bessel(nmax, kr)
 
         # scaling factors from Ticra (eq 4.212 abd 4.213)
         Z0 = 376.730313668
-        E_prefactor = self.k * np.sqrt(Z0)
-        H_prefactor = 1j*self.k/np.sqrt(Z0)
+        E_prefactor = k * np.sqrt(Z0)
+        H_prefactor = 1j*k/np.sqrt(Z0)
 
         # Loop through modes
         for (n, m) in all_modes:
             # Get near-field pattern functions for this mode
             F1_E, F2_E, F1_H, F2_H = near_field_pattern_functions(
-                n, m, r, theta, phi, self.k, legendre_cache, bessel_cache
+                n, m, r, theta, phi, k, legendre_cache, bessel_cache
             )
             
             # Q1 contribution (TE to r modes)
-            if (n, m) in self.Q1_coeffs:
-                Q1 = self.Q1_coeffs[(n, m)]
+            if (n, m) in q1_coeffs:
+                Q1 = q1_coeffs[(n, m)]
                 E_r += E_prefactor * Q1 * F1_E[0]
                 E_theta += E_prefactor * Q1 * F1_E[1]
                 E_phi += E_prefactor * Q1 * F1_E[2]
@@ -1482,8 +1748,8 @@ class SphericalWaveExpansion:
                 H_phi += H_prefactor * Q1 * F1_H[2]
             
             # Q2 contribution (TM to r modes)
-            if (n, m) in self.Q2_coeffs:
-                Q2 = self.Q2_coeffs[(n, m)]
+            if (n, m) in q2_coeffs:
+                Q2 = q2_coeffs[(n, m)]
                 E_r += E_prefactor * Q2 * F2_E[0]
                 E_theta += E_prefactor * Q2 * F2_E[1]
                 E_phi += E_prefactor * Q2 * F2_E[2]
@@ -1494,7 +1760,7 @@ class SphericalWaveExpansion:
 
         # Normalize consistently with directivity-normalized far field
         if normalize:
-            tp = self.total_power
+            tp = self._total_power_for(q1_coeffs, q2_coeffs)
             if tp > 0:
                 norm = np.sqrt(tp)
                 E_r /= norm
@@ -1507,6 +1773,7 @@ class SphericalWaveExpansion:
         return (E_r, E_theta, E_phi), (H_r, H_theta, H_phi)
 
     def near_field_cartesian(self, x: np.ndarray, y: np.ndarray, z: np.ndarray,
+                             frequency: Optional[float] = None,
                              normalize: bool = True) -> \
             Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray],
                   Tuple[np.ndarray, np.ndarray, np.ndarray]]:
@@ -1522,11 +1789,17 @@ class SphericalWaveExpansion:
             E: Tuple of (E_x, E_y, E_z) components in V/m
             H: Tuple of (H_x, H_y, H_z) components in A/m
         """
+        if isinstance(frequency, (bool, np.bool_)):
+            normalize = bool(frequency)
+            frequency = None
+
         # Convert to spherical coordinates
         r, theta, phi = cartesian_to_spherical(x, y, z)
 
         # Get fields in spherical basis
-        (E_r, E_theta, E_phi), (H_r, H_theta, H_phi) = self.near_field(r, theta, phi, normalize=normalize)
+        (E_r, E_theta, E_phi), (H_r, H_theta, H_phi) = self.near_field(
+            r, theta, phi, frequency=frequency, normalize=normalize
+        )
         
         # Convert to Cartesian basis
         E_x, E_y, E_z = spherical_to_cartesian_field(E_r, E_theta, E_phi, theta, phi)
@@ -1536,7 +1809,8 @@ class SphericalWaveExpansion:
     
     def currents_on_surface(self, rr: np.ndarray, unr: np.ndarray, dSr: np.ndarray,
                                 swe_origin: np.ndarray = None,
-                                swe_rotation: Optional[Tuple[float, float, float]] = None) -> \
+                                swe_rotation: Optional[Tuple[float, float, float]] = None,
+                                frequency: Optional[float] = None) -> \
             Tuple[np.ndarray, np.ndarray]:
         """
         Calculate equivalent surface currents on an arbitrary reflector surface from SWE source.
@@ -1577,7 +1851,9 @@ class SphericalWaveExpansion:
         
         # Calculate near field at surface
         x, y, z = rr_swe[:, 0], rr_swe[:, 1], rr_swe[:, 2]
-        (Ex, Ey, Ez), (Hx, Hy, Hz) = self.near_field_cartesian(x, y, z)
+        (Ex, Ey, Ez), (Hx, Hy, Hz) = self.near_field_cartesian(
+            x, y, z, frequency=frequency
+        )
         
         E_total = np.column_stack([Ex, Ey, Ez])
         H_total = np.column_stack([Hx, Hy, Hz])
@@ -1642,54 +1918,29 @@ class SphericalWaveExpansion:
 # File I/O Functions
 # ==============================================================================
 
-def read_ticra_sph(filename: str) -> Dict:
-    """
-    Read TICRA .sph file containing spherical wave expansion coefficients.
-
-    Note:
-        TICRA/GRASP .sph exports should have power normalization enabled so
-        that the coefficients are normalized to unit radiated power. Without
-        this, the near-field computation will produce incorrect absolute levels
-        even though the far-field pattern shape appears correct.
-
-    Args:
-        filename: Path to the .sph file
-
-    Returns:
-        Dictionary containing all data from .sph file
-    """
-    logger.info(f"Reading TICRA .sph file: {filename}")
-
-    # NORMALIZATION FACTOR (from Ticra)
-    normalization_factor = 1/np.sqrt(8*np.pi)
-
-    with open(filename, 'r') as f:
-        lines = f.readlines()
-    
+def _parse_ticra_sph_block(lines: List[str]) -> Dict:
+    """Parse one TICRA .sph block."""
+    normalization_factor = 1 / np.sqrt(8 * np.pi)
     line_idx = 0
-    
-    # Record 1: PRGTAG
+
     prgtag = lines[line_idx].strip()
     line_idx += 1
-    
+
     frequency = None
     if 'Freq [GHz]:' in prgtag:
         freq_str = prgtag.split('Freq [GHz]:')[1].strip().split()[0]
         frequency = float(freq_str)
-    
-    # Record 2: IDSTRG
+
     idstrg = lines[line_idx].strip()
     line_idx += 1
-    
-    # Record 3: NTHE, NPHI, NMAX, MMAX
+
     control_data = lines[line_idx].strip().split()
     NTHE = int(control_data[0])
     NPHI = int(control_data[1])
     NMAX = int(control_data[2])
     MMAX = int(control_data[3])
     line_idx += 1
-    
-    # Record 4: Rotation angles
+
     rotation_line = lines[line_idx].strip()
     line_idx += 1
     if 'Rotation angles' in rotation_line:
@@ -1697,92 +1948,96 @@ def read_ticra_sph(filename: str) -> Dict:
         rotation_angles = tuple(float(x.strip()) for x in angles_str.split(','))
     else:
         rotation_angles = (0.0, 0.0, 0.0)
-    
-    # Records 5-8: Dummy data
+
     line_idx += 4
-    
-    # Read coefficients
+
     Q1_coeffs = {}
     Q2_coeffs = {}
     power = {}
-    
+
     while line_idx < len(lines):
         line = lines[line_idx].strip()
         if not line:
             line_idx += 1
             continue
-            
+
         parts = line.split()
-        if len(parts) >= 2:
-            try:
-                m_index = int(parts[0])
-                powerm = float(parts[1])
-                power[abs(m_index)] = powerm
-                line_idx += 1
-                
-                abs_m = abs(m_index)
-                n_start = max(1, abs_m)
-                
-                if m_index == 0:
-                    for n in range(n_start, NMAX + 1):
-                        if line_idx >= len(lines):
-                            break
-                        coeff_line = lines[line_idx].strip()
-                        line_idx += 1
-                        
-                        coeff_parts = coeff_line.split()
-                        if len(coeff_parts) >= 4:
-                            Q1_coeffs[(n, 0)] = normalization_factor * (float(coeff_parts[0]) + 1j * float(coeff_parts[1]))
-                            Q2_coeffs[(n, 0)] = normalization_factor * (float(coeff_parts[2]) + 1j * float(coeff_parts[3]))
-                        else:
-                            line_idx -= 1
-                            break
-                else:
-                    for n in range(n_start, NMAX + 1):
-                        # -m coefficients
-                        if line_idx >= len(lines):
-                            break
-                        coeff_line = lines[line_idx].strip()
-                        line_idx += 1
-                        
-                        coeff_parts = coeff_line.split()
-                        if len(coeff_parts) >= 4:
-                            Q1_coeffs[(n, -abs_m)] = normalization_factor * (float(coeff_parts[0]) + 1j * float(coeff_parts[1]))
-                            Q2_coeffs[(n, -abs_m)] = normalization_factor * (float(coeff_parts[2]) + 1j * float(coeff_parts[3]))
-                        else:
-                            line_idx -= 1
-                            break
-                        
-                        # +m coefficients
-                        if line_idx >= len(lines):
-                            break
-                        coeff_line = lines[line_idx].strip()
-                        line_idx += 1
-                        
-                        coeff_parts = coeff_line.split()
-                        if len(coeff_parts) >= 4:
-                            Q1_coeffs[(n, abs_m)] = normalization_factor * (float(coeff_parts[0]) + 1j * float(coeff_parts[1]))
-                            Q2_coeffs[(n, abs_m)] = normalization_factor * (float(coeff_parts[2]) + 1j * float(coeff_parts[3]))
-                        else:
-                            line_idx -= 1
-                            break
-                            
-            except (ValueError, IndexError):
-                line_idx += 1
-        else:
+        if len(parts) < 2:
             line_idx += 1
-    
-    # conjugate coefficients to match Q_smn definition
+            continue
+
+        try:
+            m_index = int(parts[0])
+            powerm = float(parts[1])
+        except (ValueError, IndexError):
+            line_idx += 1
+            continue
+
+        power[abs(m_index)] = powerm
+        line_idx += 1
+
+        abs_m = abs(m_index)
+        n_start = max(1, abs_m)
+
+        if m_index == 0:
+            for n in range(n_start, NMAX + 1):
+                if line_idx >= len(lines):
+                    break
+                coeff_parts = lines[line_idx].strip().split()
+                line_idx += 1
+                if len(coeff_parts) < 4:
+                    line_idx -= 1
+                    break
+                Q1_coeffs[(n, 0)] = normalization_factor * (
+                    float(coeff_parts[0]) + 1j * float(coeff_parts[1])
+                )
+                Q2_coeffs[(n, 0)] = normalization_factor * (
+                    float(coeff_parts[2]) + 1j * float(coeff_parts[3])
+                )
+        else:
+            for n in range(n_start, NMAX + 1):
+                if line_idx >= len(lines):
+                    break
+                coeff_parts = lines[line_idx].strip().split()
+                line_idx += 1
+                if len(coeff_parts) < 4:
+                    line_idx -= 1
+                    break
+                Q1_coeffs[(n, -abs_m)] = normalization_factor * (
+                    float(coeff_parts[0]) + 1j * float(coeff_parts[1])
+                )
+                Q2_coeffs[(n, -abs_m)] = normalization_factor * (
+                    float(coeff_parts[2]) + 1j * float(coeff_parts[3])
+                )
+
+                if line_idx >= len(lines):
+                    break
+                coeff_parts = lines[line_idx].strip().split()
+                line_idx += 1
+                if len(coeff_parts) < 4:
+                    line_idx -= 1
+                    break
+                Q1_coeffs[(n, abs_m)] = normalization_factor * (
+                    float(coeff_parts[0]) + 1j * float(coeff_parts[1])
+                )
+                Q2_coeffs[(n, abs_m)] = normalization_factor * (
+                    float(coeff_parts[2]) + 1j * float(coeff_parts[3])
+                )
+
     for key in Q1_coeffs:
         Q1_coeffs[key] = np.conj(Q1_coeffs[key])
     for key in Q2_coeffs:
         Q2_coeffs[key] = np.conj(Q2_coeffs[key])
 
-    logger.info(f"Loaded SWE: NMAX={NMAX}, MMAX={MMAX}, frequency={frequency} GHz, {len(Q1_coeffs)} Q1 modes, {len(Q2_coeffs)} Q2 modes")
+    logger.info(
+        f"Loaded SWE: NMAX={NMAX}, MMAX={MMAX}, frequency={frequency} GHz, "
+        f"{len(Q1_coeffs)} Q1 modes, {len(Q2_coeffs)} Q2 modes"
+    )
     logger.debug(f"Rotation angles: {rotation_angles}")
 
     return {
         'frequency': frequency,
+        'idstrg': idstrg,
         'NTHE': NTHE,
         'NPHI': NPHI,
         'NMAX': NMAX,
@@ -1790,8 +2045,38 @@ def read_ticra_sph(filename: str) -> Dict:
         'rotation_angles': rotation_angles,
         'Q1_coeffs': Q1_coeffs,
         'Q2_coeffs': Q2_coeffs,
-        'power': power
+        'power': power,
     }
+
+
+def read_ticra_sph_blocks(filename: str) -> List[Dict]:
+    """Read all concatenated TICRA .sph frequency blocks."""
+    logger.info(f"Reading TICRA .sph file: {filename}")
+    with open(filename, 'r') as f:
+        lines = f.readlines()
+
+    starts = [
+        idx for idx, line in enumerate(lines)
+        if 'Freq [GHz]:' in line
+    ]
+    if not starts:
+        raise ValueError(f"No TICRA .sph frequency blocks found in {filename}")
+
+    blocks = []
+    for block_idx, start in enumerate(starts):
+        end = starts[block_idx + 1] if block_idx + 1 < len(starts) else len(lines)
+        blocks.append(_parse_ticra_sph_block(lines[start:end]))
+    return blocks
+
+
+def read_ticra_sph(filename: str) -> Dict:
+    """
+    Read TICRA .sph file containing spherical wave expansion coefficients.
+
+    For backward compatibility this returns the first block. Use
+    read_ticra_sph_blocks() to retrieve all concatenated frequency blocks.
+    """
+    return read_ticra_sph_blocks(filename)[0]
 
 
 def write_ticra_sph(filename: str,
@@ -1800,7 +2085,8 @@ def write_ticra_sph(filename: str,
                     frequency_GHz: float,
                     NTHE: int, NPHI: int,
                     NMAX: int, MMAX: int,
-                    description: str = "Generated by SWE module"):
+                    description: str = "Generated by SWE module",
+                    file_mode: str = 'w'):
     """
     Write spherical wave coefficients to TICRA .sph file format.
 
@@ -1813,7 +2099,7 @@ def write_ticra_sph(filename: str,
     # normalization factor (between Ticra and Hansen)
     normalization_factor = np.sqrt(8*np.pi)
 
-    with open(filename, 'w') as f:
+    with open(filename, file_mode) as f:
         # Record 1: PRGTAG
         f.write(f"TICRA-SWE Freq [GHz]: {frequency_GHz:.6f}\n")
         

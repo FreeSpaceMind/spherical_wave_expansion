@@ -12,6 +12,7 @@ __email__ = "justinwlong1@gmail.com"
 from .core import (
     SphericalWaveExpansion,
     read_ticra_sph,
+    read_ticra_sph_blocks,
     write_ticra_sph,
     normalized_associated_legendre,
     far_field_pattern_functions,
@@ -31,6 +32,7 @@ from .ticra_io import (
 __all__ = [
     "SphericalWaveExpansion",
     "read_ticra_sph",
+    "read_ticra_sph_blocks",
     "write_ticra_sph",
     "normalized_associated_legendre",
     "far_field_pattern_functions",
