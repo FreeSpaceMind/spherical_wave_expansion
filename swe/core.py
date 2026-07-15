@@ -748,10 +748,80 @@ def precompute_spherical_bessel(nmax: int, kr: np.ndarray,
         return _precompute_bessel_numpy(nmax, kr)
 
 
+if HAS_NUMBA:
+    @jit(nopython=True, parallel=True)
+    def _near_field_accumulate_numba(n_arr, m_arr, q1_arr, q2_arr,
+                                     prefactor_arr, sign_arr,
+                                     P_arr, dP_arr, h_all, dkrh_all,
+                                     kr, sin_theta, phi,
+                                     E_prefactor, H_prefactor):
+        n_points = phi.shape[0]
+        n_modes = n_arr.shape[0]
+        E_r = np.zeros(n_points, dtype=np.complex128)
+        E_theta = np.zeros(n_points, dtype=np.complex128)
+        E_phi = np.zeros(n_points, dtype=np.complex128)
+        H_r = np.zeros(n_points, dtype=np.complex128)
+        H_theta = np.zeros(n_points, dtype=np.complex128)
+        H_phi = np.zeros(n_points, dtype=np.complex128)
+
+        for i in prange(n_points):
+            er = 0.0 + 0.0j
+            et = 0.0 + 0.0j
+            ep = 0.0 + 0.0j
+            hr = 0.0 + 0.0j
+            ht = 0.0 + 0.0j
+            hp = 0.0 + 0.0j
+            kr_i = kr[i]
+            if abs(kr_i) < 1e-300:
+                kr_i = 1e-300
+            sin_i = sin_theta[i]
+            if abs(sin_i) < 1e-12:
+                sin_i = 1e-12
+
+            for mode_idx in range(n_modes):
+                n = n_arr[mode_idx]
+                m = m_arr[mode_idx]
+                q1 = q1_arr[mode_idx]
+                q2 = q2_arr[mode_idx]
+                phase_angle = -m * phi[i]
+                phase = math.cos(phase_angle) + 1j * math.sin(phase_angle)
+                coef = prefactor_arr[mode_idx] * sign_arr[mode_idx] * phase
+
+                P = P_arr[mode_idx, i]
+                dP = dP_arr[mode_idx, i]
+                h_n = h_all[n, i]
+                dkrh_n = dkrh_all[n, i]
+                jmP_over_sin = 1j * m * P / sin_i
+
+                f1e_theta = -coef * h_n * jmP_over_sin
+                f1e_phi = -coef * h_n * dP
+                f2e_r = coef * (n * (n + 1) / kr_i) * h_n * P
+                f2e_theta = coef * (dkrh_n / kr_i) * dP
+                f2e_phi = -coef * (dkrh_n / kr_i) * jmP_over_sin
+
+                er += E_prefactor * q2 * f2e_r
+                et += E_prefactor * (q1 * f1e_theta + q2 * f2e_theta)
+                ep += E_prefactor * (q1 * f1e_phi + q2 * f2e_phi)
+
+                hr += H_prefactor * q1 * f2e_r
+                ht += H_prefactor * (q1 * f2e_theta + q2 * f1e_theta)
+                hp += H_prefactor * (q1 * f2e_phi + q2 * f1e_phi)
+
+            E_r[i] = er
+            E_theta[i] = et
+            E_phi[i] = ep
+            H_r[i] = hr
+            H_theta[i] = ht
+            H_phi[i] = hp
+
+        return E_r, E_theta, E_phi, H_r, H_theta, H_phi
+
+
 def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
                                  theta: np.ndarray, phi: np.ndarray,
                                  k: float, legendre_cache: Dict = None,
-                                 bessel_cache: Tuple[np.ndarray, np.ndarray] = None):
+                                 bessel_cache: Tuple[np.ndarray, np.ndarray] = None,
+                                 phase_cache: Dict = None):
     """
     Calculate near-field pattern functions using TICRA convention.
     Uses Hankel function of second kind h_n^(2) = j_n - i*y_n
@@ -811,7 +881,10 @@ def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
         sign_factor = (-m / abs(m)) ** m
     
     # TICRA phase convention: exp(-jmφ)
-    phase = np.exp(-1j * m * phi)
+    if phase_cache is not None and m in phase_cache:
+        phase = phase_cache[m]
+    else:
+        phase = np.exp(-1j * m * phi)
     
     sin_theta = np.sin(theta_safe)
     jmP_over_sin = 1j * m * P_norm / sin_theta
@@ -1041,23 +1114,24 @@ class SphericalWaveExpansion:
     _C = 299792458.0  # speed of light (m/s)
 
     def __init__(self,
-                 Q1_coeffs: Optional[Dict[float, Dict[Tuple[int, int], complex]]] = None,
-                 Q2_coeffs: Optional[Dict[float, Dict[Tuple[int, int], complex]]] = None,
-                 NMAX: Optional[Dict[float, int]] = None,
-                 MMAX: Optional[Dict[float, int]] = None):
+                 Q1_coeffs: Optional[Dict[Union[float, Tuple[int, int]], Union[Dict[Tuple[int, int], complex], complex]]] = None,
+                 Q2_coeffs: Optional[Dict[Union[float, Tuple[int, int]], Union[Dict[Tuple[int, int], complex], complex]]] = None,
+                 frequency: Optional[float] = None,
+                 NMAX: Optional[Union[Dict[float, int], int]] = None,
+                 MMAX: Optional[Union[Dict[float, int], int]] = None):
         """
         Initialize a multi-frequency SWE object.
 
         Args:
-            Q1_coeffs: ``{freq_Hz: {(n, m): complex}}`` mapping for Q₁ modes.
-            Q2_coeffs: ``{freq_Hz: {(n, m): complex}}`` mapping for Q₂ modes.
-            NMAX: ``{freq_Hz: int}`` maximum degree per frequency.
-                  Auto-detected from coefficient keys when omitted.
-            MMAX: ``{freq_Hz: int}`` maximum order per frequency.
-                  Auto-detected from coefficient keys when omitted.
+            Q1_coeffs: Either ``{freq_Hz: {(n, m): complex}}`` or a legacy
+                single-frequency ``{(n, m): complex}`` mapping.
+            Q2_coeffs: Same shape as ``Q1_coeffs`` for Q₂ modes.
+            frequency: Frequency in Hz for legacy single-frequency inputs.
+            NMAX: Maximum degree, as an int or ``{freq_Hz: int}``.
+            MMAX: Maximum order, as an int or ``{freq_Hz: int}``.
         """
-        q1 = dict(Q1_coeffs) if Q1_coeffs is not None else {}
-        q2 = dict(Q2_coeffs) if Q2_coeffs is not None else {}
+        q1_raw = dict(Q1_coeffs) if Q1_coeffs is not None else {}
+        q2_raw = dict(Q2_coeffs) if Q2_coeffs is not None else {}
         self._frequency_order: List[float] = []
         self._Q1_by_frequency: Dict[float, Dict[Tuple[int, int], complex]] = {}
         self._Q2_by_frequency: Dict[float, Dict[Tuple[int, int], complex]] = {}
@@ -1065,37 +1139,117 @@ class SphericalWaveExpansion:
         self._MMAX_by_frequency: Dict[float, int] = {}
         self._frequency = float(frequency) if frequency is not None else None
 
-        # Auto-detect NMAX and MMAX if not provided
-        if NMAX is None or MMAX is None:
-            all_keys = list(q1.keys()) + list(q2.keys())
-            if all_keys:
-                nmax_value = max(n for n, m in all_keys)
-                mmax_value = max(abs(m) for n, m in all_keys)
-                logger.debug(f"Auto-detected NMAX={nmax_value}, MMAX={mmax_value} from {len(all_keys)} mode keys")
-            else:
-                nmax_value = NMAX if NMAX is not None else 0
-                mmax_value = MMAX if MMAX is not None else 0
+        def _is_frequency_indexed(mapping: Dict) -> bool:
+            return bool(mapping) and all(isinstance(value, dict) for value in mapping.values())
+
+        def _to_mode_dict(mapping: Dict) -> Dict[Tuple[int, int], complex]:
+            return {
+                (int(n), int(m)): complex(value)
+                for (n, m), value in mapping.items()
+            }
+
+        q1_is_indexed = _is_frequency_indexed(q1_raw)
+        q2_is_indexed = _is_frequency_indexed(q2_raw)
+        nmax_is_indexed = isinstance(NMAX, dict)
+        mmax_is_indexed = isinstance(MMAX, dict)
+        indexed_input = q1_is_indexed or q2_is_indexed or nmax_is_indexed or mmax_is_indexed
+
+        self._unindexed_Q1_coeffs: Dict[Tuple[int, int], complex] = {}
+        self._unindexed_Q2_coeffs: Dict[Tuple[int, int], complex] = {}
+        self._unindexed_NMAX = 0
+        self._unindexed_MMAX = 0
+
+        if indexed_input:
+            freq_set = set()
+            if q1_is_indexed:
+                freq_set.update(float(freq) for freq in q1_raw.keys())
+            elif q1_raw and self._frequency is not None:
+                freq_set.add(self._frequency)
+            if q2_is_indexed:
+                freq_set.update(float(freq) for freq in q2_raw.keys())
+            elif q2_raw and self._frequency is not None:
+                freq_set.add(self._frequency)
+            if nmax_is_indexed:
+                freq_set.update(float(freq) for freq in NMAX.keys())
+            if mmax_is_indexed:
+                freq_set.update(float(freq) for freq in MMAX.keys())
+            if self._frequency is not None:
+                freq_set.add(self._frequency)
+
+            self._frequency_order = sorted(freq_set)
+            if self._frequency is None and self._frequency_order:
+                self._frequency = self._frequency_order[0]
+
+            for freq in self._frequency_order:
+                q1_modes = q1_raw.get(freq, q1_raw.get(float(freq), {})) if q1_is_indexed else (
+                    q1_raw if self._frequency == freq else {}
+                )
+                q2_modes = q2_raw.get(freq, q2_raw.get(float(freq), {})) if q2_is_indexed else (
+                    q2_raw if self._frequency == freq else {}
+                )
+                q1_modes = _to_mode_dict(q1_modes)
+                q2_modes = _to_mode_dict(q2_modes)
+                all_keys = list(q1_modes.keys()) + list(q2_modes.keys())
+
+                if nmax_is_indexed and freq in NMAX:
+                    nmax_value = int(NMAX[freq])
+                elif nmax_is_indexed and float(freq) in NMAX:
+                    nmax_value = int(NMAX[float(freq)])
+                elif isinstance(NMAX, int):
+                    nmax_value = int(NMAX)
+                elif all_keys:
+                    nmax_value = max(n for n, _ in all_keys)
+                else:
+                    nmax_value = 0
+
+                if mmax_is_indexed and freq in MMAX:
+                    mmax_value = int(MMAX[freq])
+                elif mmax_is_indexed and float(freq) in MMAX:
+                    mmax_value = int(MMAX[float(freq)])
+                elif isinstance(MMAX, int):
+                    mmax_value = int(MMAX)
+                elif all_keys:
+                    mmax_value = max(abs(m) for _, m in all_keys)
+                else:
+                    mmax_value = 0
+
+                self._Q1_by_frequency[freq] = q1_modes
+                self._Q2_by_frequency[freq] = q2_modes
+                self._NMAX_by_frequency[freq] = nmax_value
+                self._MMAX_by_frequency[freq] = mmax_value
         else:
-            nmax_value = NMAX
-            mmax_value = MMAX
+            q1_modes = _to_mode_dict(q1_raw)
+            q2_modes = _to_mode_dict(q2_raw)
+            all_keys = list(q1_modes.keys()) + list(q2_modes.keys())
+            nmax_value = int(NMAX) if isinstance(NMAX, int) else (
+                max((n for n, _ in all_keys), default=0)
+            )
+            mmax_value = int(MMAX) if isinstance(MMAX, int) else (
+                max((abs(m) for _, m in all_keys), default=0)
+            )
 
-        self._unindexed_Q1_coeffs = q1
-        self._unindexed_Q2_coeffs = q2
-        self._unindexed_NMAX = int(nmax_value)
-        self._unindexed_MMAX = int(mmax_value)
+            self._unindexed_Q1_coeffs = q1_modes
+            self._unindexed_Q2_coeffs = q2_modes
+            self._unindexed_NMAX = nmax_value
+            self._unindexed_MMAX = mmax_value
 
-        if self._frequency is not None:
-            self._frequency_order = [self._frequency]
-            self._Q1_by_frequency[self._frequency] = q1
-            self._Q2_by_frequency[self._frequency] = q2
-            self._NMAX_by_frequency[self._frequency] = int(nmax_value)
-            self._MMAX_by_frequency[self._frequency] = int(mmax_value)
+            if self._frequency is not None:
+                self._frequency_order = [self._frequency]
+                self._Q1_by_frequency[self._frequency] = q1_modes
+                self._Q2_by_frequency[self._frequency] = q2_modes
+                self._NMAX_by_frequency[self._frequency] = nmax_value
+                self._MMAX_by_frequency[self._frequency] = mmax_value
 
         self._sync_active_views()
 
-        n_modes = len(q1) + len(q2)
+        active_q1 = self.Q1_coeffs() if callable(self.Q1_coeffs) else self.Q1_coeffs
+        active_q2 = self.Q2_coeffs() if callable(self.Q2_coeffs) else self.Q2_coeffs
+        n_modes = len(active_q1) + len(active_q2)
         if n_modes > 0:
-            logger.debug(f"SphericalWaveExpansion initialized: NMAX={int(self.NMAX)}, MMAX={int(self.MMAX)}, {len(q1)} Q1 modes, {len(q2)} Q2 modes")
+            logger.debug(
+                f"SphericalWaveExpansion initialized: NMAX={int(self.NMAX)}, "
+                f"MMAX={int(self.MMAX)}, {len(active_q1)} Q1 modes, {len(active_q2)} Q2 modes"
+            )
 
     @classmethod
     def from_frequency_data(cls, frequency_data: Iterable[Dict]) -> 'SphericalWaveExpansion':
@@ -1146,9 +1300,9 @@ class SphericalWaveExpansion:
         return _match_frequency_key(target, self._frequency_order)
 
     @property
-    def frequencies(self) -> np.ndarray:
-        """Available frequencies in Hz, in file/construction order."""
-        return np.asarray(self._frequency_order, dtype=float)
+    def frequencies(self) -> List[float]:
+        """Available frequencies in Hz, in ascending order."""
+        return sorted(self._frequency_order)
     
     @property
     def frequency(self) -> Optional[float]:
@@ -1160,30 +1314,68 @@ class SphericalWaveExpansion:
         """Set frequency in Hz."""
         self._frequency = float(freq) if freq is not None else None
         self._sync_active_views()
-    
-    @property
-    def k(self) -> Optional[float]:
-        """Wavenumber in rad/m."""
-        if self._frequency is None:
-            return None
-        return 2 * np.pi * self._frequency / 299792458.0
-    
-    @property
-    def wavelength(self) -> Optional[float]:
-        """Wavelength in meters."""
-        if self._frequency is None:
-            return None
-        return 299792458.0 / self._frequency
 
-    @property
-    def total_power(self) -> float:
+    def _resolve_frequency(self, frequency: Optional[float] = None) -> Optional[float]:
+        """Return the active frequency key, or a legacy unindexed frequency."""
+        if self._frequency_order:
+            return self._active_frequency_key(frequency)
+        return self._frequency if frequency is None else float(frequency)
+
+    def _coefficients_for_frequency(
+        self, frequency: Optional[float] = None
+    ) -> Tuple[Optional[float], Dict[Tuple[int, int], complex],
+               Dict[Tuple[int, int], complex], int, int]:
+        """Return frequency, coefficient dicts, NMAX, and MMAX for computation."""
+        if self._frequency_order:
+            freq_key = self._active_frequency_key(frequency)
+            return (
+                freq_key,
+                self._Q1_by_frequency[freq_key],
+                self._Q2_by_frequency[freq_key],
+                self._NMAX_by_frequency[freq_key],
+                self._MMAX_by_frequency[freq_key],
+            )
+
+        freq_key = self._frequency if frequency is None else float(frequency)
+        return (
+            freq_key,
+            self._unindexed_Q1_coeffs,
+            self._unindexed_Q2_coeffs,
+            self._unindexed_NMAX,
+            self._unindexed_MMAX,
+        )
+
+    def _validate_freq(self, freq: Optional[float]) -> None:
+        """Raise a helpful error if *freq* is not loaded."""
+        if self._frequency_order:
+            self._active_frequency_key(freq)
+            return
+        if freq is None and self._frequency is None:
+            raise ValueError("Frequency must be set before computing fields")
+    
+    def k(self, freq: Optional[float] = None) -> float:
+        """Wavenumber in rad/m."""
+        freq_key = self._resolve_frequency(freq)
+        if freq_key is None:
+            raise ValueError("Frequency must be set before computing wavenumber")
+        return 2 * np.pi * float(freq_key) / self._C
+    
+    def wavelength(self, freq: Optional[float] = None) -> float:
+        """Wavelength in meters."""
+        freq_key = self._resolve_frequency(freq)
+        if freq_key is None:
+            raise ValueError("Frequency must be set before computing wavelength")
+        return self._C / float(freq_key)
+
+    def total_power(self, freq: Optional[float] = None) -> float:
         """Total power in the SWE coefficients: Σ(|Q1|² + |Q2|²).
 
         Used for directivity normalization. When coefficients are normalized
         (via normalize_coefficients()), total_power = 1.0 and the far field
         with normalize=True gives |E|² = directivity.
         """
-        return self._total_power_for(self.Q1_coeffs, self.Q2_coeffs)
+        _, q1_coeffs, q2_coeffs, _, _ = self._coefficients_for_frequency(freq)
+        return self._total_power_for(q1_coeffs, q2_coeffs)
 
     @staticmethod
     def _total_power_for(q1_coeffs: Dict[Tuple[int, int], complex],
@@ -1233,7 +1425,7 @@ class SphericalWaveExpansion:
             self._sync_active_views()
             return
 
-        tp = self.total_power
+        tp = self.total_power()
         if tp <= 0:
             logger.warning("Cannot normalize: total_power is zero")
             return
@@ -1244,11 +1436,83 @@ class SphericalWaveExpansion:
         for key in self.Q2_coeffs:
             self.Q2_coeffs[key] /= norm
 
+    @staticmethod
+    def _select_active_modes(q1_coeffs: Dict[Tuple[int, int], complex],
+                             q2_coeffs: Dict[Tuple[int, int], complex],
+                             nmax: int,
+                             mmax: int,
+                             power_threshold: float = 0.999,
+                             azimuthal_power_threshold: float = 1e-5,
+                             per_mode_power_threshold: float = 1e-8) -> \
+            Tuple[List[Tuple[int, int]], int, int, float]:
+        """Select active modes using n-shell and per-|m| power filtering."""
+        all_modes = set(q1_coeffs.keys()) | set(q2_coeffs.keys())
+        if not all_modes:
+            return [], 0, 0, 0.0
+
+        mode_powers = []
+        for mode in all_modes:
+            q1 = q1_coeffs.get(mode, 0.0)
+            q2 = q2_coeffs.get(mode, 0.0)
+            mode_powers.append((mode, abs(q1) ** 2 + abs(q2) ** 2))
+
+        total_power = sum(power for _, power in mode_powers)
+        if total_power <= 0.0:
+            active = sorted(all_modes)
+            return active, nmax, min(mmax, nmax), total_power
+
+        effective_nmax = nmax
+        if power_threshold < 1.0:
+            n_power: Dict[int, float] = {}
+            for (n, _m), power in mode_powers:
+                n_power[n] = n_power.get(n, 0.0) + power
+
+            cumulative = 0.0
+            for n in sorted(n_power):
+                cumulative += n_power[n]
+                if cumulative >= power_threshold * total_power:
+                    effective_nmax = n
+                    break
+
+        m_power: Dict[int, float] = {}
+        for (n, m), power in mode_powers:
+            if n <= effective_nmax:
+                m_power[abs(m)] = m_power.get(abs(m), 0.0) + power
+
+        active_abs_m = {
+            abs_m for abs_m, power in m_power.items()
+            if power >= azimuthal_power_threshold * total_power
+        }
+        if not active_abs_m and m_power:
+            active_abs_m = {max(m_power, key=m_power.get)}
+
+        cutoff = per_mode_power_threshold * total_power
+        active_modes = [
+            mode for mode, power in mode_powers
+            if mode[0] <= effective_nmax
+            and abs(mode[1]) in active_abs_m
+            and power > cutoff
+        ]
+        active_modes.sort()
+
+        effective_mmax = max((abs(m) for _, m in active_modes), default=0)
+        effective_mmax = min(effective_mmax, mmax, effective_nmax)
+
+        if len(active_modes) < len(all_modes):
+            logger.debug(
+                "Power filtering: NMAX %s -> %s, MMAX %s -> %s, "
+                "%s/%s modes kept",
+                nmax, effective_nmax, mmax, effective_mmax,
+                len(active_modes), len(all_modes),
+            )
+
+        return active_modes, effective_nmax, effective_mmax, total_power
+
     def far_field(self, theta: np.ndarray, phi: np.ndarray,
-                  frequency: float,
+                  frequency: Optional[float] = None,
                   power_threshold: float = 0.999,
-                  normalize: bool = True,
-                  frequency: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray]:
+                  azimuthal_power_threshold: float = 1e-5,
+                  normalize: bool = True) -> Tuple[np.ndarray, np.ndarray]:
         """
         Compute far-field pattern from SWE coefficients.
 
@@ -1270,19 +1534,7 @@ class SphericalWaveExpansion:
             E_theta: Theta component of electric field
             E_phi: Phi component of electric field
         """
-        if self._frequency_order:
-            freq_key = self._active_frequency_key(frequency)
-            q1_coeffs = self._Q1_by_frequency[freq_key]
-            q2_coeffs = self._Q2_by_frequency[freq_key]
-            nmax = self._NMAX_by_frequency[freq_key]
-            mmax = self._MMAX_by_frequency[freq_key]
-        else:
-            freq_key = self._frequency if frequency is None else float(frequency)
-            q1_coeffs = self.Q1_coeffs
-            q2_coeffs = self.Q2_coeffs
-            nmax = int(self.NMAX)
-            mmax = int(self.MMAX)
-
+        freq_key, q1_coeffs, q2_coeffs, nmax, mmax = self._coefficients_for_frequency(frequency)
         if freq_key is None:
             raise ValueError("Frequency must be set before computing far field")
 
@@ -1292,61 +1544,20 @@ class SphericalWaveExpansion:
         if theta.shape != phi.shape:
             theta, phi = np.broadcast_arrays(theta, phi)
 
-        q1 = self._Q1[frequency]
-        q2 = self._Q2[frequency]
+        active_modes, effective_nmax, effective_mmax, total_power = self._select_active_modes(
+            q1_coeffs,
+            q2_coeffs,
+            nmax,
+            mmax,
+            power_threshold=power_threshold,
+            azimuthal_power_threshold=azimuthal_power_threshold,
+        )
 
-        # Compute mode powers and filter by cumulative power threshold
-        all_modes = set(q1_coeffs.keys()) | set(q2_coeffs.keys())
-
-        if not all_modes:
+        if not active_modes:
             logger.debug("No modes present, returning zero field")
             E_theta = np.zeros_like(theta, dtype=complex)
             E_phi = np.zeros_like(phi, dtype=complex)
             return E_theta, E_phi
-
-        nmax = self._nmax[frequency]
-        mmax = self._mmax[frequency]
-
-        # Calculate power per mode
-        mode_powers = []
-        for (n, m) in all_modes:
-            Q1 = q1_coeffs.get((n, m), 0)
-            Q2 = q2_coeffs.get((n, m), 0)
-            power = abs(Q1)**2 + abs(Q2)**2
-            mode_powers.append(((n, m), power))
-
-        total_power = sum(p for _, p in mode_powers)
-
-        # Find effective NMAX based on cumulative n-shell power threshold,
-        # then additionally skip any individual modes with negligible power
-        # (e.g. zero-coefficient m values within an otherwise active n-shell).
-        if power_threshold < 1.0 and total_power > 0:
-            n_power = {}
-            for (n, m), p in mode_powers:
-                n_power[n] = n_power.get(n, 0) + p
-
-            cumulative = 0
-            effective_nmax = nmax
-            effective_nmax = nmax
-            for n in sorted(n_power.keys()):
-                cumulative += n_power[n]
-                if cumulative >= power_threshold * total_power:
-                    effective_nmax = n
-                    break
-
-            # Per-mode cutoff: skip modes whose power is negligible relative to total
-            mode_cutoff = 1e-8 * total_power
-            filtered_modes = [(nm, p) for nm, p in mode_powers
-                              if nm[0] <= effective_nmax and p > mode_cutoff]
-            if len(filtered_modes) < len(mode_powers):
-                logger.debug(f"Power filtering: using NMAX={effective_nmax}, "
-                             f"{len(filtered_modes)}/{len(mode_powers)} modes kept "
-                             f"({100*power_threshold:.2f}% power, per-mode cutoff 1e-8)")
-        else:
-            mode_cutoff = 0.0
-            filtered_modes = mode_powers
-            effective_nmax = nmax
-            effective_nmax = nmax
 
         logger.debug(f"Computing far field at {len(theta.flatten())} points, "
                      f"effective NMAX={effective_nmax}")
@@ -1354,16 +1565,14 @@ class SphericalWaveExpansion:
         E_theta = np.zeros_like(theta, dtype=complex)
         E_phi = np.zeros_like(phi, dtype=complex)
 
-        # PRE-COMPUTE ALL LEGENDRE FUNCTIONS AT ONCE
-        effective_mmax = min(mmax, effective_nmax)
         legendre_cache = compute_all_modes_legendre(effective_nmax, effective_mmax, theta)
 
         # Precompute exp(-1j*m*phi) for each unique m in filtered_modes.
         # Many n values share the same m, so this avoids redundant complex exponentials.
-        unique_m = {nm[1] for nm, _ in filtered_modes}
+        unique_m = {m for _, m in active_modes}
         phase_cache = {m_val: np.exp(-1j * m_val * phi) for m_val in unique_m}
 
-        for (n, m), _ in filtered_modes:
+        for n, m in active_modes:
             if (n, m) not in legendre_cache:
                 continue
 
@@ -1760,7 +1969,8 @@ class SphericalWaveExpansion:
 
     @classmethod
     def from_sph_file(cls, filename: str,
-                      frequencies: Optional[Iterable[float]] = None) -> 'SphericalWaveExpansion':
+                      frequencies: Optional[Iterable[float]] = None,
+                      normalize: bool = True) -> 'SphericalWaveExpansion':
         """
         Create a multi-frequency SWE object from a TICRA .sph file.
 
@@ -1806,9 +2016,6 @@ class SphericalWaveExpansion:
 
         swe = cls.from_frequency_data(frequency_data)
 
-        swe = cls(Q1_coeffs=Q1_all, Q2_coeffs=Q2_all,
-                  NMAX=nmax_all, MMAX=mmax_all)
-
         if normalize:
             swe.normalize_coefficients()
 
@@ -1848,68 +2055,28 @@ class SphericalWaveExpansion:
                 description,
                 file_mode='w' if idx == 0 else 'a',
             )
-    
-    def near_field(self, r: np.ndarray, theta: np.ndarray, phi: np.ndarray,
-                   frequency: Optional[float] = None,
-                   normalize: bool = True) -> \
-            Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray],
-                  Tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """
-        Calculate near-field E and H components.
 
-        By default, normalizes by sqrt(total_power) so that the fields are
-        consistent with the directivity-normalized far field.
+    @staticmethod
+    def _near_field_prefactors(k: float) -> Tuple[complex, complex]:
+        """Return E/H scaling prefactors for the near-field pattern functions."""
+        Z0 = 376.730313668
+        return k * np.sqrt(Z0), 1j * k / np.sqrt(Z0)
 
-        Scaling note: the prefactors used are sqrt(4π) for E and j*sqrt(4π)/Z0
-        for H, consistent with the far-field K-function normalisation. TICRA's
-        internal convention stores Q_internal = -conj(Q_file) with no additional
-        scaling factor.
-
-        Args:
-            r: Radial distance(s) in meters
-            theta: Polar angle(s) in radians
-            phi: Azimuthal angle(s) in radians
-            frequency: Frequency in Hz (must be a loaded frequency)
-            normalize: If True (default), divide by sqrt(total_power) for
-                      consistency with directivity-normalized far field.
-
-        Returns:
-            E: Tuple of (E_r, E_theta, E_phi) in V/m
-            H: Tuple of (H_r, H_theta, H_phi) in A/m
-        """
-        if isinstance(frequency, (bool, np.bool_)):
-            normalize = bool(frequency)
-            frequency = None
-
-        if self._frequency_order:
-            freq_key = self._active_frequency_key(frequency)
-            q1_coeffs = self._Q1_by_frequency[freq_key]
-            q2_coeffs = self._Q2_by_frequency[freq_key]
-            nmax = self._NMAX_by_frequency[freq_key]
-            mmax = self._MMAX_by_frequency[freq_key]
-        else:
-            freq_key = self._frequency if frequency is None else float(frequency)
-            q1_coeffs = self.Q1_coeffs
-            q2_coeffs = self.Q2_coeffs
-            nmax = int(self.NMAX)
-            mmax = int(self.MMAX)
-
-        if freq_key is None:
-            raise ValueError("Frequency must be set before computing near field")
-        k = 2 * np.pi * float(freq_key) / 299792458.0
-
-        r = np.atleast_1d(r)
-        theta = np.atleast_1d(theta)
-        phi = np.atleast_1d(phi)
-
-        if not (r.shape == theta.shape == phi.shape):
-            r, theta, phi = np.broadcast_arrays(r, theta, phi)
-
-        logger.debug(f"Computing near field at {len(r.flatten())} points, NMAX={nmax}, MMAX={mmax}")
-
-        logger.debug(f"Computing near field at {len(r.flatten())} points, "
-                     f"NMAX={nmax}, MMAX={mmax}")
-
+    @staticmethod
+    def _evaluate_near_field_general(
+        r: np.ndarray,
+        theta: np.ndarray,
+        phi: np.ndarray,
+        k: float,
+        active_modes: List[Tuple[int, int]],
+        q1_coeffs: Dict[Tuple[int, int], complex],
+        q2_coeffs: Dict[Tuple[int, int], complex],
+        effective_nmax: int,
+        effective_mmax: int,
+        use_numba: bool = True,
+    ) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray],
+               Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Pure NumPy reference path for arbitrary point clouds."""
         E_r = np.zeros_like(r, dtype=complex)
         E_theta = np.zeros_like(theta, dtype=complex)
         E_phi = np.zeros_like(phi, dtype=complex)
@@ -1917,69 +2084,355 @@ class SphericalWaveExpansion:
         H_theta = np.zeros_like(theta, dtype=complex)
         H_phi = np.zeros_like(phi, dtype=complex)
 
-        all_modes = set(q1_coeffs.keys()) | set(q2_coeffs.keys())
-
-        if not all_modes:
-            logger.debug("No modes present, returning zero fields")
+        if not active_modes:
             return (E_r, E_theta, E_phi), (H_r, H_theta, H_phi)
 
-        # Pre-compute Legendre functions
-        legendre_cache = compute_all_modes_legendre(nmax, mmax, theta)
+        legendre_cache = compute_all_modes_legendre(effective_nmax, effective_mmax, theta)
+        bessel_cache = precompute_spherical_bessel(effective_nmax, k * r.ravel(), use_numba=use_numba)
+        phase_cache = {m: np.exp(-1j * m * phi) for _, m in active_modes}
+        E_prefactor, H_prefactor = SphericalWaveExpansion._near_field_prefactors(k)
 
-        # Pre-compute ALL spherical Bessel functions for n=0 to NMAX
-        # This eliminates redundant scipy calls since Bessel functions depend on (n, kr), not m
-        kr = k * r.ravel()
-        bessel_cache = precompute_spherical_bessel(nmax, kr)
-
-        # Scaling prefactors for near-field E and H.
-        # TICRA's internal convention is Q_internal = -conj(Q_file) with no extra scaling.
-        # The effective prefactor consistent with the far-field K-function scaling is sqrt(4π).
-        Z0 = 376.730313668
-        E_prefactor = k * np.sqrt(Z0)
-        H_prefactor = 1j*k/np.sqrt(Z0)
-
-        for (n, m) in active_modes:
+        for n, m in active_modes:
             F1_E, F2_E, F1_H, F2_H = near_field_pattern_functions(
-                n, m, r, theta, phi, k, legendre_cache, bessel_cache
-                n, m, r, theta, phi, k, legendre_cache, bessel_cache
+                n, m, r, theta, phi, k, legendre_cache, bessel_cache, phase_cache
             )
-            
-            # Q1 contribution (TE to r modes)
-            if (n, m) in q1_coeffs:
-                Q1 = q1_coeffs[(n, m)]
-                E_r += E_prefactor * Q1 * F1_E[0]
-                E_theta += E_prefactor * Q1 * F1_E[1]
-                E_phi += E_prefactor * Q1 * F1_E[2]
-                H_r += H_prefactor * Q1 * F1_H[0]
-                H_theta += H_prefactor * Q1 * F1_H[1]
-                H_phi += H_prefactor * Q1 * F1_H[2]
-            
-            # Q2 contribution (TM to r modes)
-            if (n, m) in q2_coeffs:
-                Q2 = q2_coeffs[(n, m)]
-                E_r += E_prefactor * Q2 * F2_E[0]
-                E_theta += E_prefactor * Q2 * F2_E[1]
-                E_phi += E_prefactor * Q2 * F2_E[2]
-                H_r += H_prefactor * Q2 * F2_H[0]
-                H_theta += H_prefactor * Q2 * F2_H[1]
-                H_phi += H_prefactor * Q2 * F2_H[2]
 
-        if normalize:
-            tp = self._total_power_for(q1_coeffs, q2_coeffs)
-            if tp > 0:
-                norm = np.sqrt(tp)
-                E_r /= norm
-                E_theta /= norm
-                E_phi /= norm
-                H_r /= norm
-                H_theta /= norm
-                H_phi /= norm
+            if (n, m) in q1_coeffs:
+                q1 = q1_coeffs[(n, m)]
+                E_r += E_prefactor * q1 * F1_E[0]
+                E_theta += E_prefactor * q1 * F1_E[1]
+                E_phi += E_prefactor * q1 * F1_E[2]
+                H_r += H_prefactor * q1 * F1_H[0]
+                H_theta += H_prefactor * q1 * F1_H[1]
+                H_phi += H_prefactor * q1 * F1_H[2]
+
+            if (n, m) in q2_coeffs:
+                q2 = q2_coeffs[(n, m)]
+                E_r += E_prefactor * q2 * F2_E[0]
+                E_theta += E_prefactor * q2 * F2_E[1]
+                E_phi += E_prefactor * q2 * F2_E[2]
+                H_r += H_prefactor * q2 * F2_H[0]
+                H_theta += H_prefactor * q2 * F2_H[1]
+                H_phi += H_prefactor * q2 * F2_H[2]
 
         return (E_r, E_theta, E_phi), (H_r, H_theta, H_phi)
 
+    @staticmethod
+    def _evaluate_near_field_numba(
+        r: np.ndarray,
+        theta: np.ndarray,
+        phi: np.ndarray,
+        k: float,
+        active_modes: List[Tuple[int, int]],
+        q1_coeffs: Dict[Tuple[int, int], complex],
+        q2_coeffs: Dict[Tuple[int, int], complex],
+        effective_nmax: int,
+        effective_mmax: int,
+        chunk_size: int = 4096,
+    ) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray],
+               Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Chunked Numba accumulation path for arbitrary point clouds."""
+        if not HAS_NUMBA:
+            return SphericalWaveExpansion._evaluate_near_field_general(
+                r, theta, phi, k, active_modes, q1_coeffs, q2_coeffs,
+                effective_nmax, effective_mmax, use_numba=False,
+            )
+
+        n_points = len(r)
+        E_r = np.zeros(n_points, dtype=complex)
+        E_theta = np.zeros(n_points, dtype=complex)
+        E_phi = np.zeros(n_points, dtype=complex)
+        H_r = np.zeros(n_points, dtype=complex)
+        H_theta = np.zeros(n_points, dtype=complex)
+        H_phi = np.zeros(n_points, dtype=complex)
+
+        n_arr = np.array([n for n, _ in active_modes], dtype=np.int64)
+        m_arr = np.array([m for _, m in active_modes], dtype=np.int64)
+        q1_arr = np.array([q1_coeffs.get(mode, 0.0 + 0.0j) for mode in active_modes],
+                          dtype=np.complex128)
+        q2_arr = np.array([q2_coeffs.get(mode, 0.0 + 0.0j) for mode in active_modes],
+                          dtype=np.complex128)
+        prefactor_arr = np.array(
+            [1.0 / np.sqrt(2.0 * np.pi) / np.sqrt(n * (n + 1)) for n, _ in active_modes],
+            dtype=np.float64,
+        )
+        sign_arr = np.array(
+            [1.0 if m == 0 else float((-m / abs(m)) ** m) for _, m in active_modes],
+            dtype=np.float64,
+        )
+        E_prefactor, H_prefactor = SphericalWaveExpansion._near_field_prefactors(k)
+
+        for start in range(0, n_points, chunk_size):
+            stop = min(start + chunk_size, n_points)
+            r_chunk = r[start:stop]
+            theta_chunk = theta[start:stop]
+            phi_chunk = phi[start:stop]
+            kr = k * r_chunk.ravel()
+
+            legendre_cache = compute_all_modes_legendre(
+                effective_nmax, effective_mmax, theta_chunk
+            )
+            P_arr = np.empty((len(active_modes), stop - start), dtype=np.float64)
+            dP_arr = np.empty_like(P_arr)
+            for mode_idx, mode in enumerate(active_modes):
+                P_arr[mode_idx], dP_arr[mode_idx] = legendre_cache[mode]
+
+            j_all, y_all = precompute_spherical_bessel(effective_nmax, kr, use_numba=True)
+            h_all = j_all - 1j * y_all
+            dkrh_all = np.empty_like(h_all)
+            safe_kr = np.where(np.abs(kr) < 1e-300, 1e-300, kr)
+            dkrh_all[0] = 1j * np.cos(safe_kr)
+            for n in range(1, effective_nmax + 1):
+                dkrh_all[n] = safe_kr * h_all[n - 1] - n * h_all[n]
+
+            theta_safe = np.copy(theta_chunk)
+            epsilon = 1e-6
+            theta_safe = np.where(theta_safe < epsilon, epsilon, theta_safe)
+            theta_safe = np.where(theta_safe > (np.pi - epsilon), np.pi - epsilon, theta_safe)
+            sin_theta = np.sin(theta_safe)
+
+            er, et, ep, hr, ht, hp = _near_field_accumulate_numba(
+                n_arr, m_arr, q1_arr, q2_arr,
+                prefactor_arr, sign_arr,
+                P_arr, dP_arr, h_all, dkrh_all,
+                safe_kr, sin_theta, phi_chunk,
+                E_prefactor, H_prefactor,
+            )
+            E_r[start:stop] = er
+            E_theta[start:stop] = et
+            E_phi[start:stop] = ep
+            H_r[start:stop] = hr
+            H_theta[start:stop] = ht
+            H_phi[start:stop] = hp
+
+        return (E_r, E_theta, E_phi), (H_r, H_theta, H_phi)
+
+    @staticmethod
+    def _detect_rings(
+        r: np.ndarray,
+        theta: np.ndarray,
+        rtol: float = 1e-9,
+        theta_atol: float = 1e-10,
+        max_ring_fraction: float = 0.25,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Group points by equal (r, theta), returning None when not beneficial."""
+        r_flat = np.asarray(r, dtype=float).ravel()
+        theta_flat = np.asarray(theta, dtype=float).ravel()
+        n_points = len(r_flat)
+        if n_points == 0:
+            return None
+
+        r_scale = max(float(np.max(np.abs(r_flat))), 1.0)
+        r_step = max(rtol * r_scale, np.finfo(float).eps)
+        theta_step = max(theta_atol, np.finfo(float).eps)
+        quantized = np.column_stack([
+            np.round(r_flat / r_step).astype(np.int64),
+            np.round(theta_flat / theta_step).astype(np.int64),
+        ])
+
+        _unique, first_index, point_to_ring = np.unique(
+            quantized, axis=0, return_index=True, return_inverse=True
+        )
+        n_rings = len(first_index)
+        if n_rings == n_points or n_rings / n_points > max_ring_fraction:
+            return None
+        if np.any(np.bincount(point_to_ring) == 1):
+            return None
+
+        ring_r = r_flat[first_index]
+        ring_theta = theta_flat[first_index]
+        if np.max(np.abs(r_flat - ring_r[point_to_ring])) > r_step:
+            return None
+        if np.max(np.abs(theta_flat - ring_theta[point_to_ring])) > theta_step:
+            return None
+
+        return ring_r, ring_theta, point_to_ring
+
+    @staticmethod
+    def _evaluate_near_field_bor(
+        ring_r: np.ndarray,
+        ring_theta: np.ndarray,
+        phi: np.ndarray,
+        point_to_ring: np.ndarray,
+        k: float,
+        active_modes: List[Tuple[int, int]],
+        q1_coeffs: Dict[Tuple[int, int], complex],
+        q2_coeffs: Dict[Tuple[int, int], complex],
+        effective_nmax: int,
+        effective_mmax: int,
+        use_numba: bool = True,
+    ) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray],
+               Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """BOR fast path: evaluate radial/theta terms once per ring."""
+        n_points = len(phi)
+        E_r = np.zeros(n_points, dtype=complex)
+        E_theta = np.zeros(n_points, dtype=complex)
+        E_phi = np.zeros(n_points, dtype=complex)
+        H_r = np.zeros(n_points, dtype=complex)
+        H_theta = np.zeros(n_points, dtype=complex)
+        H_phi = np.zeros(n_points, dtype=complex)
+
+        if not active_modes:
+            return (E_r, E_theta, E_phi), (H_r, H_theta, H_phi)
+
+        ring_phi = np.zeros_like(ring_r)
+        legendre_cache = compute_all_modes_legendre(effective_nmax, effective_mmax, ring_theta)
+        bessel_cache = precompute_spherical_bessel(
+            effective_nmax, k * ring_r.ravel(), use_numba=use_numba
+        )
+        ring_phase_cache = {m: np.ones_like(ring_r, dtype=complex) for _, m in active_modes}
+        point_phase_cache = {m: np.exp(-1j * m * phi) for _, m in active_modes}
+        E_prefactor, H_prefactor = SphericalWaveExpansion._near_field_prefactors(k)
+
+        def expand(base, phase):
+            if np.isscalar(base):
+                return base
+            return base[point_to_ring] * phase
+
+        for n, m in active_modes:
+            F1_E, F2_E, F1_H, F2_H = near_field_pattern_functions(
+                n, m, ring_r, ring_theta, ring_phi, k,
+                legendre_cache, bessel_cache, ring_phase_cache
+            )
+            phase = point_phase_cache[m]
+
+            if (n, m) in q1_coeffs:
+                q1 = q1_coeffs[(n, m)]
+                E_r += E_prefactor * q1 * expand(F1_E[0], phase)
+                E_theta += E_prefactor * q1 * expand(F1_E[1], phase)
+                E_phi += E_prefactor * q1 * expand(F1_E[2], phase)
+                H_r += H_prefactor * q1 * expand(F1_H[0], phase)
+                H_theta += H_prefactor * q1 * expand(F1_H[1], phase)
+                H_phi += H_prefactor * q1 * expand(F1_H[2], phase)
+
+            if (n, m) in q2_coeffs:
+                q2 = q2_coeffs[(n, m)]
+                E_r += E_prefactor * q2 * expand(F2_E[0], phase)
+                E_theta += E_prefactor * q2 * expand(F2_E[1], phase)
+                E_phi += E_prefactor * q2 * expand(F2_E[2], phase)
+                H_r += H_prefactor * q2 * expand(F2_H[0], phase)
+                H_theta += H_prefactor * q2 * expand(F2_H[1], phase)
+                H_phi += H_prefactor * q2 * expand(F2_H[2], phase)
+
+        return (E_r, E_theta, E_phi), (H_r, H_theta, H_phi)
+    
+    def near_field(self, r: np.ndarray, theta: np.ndarray, phi: np.ndarray,
+                   frequency: Optional[float] = None,
+                   power_threshold: float = 0.999,
+                   azimuthal_power_threshold: float = 1e-5,
+                   normalize: bool = True,
+                   use_numba: bool = True,
+                   force_general: bool = False) -> \
+            Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray],
+                  Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """
+        Calculate near-field E and H components.
+
+        Automatic BOR ring detection is used when the points share repeated
+        (r, theta) rings in the SWE frame. Set ``force_general=True`` to use
+        the pure NumPy arbitrary-point reference path.
+        """
+        if isinstance(frequency, (bool, np.bool_)):
+            normalize = bool(frequency)
+            frequency = None
+
+        freq_key, q1_coeffs, q2_coeffs, nmax, mmax = self._coefficients_for_frequency(frequency)
+        if freq_key is None:
+            raise ValueError("Frequency must be set before computing near field")
+        k = 2 * np.pi * float(freq_key) / self._C
+
+        r = np.atleast_1d(r)
+        theta = np.atleast_1d(theta)
+        phi = np.atleast_1d(phi)
+        if not (r.shape == theta.shape == phi.shape):
+            r, theta, phi = np.broadcast_arrays(r, theta, phi)
+
+        output_shape = r.shape
+        r_flat = np.asarray(r, dtype=float).ravel()
+        theta_flat = np.asarray(theta, dtype=float).ravel()
+        phi_flat = np.asarray(phi, dtype=float).ravel()
+
+        logger.debug(
+            "Computing near field at %s points, NMAX=%s, MMAX=%s",
+            len(r_flat), nmax, mmax,
+        )
+
+        active_modes, effective_nmax, effective_mmax, total_power = self._select_active_modes(
+            q1_coeffs,
+            q2_coeffs,
+            nmax,
+            mmax,
+            power_threshold=power_threshold,
+            azimuthal_power_threshold=azimuthal_power_threshold,
+        )
+
+        if not active_modes:
+            zero = np.zeros(output_shape, dtype=complex)
+            return (zero.copy(), zero.copy(), zero.copy()), (zero.copy(), zero.copy(), zero.copy())
+
+        ring_data = None if force_general else self._detect_rings(r_flat, theta_flat)
+        if ring_data is not None:
+            ring_r, ring_theta, point_to_ring = ring_data
+            logger.debug(
+                "Near-field BOR path: %s points compressed to %s rings",
+                len(r_flat), len(ring_r),
+            )
+            E, H = self._evaluate_near_field_bor(
+                ring_r,
+                ring_theta,
+                phi_flat,
+                point_to_ring,
+                k,
+                active_modes,
+                q1_coeffs,
+                q2_coeffs,
+                effective_nmax,
+                effective_mmax,
+                use_numba=use_numba,
+            )
+        else:
+            logger.debug("Near-field general path: %s points", len(r_flat))
+            if use_numba and HAS_NUMBA:
+                E, H = self._evaluate_near_field_numba(
+                    r_flat,
+                    theta_flat,
+                    phi_flat,
+                    k,
+                    active_modes,
+                    q1_coeffs,
+                    q2_coeffs,
+                    effective_nmax,
+                    effective_mmax,
+                )
+            else:
+                E, H = self._evaluate_near_field_general(
+                    r_flat,
+                    theta_flat,
+                    phi_flat,
+                    k,
+                    active_modes,
+                    q1_coeffs,
+                    q2_coeffs,
+                    effective_nmax,
+                    effective_mmax,
+                    use_numba=use_numba,
+                )
+
+        if normalize and total_power > 0:
+            norm = np.sqrt(total_power)
+            E = tuple(component / norm for component in E)
+            H = tuple(component / norm for component in H)
+
+        E = tuple(component.reshape(output_shape) for component in E)
+        H = tuple(component.reshape(output_shape) for component in H)
+        return E, H
     def near_field_cartesian(self, x: np.ndarray, y: np.ndarray, z: np.ndarray,
                              frequency: Optional[float] = None,
-                             normalize: bool = True) -> \
+                             power_threshold: float = 0.999,
+                             azimuthal_power_threshold: float = 1e-5,
+                             normalize: bool = True,
+                             use_numba: bool = True,
+                             force_general: bool = False) -> \
             Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray],
                   Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """
@@ -2004,7 +2457,13 @@ class SphericalWaveExpansion:
 
         # Get fields in spherical basis
         (E_r, E_theta, E_phi), (H_r, H_theta, H_phi) = self.near_field(
-            r, theta, phi, frequency=frequency, normalize=normalize
+            r, theta, phi,
+            frequency=frequency,
+            power_threshold=power_threshold,
+            azimuthal_power_threshold=azimuthal_power_threshold,
+            normalize=normalize,
+            use_numba=use_numba,
+            force_general=force_general,
         )
         
         # Convert to Cartesian basis
@@ -2015,7 +2474,11 @@ class SphericalWaveExpansion:
     def currents_on_surface(self, rr: np.ndarray, unr: np.ndarray, dSr: np.ndarray,
                                 swe_origin: np.ndarray = None,
                                 swe_rotation: Optional[Tuple[float, float, float]] = None,
-                                frequency: Optional[float] = None) -> \
+                                frequency: Optional[float] = None,
+                                power_threshold: float = 0.999,
+                                azimuthal_power_threshold: float = 1e-5,
+                                use_numba: bool = True,
+                                force_general: bool = False) -> \
             Tuple[np.ndarray, np.ndarray]:
         """
         Calculate equivalent surface currents on an arbitrary reflector surface.
@@ -2053,7 +2516,12 @@ class SphericalWaveExpansion:
 
         x, y, z = rr_swe[:, 0], rr_swe[:, 1], rr_swe[:, 2]
         (Ex, Ey, Ez), (Hx, Hy, Hz) = self.near_field_cartesian(
-            x, y, z, frequency=frequency
+            x, y, z,
+            frequency=frequency,
+            power_threshold=power_threshold,
+            azimuthal_power_threshold=azimuthal_power_threshold,
+            use_numba=use_numba,
+            force_general=force_general,
         )
         
         E_total = np.column_stack([Ex, Ey, Ez])
@@ -2268,14 +2736,13 @@ def read_ticra_sph_blocks(filename: str) -> List[Dict]:
     return blocks
 
 
-def read_ticra_sph(filename: str) -> Dict:
+def read_ticra_sph(filename: str) -> List[Dict]:
     """
     Read TICRA .sph file containing spherical wave expansion coefficients.
 
-    For backward compatibility this returns the first block. Use
-    read_ticra_sph_blocks() to retrieve all concatenated frequency blocks.
+    Returns all frequency blocks present in the file.
     """
-    return read_ticra_sph_blocks(filename)[0]
+    return read_ticra_sph_blocks(filename)
 
 
 def write_ticra_sph(filename: str,
@@ -2304,7 +2771,11 @@ def write_ticra_sph(filename: str,
     Internal coefficients are converted back to file convention on write:
         Q_file = -conj(Q_internal)
     """
-    logger.info(f"Writing TICRA .sph file: {filename} ({len(freq_data_list)} frequency block(s))")
+    logger.info(
+        f"Writing TICRA .sph file: {filename}, "
+        f"NMAX={NMAX}, MMAX={MMAX}, frequency={frequency_GHz} GHz"
+    )
+    normalization_factor = np.sqrt(8 * np.pi)
 
     with open(filename, file_mode) as f:
         # Record 1: PRGTAG

@@ -5,22 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "spherical-wave-expansion"
 version = "0.1.0"
-<<<<<<< HEAD
-description = "Spherical wave expansion analysis for electromagnetic fields"
-readme = "README.md"
-authors = [{name = "Justin Long", email = "justinwlong1@gmail.com"}]
-requires-python = ">=3.9"
-license = "MIT"
-
-keywords = ["spherical", "wave", "expansion", "antenna", "electromagnetic", "near-field"]
-=======
 description = "Spherical wave expansion analysis of electromagnetic fields (Hansen/TICRA convention)"
 readme = "README.md"
 authors = [{name = "Justin Long", email = "justinwlong1@gmail.com"}]
 requires-python = ">=3.9"
 license = {file = "LICENSE"}
 keywords = ["spherical", "wave", "expansion", "antenna", "electromagnetic", "near-field", "TICRA", "GRASP"]
->>>>>>> 1f18d7cb49b3732a462bd44c50d28f77172b4a52
 
 classifiers = [
     "Development Status :: 4 - Beta",

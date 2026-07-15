@@ -51,12 +51,8 @@ __all__ = [
     "cut_to_fields",
     "read_grasp_grd",
     "write_grasp_grd",
-<<<<<<< HEAD
-]
-=======
     "spherical_to_ludwig3",
     "ludwig3_to_spherical",
     "remap_negative_theta",
     "extract_cut_frequency_set",
 ]
->>>>>>> 1f18d7cb49b3732a462bd44c50d28f77172b4a52
