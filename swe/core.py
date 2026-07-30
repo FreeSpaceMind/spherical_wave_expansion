@@ -45,6 +45,11 @@ from scipy.optimize import lsq_linear
 from typing import Dict, Tuple, Optional, Union, Iterable, List
 import warnings
 from multiprocessing import Pool
+
+# NumPy 1.x/2.x compatibility: np.trapezoid appeared in 2.0 and np.trapz
+# is removed there. Downstream hosts (UmbraAntennaDesigner) pin 1.26, so
+# resolve whichever this NumPy provides once, at import.
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
 import os
 
 # Optional Numba acceleration for performance-critical functions
@@ -1812,10 +1817,10 @@ class SphericalWaveExpansion:
                     K2_phi = prefactor * sign_factor * phase * i_factor_2 * (-mP_over_sin)
 
                     integrand_1 = (E_THETA * np.conj(K1_theta) + E_PHI * np.conj(K1_phi)) * sin_theta
-                    Q1 = np.dot(w_theta, np.trapezoid(integrand_1, phi_unique, axis=1)) * norm_factor
+                    Q1 = np.dot(w_theta, _trapezoid(integrand_1, phi_unique, axis=1)) * norm_factor
 
                     integrand_2 = (E_THETA * np.conj(K2_theta) + E_PHI * np.conj(K2_phi)) * sin_theta
-                    Q2 = np.dot(w_theta, np.trapezoid(integrand_2, phi_unique, axis=1)) * norm_factor
+                    Q2 = np.dot(w_theta, _trapezoid(integrand_2, phi_unique, axis=1)) * norm_factor
                     
                     Q1_coeffs[(n, m)] = Q1
                     Q2_coeffs[(n, m)] = Q2
