@@ -8,10 +8,8 @@ operations are properly inverse.
 
 import os
 import tempfile
-import numpy as np
-import pytest
 
-from swe import SphericalWaveExpansion, read_ticra_sph, write_ticra_sph
+from swe import SphericalWaveExpansion, read_ticra_sph
 from tests.conftest import SPH_FILE, requires_sph
 
 

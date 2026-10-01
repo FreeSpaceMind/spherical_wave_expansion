@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spherical-wave-expansion"
-version = "0.1.0"
+version = "0.2.0"
 description = "Spherical wave expansion analysis of electromagnetic fields (Hansen/TICRA convention)"
 readme = "README.md"
 authors = [{name = "Justin Long", email = "justinwlong1@gmail.com"}]
@@ -46,8 +46,10 @@ Repository = "https://github.com/FreeSpaceMind/spherical_wave_expansion"
 Issues = "https://github.com/FreeSpaceMind/spherical_wave_expansion/issues"
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["swe*"]
+# src layout: the package is importable only once installed (editable or
+# not), so tests always exercise the installed package, and the project
+# root itself is never mistaken for a package.
+where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

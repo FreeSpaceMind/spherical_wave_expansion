@@ -85,6 +85,13 @@ class TestSphToNearField:
               f"[{field['grid_max_x']:.4f}, {field['grid_max_y']:.4f}], "
               f"size={field['nx']}x{field['ny']}")
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="The near field computed from example.sph does not match example.grd: "
+               "the normalized RMS after the best-fit scale is about 10 (Eco) and 28 (Ecx) "
+               "at every frequency, with a best-fit scale near 183. Either the .grd plane "
+               "is not being read as the test assumes or the near-field synthesis is wrong; "
+               "the assertions state what a correct comparison must satisfy.")
     def test_near_field_absolute_vs_grd(self):
         """
         Compare absolute near-field against .grd at z=0.25m for all frequencies.
@@ -115,6 +122,9 @@ class TestSphToNearField:
                   f"Eco scale={met_co['scaling_ratio']:.4f}, "
                   f"Ecx scale={met_cx['scaling_ratio']:.4f}, "
                   f"Eco nRMS={met_co['normalized_rms_after_scaling']:.2e}")
+            label = f"{freq/1e9:.4f} GHz"
+            assert met_co['normalized_rms_after_scaling'] < 5e-2, f"Eco near-field shape mismatch at {label}"
+            assert met_cx['normalized_rms_after_scaling'] < 1e-1, f"Ecx near-field shape mismatch at {label}"
 
     def test_near_field_not_zero(self):
         """Sanity check: near field is non-zero at a test point for every frequency."""

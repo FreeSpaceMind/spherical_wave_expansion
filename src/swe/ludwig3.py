@@ -15,7 +15,7 @@ References:
 """
 
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple
 
 
 def spherical_to_ludwig3(E_theta: np.ndarray, E_phi: np.ndarray,

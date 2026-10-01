@@ -152,7 +152,7 @@ class TestCutToSph:
         freq_ext = swe_extracted.frequencies[0]
 
         print(f"\n{'='*70}")
-        print(f"Roundtrip: .cut -> SWE -> far_field -> Ludwig-3 vs original .cut")
+        print("Roundtrip: .cut -> SWE -> far_field -> Ludwig-3 vs original .cut")
         print(f"{'='*70}")
 
         for i, cut in enumerate(self.cut_data['cuts'][:5]):  # first 5 cuts for speed

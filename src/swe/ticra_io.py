@@ -13,7 +13,7 @@ File format references:
 
 import logging
 import numpy as np
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 

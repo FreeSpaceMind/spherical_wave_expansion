@@ -85,6 +85,19 @@ class TestSphToFarField:
             print(f"  {freq/1e9:.4f} GHz — "
                   f"Eco scale={met_co['scaling_ratio']:.4f}, "
                   f"Ecx scale={met_cx['scaling_ratio']:.4f}")
+            # The pattern shape is what the expansion must reproduce; the
+            # best-fit scale absorbs the file's power normalization (the
+            # .sph is unit-power, the .cut carries gain) and the phase
+            # offset the sign convention. Measured on example.sph/.cut:
+            # Eco nRMS 1.8e-3..3.5e-3, Ecx nRMS 1.0e-2..1.7e-2, Eco and Ecx
+            # scales within 1.5 %, phase offset within 0.5 deg of 180 deg.
+            label = f"{freq/1e9:.4f} GHz"
+            assert met_co['normalized_rms_after_scaling'] < 1e-2, f"Eco shape mismatch at {label}"
+            assert met_cx['normalized_rms_after_scaling'] < 3e-2, f"Ecx shape mismatch at {label}"
+            assert abs(met_cx['scaling_ratio'] / met_co['scaling_ratio'] - 1.0) < 0.03, \
+                f"co and cross-polar scales disagree at {label}"
+            assert abs(abs(met_co['phase_offset_deg']) - 180.0) < 1.0, \
+                f"global phase relative to the .cut changed at {label}: {met_co['phase_offset_deg']:.2f} deg"
 
     def test_far_field_per_cut_ludwig3(self):
         """Compare Ludwig-3 per phi-cut for all frequencies."""

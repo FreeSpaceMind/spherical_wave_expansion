@@ -4,7 +4,7 @@ Spherical Wave Expansion Package
 A Python package for spherical wave expansion analysis of electromagnetic fields.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __author__ = "Justin Long"
 __email__ = "justinwlong1@gmail.com"
 

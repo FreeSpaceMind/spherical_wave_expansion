@@ -40,8 +40,7 @@ References:
 import logging
 import math
 import numpy as np
-from scipy.special import lpmv, spherical_jn, spherical_yn
-from scipy.optimize import lsq_linear
+from scipy.special import spherical_jn, spherical_yn
 from typing import Dict, Tuple, Optional, Union, Iterable, List
 import warnings
 from multiprocessing import Pool
@@ -439,9 +438,7 @@ def normalized_associated_legendre(n: int, m: int,
     """
     theta = np.atleast_1d(theta)
     cos_theta = np.cos(theta)
-    
-    abs_m = abs(m)
-    
+
     # compute_legendre_recurrence returns already-normalized P̄_n^m values.
     # We need up to n so the derivative recurrence has P̄_{n-1}^m available.
     P_all = compute_legendre_recurrence(n, abs(m), cos_theta)
@@ -560,6 +557,32 @@ def compute_all_modes_legendre(n_max: int, m_max: int,
     
     return results
 
+def _pattern_function_bases(n: int, m: int, P_norm, dP_norm, sin_theta):
+    """
+    The far-field pattern functions of mode (n, m) without the exp(-j m phi)
+    factor: (K1_theta, K1_phi, K2_theta, K2_phi).
+
+    This is the single source of the sign and j-factor convention. The
+    synthesis in ``far_field_pattern_functions`` multiplies these by
+    exp(-j m phi); the extraction kernels in ``from_far_field`` conjugate the
+    same functions under the integral, so the integral of |K|^2 over the
+    sphere is 4 pi and extraction inverts synthesis exactly. (The extraction
+    used to carry its own copy with a different sign factor and swapped
+    j-factors, which differed from these by j(-1)^m per mode: a pattern
+    extracted and re-synthesized came back rotated by 180 degrees in phi.)
+    """
+    prefactor = np.sqrt(2 / (n * (n + 1)))
+    sign_factor = 1.0 if m == 0 else (-m / abs(m)) ** m
+    i_factor_1 = (1j) ** (n + 1)
+    i_factor_2 = (1j) ** n
+    mP_over_sin = m * P_norm / sin_theta
+    K1_theta = prefactor * sign_factor * i_factor_1 * (-1j * mP_over_sin)
+    K1_phi = prefactor * sign_factor * i_factor_1 * (-dP_norm)
+    K2_theta = prefactor * sign_factor * i_factor_2 * dP_norm
+    K2_phi = prefactor * sign_factor * i_factor_2 * (-1j * mP_over_sin)
+    return K1_theta, K1_phi, K2_theta, K2_phi
+
+
 def far_field_pattern_functions(n: int, m: int,
                                          theta: np.ndarray,
                                          phi: np.ndarray,
@@ -604,31 +627,15 @@ def far_field_pattern_functions(n: int, m: int,
     else:
         P_norm, dP_norm_dtheta = normalized_associated_legendre(n, m, theta_safe)
 
-    prefactor = np.sqrt(2 / (n * (n + 1)))
-
-    if m == 0:
-        sign_factor = 1.0
-    else:
-        sign_factor = (-m / abs(m)) ** m
-
     # Ticra sign convention: negative phase progression
     if phase_cache is not None and m in phase_cache:
         phase = phase_cache[m]
     else:
         phase = np.exp(-1j * m * phi)
-    i_factor_1 = (1j) ** (n + 1)
-    i_factor_2 = (1j) ** (n)
 
-    sin_theta = np.sin(theta_safe)
-    mP_over_sin = m * P_norm / sin_theta
-
-    K1_theta = prefactor * sign_factor * phase * i_factor_1 * (-1j * mP_over_sin)
-    K1_phi = prefactor * sign_factor * phase * i_factor_1 * (-dP_norm_dtheta)
-    
-    K2_theta = prefactor * sign_factor * phase * i_factor_2 * (dP_norm_dtheta)
-    K2_phi = prefactor * sign_factor * phase * i_factor_2 * (-1j * mP_over_sin)
-    
-    return (K1_theta, K1_phi), (K2_theta, K2_phi)
+    K1_theta, K1_phi, K2_theta, K2_phi = _pattern_function_bases(
+        n, m, P_norm, dP_norm_dtheta, np.sin(theta_safe))
+    return (K1_theta * phase, K1_phi * phase), (K2_theta * phase, K2_phi * phase)
 
 
 def _precompute_bessel_numpy(nmax: int, kr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -826,8 +833,6 @@ def near_field_pattern_functions(n: int, m: int, r: np.ndarray,
     Calculate near-field pattern functions using TICRA convention.
     Uses Hankel function of second kind h_n^(2) = j_n - i*y_n
     """
-    abs_m = abs(m)
-    
     # Apply pole avoidance — epsilon must match compute_all_modes_legendre (1e-6)
     # so that P_norm from cache and sin_theta are evaluated at the same clamped θ.
     # A larger epsilon here would make mP_over_sin = jm·P_norm/sin_theta wrong
@@ -995,21 +1000,12 @@ def compute_mode_coefficients_batch(args):
         P_norm_2d = P_norm[:, np.newaxis]
         dP_norm_2d = dP_norm[:, np.newaxis]
         
-        # TICRA pattern functions WITHOUT exp(-imφ) phase term
-        prefactor = np.sqrt(2 / (n * (n + 1)))
-        sign_factor = (m / abs(m)) ** m if m != 0 else 1.0
-        i_factor_1 = (1j) ** n
-        i_factor_2 = (1j) ** (n + 1)
-        
+        # Pattern functions WITHOUT the exp(-imφ) phase term, in the same
+        # convention as the synthesis (see _pattern_function_bases).
         # Use same epsilon as compute_all_modes_legendre for consistency
         sin_theta_safe = np.where(np.abs(sin_theta) < 1e-6, 1e-6, sin_theta)
-        mP_over_sin = 1j * m * P_norm_2d / sin_theta_safe
-        
-        # Pattern functions without exp(-imφ)
-        K1_theta_base = prefactor * sign_factor * i_factor_1 * mP_over_sin
-        K1_phi_base = prefactor * sign_factor * i_factor_1 * dP_norm_2d
-        K2_theta_base = prefactor * sign_factor * i_factor_2 * dP_norm_2d
-        K2_phi_base = prefactor * sign_factor * i_factor_2 * (-mP_over_sin)
+        K1_theta_base, K1_phi_base, K2_theta_base, K2_phi_base = _pattern_function_bases(
+            n, m, P_norm_2d, dP_norm_2d, sin_theta_safe)
         
         # Integrand without exp(-imφ) in K (but will have exp(+imφ) from conjugate)
         # We'll compute: ∫∫ E * conj(K_base) * exp(+imφ) * sin(θ) dθ dφ
@@ -1055,20 +1051,13 @@ def compute_mode_coefficients_batch_trapz(args):
         P_norm_2d = P_norm[:, np.newaxis]
         dP_norm_2d = dP_norm[:, np.newaxis]
 
-        prefactor = np.sqrt(2 / (n * (n + 1)))
-        sign_factor = (m / abs(m)) ** m if m != 0 else 1.0
         phase = np.exp(-1j * m * PHI)
-        i_factor_1 = (1j) ** n
-        i_factor_2 = (1j) ** (n + 1)
-
-        # Use same epsilon as compute_all_modes_legendre for consistency
+        # Same pattern functions as the synthesis (see _pattern_function_bases)
         sin_theta_safe = np.where(np.abs(sin_theta) < 1e-6, 1e-6, sin_theta)
-        mP_over_sin = 1j * m * P_norm_2d / sin_theta_safe
-
-        K1_theta = prefactor * sign_factor * phase * i_factor_1 * mP_over_sin
-        K1_phi = prefactor * sign_factor * phase * i_factor_1 * dP_norm_2d
-        K2_theta = prefactor * sign_factor * phase * i_factor_2 * (dP_norm_2d)
-        K2_phi = prefactor * sign_factor * phase * i_factor_2 * (-mP_over_sin)
+        K1_theta, K1_phi, K2_theta, K2_phi = _pattern_function_bases(
+            n, m, P_norm_2d, dP_norm_2d, sin_theta_safe)
+        K1_theta, K1_phi = K1_theta * phase, K1_phi * phase
+        K2_theta, K2_phi = K2_theta * phase, K2_phi * phase
 
         integrand_1 = (E_THETA * np.conj(K1_theta) + E_PHI * np.conj(K1_phi)) * sin_theta
         Q1 = np.dot(w_theta, np.trapz(integrand_1, phi_unique, axis=1)) * norm_factor
@@ -1272,8 +1261,6 @@ class SphericalWaveExpansion:
         if self._frequency_order and self._frequency is None:
             self._frequency = self._frequency_order[0]
         active = self._active_frequency_key(required=False)
-        active_q1 = self._Q1_by_frequency.get(active, {})
-        active_q2 = self._Q2_by_frequency.get(active, {})
         active_nmax = self._NMAX_by_frequency.get(active, 0)
         active_mmax = self._MMAX_by_frequency.get(active, 0)
         if active is None:
@@ -1796,20 +1783,13 @@ class SphericalWaveExpansion:
                     P_norm_2d = P_norm[:, np.newaxis]
                     dP_norm_2d = dP_norm[:, np.newaxis]
 
-                    prefactor = np.sqrt(2 / (n * (n + 1)))
-                    sign_factor = (m / abs(m)) ** m if m != 0 else 1.0
                     phase = np.exp(-1j * m * PHI)
-                    i_factor_1 = (1j) ** n
-                    i_factor_2 = (1j) ** (n + 1)
-
+                    # Same pattern functions as the synthesis (see _pattern_function_bases)
                     sin_theta_safe = np.where(np.abs(sin_theta) < 1e-10, 1e-10, sin_theta)
-                    mP_over_sin = 1j * m * P_norm_2d / sin_theta_safe
-
-                    K1_theta = prefactor * sign_factor * phase * i_factor_1 * mP_over_sin
-                    K1_phi = prefactor * sign_factor * phase * i_factor_1 * dP_norm_2d
-
-                    K2_theta = prefactor * sign_factor * phase * i_factor_2 * (dP_norm_2d)
-                    K2_phi = prefactor * sign_factor * phase * i_factor_2 * (-mP_over_sin)
+                    K1_theta, K1_phi, K2_theta, K2_phi = _pattern_function_bases(
+                        n, m, P_norm_2d, dP_norm_2d, sin_theta_safe)
+                    K1_theta, K1_phi = K1_theta * phase, K1_phi * phase
+                    K2_theta, K2_phi = K2_theta * phase, K2_phi * phase
 
                     integrand_1 = (E_THETA * np.conj(K1_theta) + E_PHI * np.conj(K1_phi)) * sin_theta
                     Q1 = np.dot(w_theta, np.trapezoid(integrand_1, phi_unique, axis=1)) * norm_factor
@@ -1897,17 +1877,6 @@ class SphericalWaveExpansion:
 
                 retained_power = sum(power_by_n.get(n, 0) for n in range(1, NMAX_truncated+1))
                 retained_fraction = retained_power / total_power
-                
-                # Verify final power distribution
-                n_values_final = np.array([n for (n, m) in Q1_final.keys()])
-                mode_powers_final = np.array([(abs(Q1_final[(n, m)])**2 + abs(Q2_final[(n, m)])**2) / 2.0 
-                                            for (n, m) in Q1_final.keys()])
-                total_power_final = np.sum(mode_powers_final)
-                
-                n_cutoff_final = max(1, int(np.ceil(0.1 * NMAX_truncated)))
-                high_n_mask_final = n_values_final > (NMAX_truncated - n_cutoff_final)
-                high_mode_power_final = np.sum(mode_powers_final[high_n_mask_final])
-                high_mode_fraction_final = high_mode_power_final / total_power_final if total_power_final > 0 else 0
                 
                 # Check if final grid is adequately sampled
                 theta_samples = len(theta_unique)

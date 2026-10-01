@@ -26,11 +26,8 @@ fields, following the Hansen convention as used by TICRA GRASP.
 ## Installation
 
 ```bash
-# From the repository root
+# From the repository root (editable install; the package lives in src/swe)
 pip install -e .
-
-# Or set PYTHONPATH if editable install fails
-PYTHONPATH=. python your_script.py
 ```
 
 **Dependencies**: numpy, scipy, matplotlib (optional, for validation plots)
@@ -248,7 +245,11 @@ python -m pytest tests/ -v -s
 ```
 
 Tests that require the example data files are automatically skipped when the
-files are absent.
+files are absent. `tests/test_cut_to_sph.py` extracts the full NMAX=359
+expansion from `example.cut` and takes over an hour; CI skips it. The fast
+extraction check is `tests/test_extraction_roundtrip.py`, which synthesizes a
+far field from known coefficients (and from the TICRA example truncated to
+n <= 12) and asserts that `from_far_field` returns them.
 
 ## Physical Conventions
 
