@@ -8,6 +8,8 @@ recover SWE coefficients that reproduce both the far field (.cut) and near field
 import numpy as np
 import pytest
 
+pytestmark = pytest.mark.slow   # minutes: the full-size expansion; run with --runslow
+
 from swe import SphericalWaveExpansion, cartesian_to_spherical
 from swe.ticra_io import read_grasp_cut, read_grasp_grd
 from swe.ludwig3 import (

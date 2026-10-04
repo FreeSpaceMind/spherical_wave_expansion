@@ -11,6 +11,8 @@ import tempfile
 import numpy as np
 import pytest
 
+pytestmark = pytest.mark.slow   # minutes: the full-size expansion; run with --runslow
+
 from swe import SphericalWaveExpansion, read_ticra_sph, write_ticra_sph
 from tests.conftest import SPH_FILE, requires_sph
 

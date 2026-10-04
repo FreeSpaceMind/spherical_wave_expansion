@@ -52,6 +52,9 @@ include = ["swe*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v"
+markers = [
+    "slow: takes minutes (full-size .cut expansion, .sph round trip); skipped unless --runslow",
+]
 
 [tool.black]
 line-length = 100

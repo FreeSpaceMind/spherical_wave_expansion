@@ -9,6 +9,23 @@ import os
 import numpy as np
 import pytest
 
+
+def pytest_addoption(parser):
+    parser.addoption("--runslow", action="store_true", default=False,
+                     help="run the tests marked slow (the full .cut and .sph round trips, minutes each)")
+
+
+def pytest_collection_modifyitems(config, items):
+    """Tests marked ``slow`` run only with --runslow: the full-size .cut
+    expansion and the .sph round trip take minutes each, the rest of the
+    suite seconds."""
+    if config.getoption("--runslow"):
+        return
+    skip = pytest.mark.skip(reason="slow: run with --runslow")
+    for item in items:
+        if "slow" in item.keywords:
+            item.add_marker(skip)
+
 # Path to test data directory (files live directly in tests/)
 TEST_DATA_DIR = os.path.dirname(__file__)
 
