@@ -40,6 +40,9 @@ References:
 import logging
 import math
 import numpy as np
+
+# np.trapezoid on NumPy 2, np.trapz before it (the old name is gone in 2.4)
+_trapezoid = getattr(np, "trapezoid", None) or getattr(np, "trapz")
 from scipy.special import lpmv, spherical_jn, spherical_yn
 from scipy.optimize import lsq_linear
 from typing import Dict, Tuple, Optional, Union, Iterable, List
@@ -1071,10 +1074,10 @@ def compute_mode_coefficients_batch_trapz(args):
         K2_phi = prefactor * sign_factor * phase * i_factor_2 * (-mP_over_sin)
 
         integrand_1 = (E_THETA * np.conj(K1_theta) + E_PHI * np.conj(K1_phi)) * sin_theta
-        Q1 = np.dot(w_theta, np.trapz(integrand_1, phi_unique, axis=1)) * norm_factor
+        Q1 = np.dot(w_theta, _trapezoid(integrand_1, phi_unique, axis=1)) * norm_factor
 
         integrand_2 = (E_THETA * np.conj(K2_theta) + E_PHI * np.conj(K2_phi)) * sin_theta
-        Q2 = np.dot(w_theta, np.trapz(integrand_2, phi_unique, axis=1)) * norm_factor
+        Q2 = np.dot(w_theta, _trapezoid(integrand_2, phi_unique, axis=1)) * norm_factor
         
         mode_power = (abs(Q1)**2 + abs(Q2)**2) / 2.0
         results.append(((n, m), Q1, Q2, mode_power))
